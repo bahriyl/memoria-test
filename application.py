@@ -11,6 +11,9 @@ import requests
 
 load_dotenv()
 
+NP_API_KEY = os.getenv('NP_API_KEY')
+NP_BASE_URL = 'https://api.novaposhta.ua/v2.0/json/'
+
 application = Flask(__name__)
 CORS(application)
 
@@ -21,12 +24,11 @@ twilio_client = Client(
 )
 verify_service = os.getenv('TWILIO_VERIFY_SERVICE_SID')
 
-print(os.getenv('TWILIO_ACCOUNT_SID'))
-
 client = MongoClient('mongodb+srv://tsbgalcontract:mymongodb26@cluster0.kppkt.mongodb.net/test')
 db = client['memoria_test']
 people_collection = db['people']
 areas_collection = db['areas']
+people_moderation_collection = db['people_moderation']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -219,6 +221,73 @@ def verify_code():
         return jsonify({ 'success': True })
     else:
         return jsonify({ 'success': False }), 401
+
+
+@application.route('/api/people/add_moderation', methods=['POST'])
+def people_add_moderation():
+    data = request.get_json()
+    name = data.get('name')
+    birthYear = data.get('birthYear')
+    deathYear = data.get('deathYear')
+    area = data.get('area')
+    cemetery = data.get('cemetery')
+    occupation = data.get('occupation', '')
+    link = data.get('link', '')
+    bio = data.get('bio', '')
+
+    document = {
+        'name': name,
+        'birthYear': birthYear,
+        'deathYear': deathYear,
+        'area': area,
+        'cemetery': cemetery,
+        'occupation': occupation,
+        'link': link,
+        'bio': bio
+    }
+    people_moderation_collection.insert_one(document)
+
+    return jsonify({ 'success': True })
+
+
+@application.route('/api/settlements', methods=['GET'])
+def search_settlements():
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify({ 'success': False, 'data': [], 'errors': ['Missing q parameter'] }), 400
+
+    payload = {
+        "apiKey": NP_API_KEY,
+        "modelName": "Address",
+        "calledMethod": "searchSettlements",
+        "methodProperties": {
+            "CityName": q,
+            "Limit": 5
+        }
+    }
+    resp = requests.post(NP_BASE_URL, json=payload)
+    return jsonify(resp.json())
+
+
+@application.route('/api/warehouses', methods=['GET'])
+def get_warehouses():
+    city_ref = request.args.get('cityRef', '').strip()
+    q = request.args.get('q', '').strip()
+    if not city_ref:
+        return jsonify({ 'success': False, 'data': [], 'errors': ['Missing cityRef parameter'] }), 400
+
+    payload = {
+        "apiKey": NP_API_KEY,
+        "modelName": "Address",
+        "calledMethod": "getWarehouses",
+        "methodProperties": {
+            "SettlementRef": city_ref,
+            "FindByString": q,
+            "Limit": 5
+        }
+    }
+    resp = requests.post(NP_BASE_URL, json=payload)
+    return jsonify(resp.json())
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 from twilio.rest import Client
 from dotenv import load_dotenv
 import requests
+from datetime import datetime
 
 load_dotenv()
 
@@ -289,6 +290,42 @@ def get_warehouses():
     }
     resp = requests.post(NP_BASE_URL, json=payload)
     return jsonify(resp.json())
+
+
+@application.route('/api/orders', methods=['POST'])
+def create_order():
+    data = request.get_json() or {}
+    # Обов’язкові поля
+    required = ['personId', 'name', 'cityRef', 'branchRef', 'phone', 'paymentMethod']
+    missing = [k for k in required if k not in data]
+    if missing:
+        return jsonify({
+            'error': 'Missing required fields',
+            'fields': missing
+        }), 400
+
+    # Формуємо документ замовлення
+    order_doc = {
+        'personId':      data['personId'],
+        'name':          data['name'],
+        'cityRef':       data['cityRef'],
+        'branchRef':     data['branchRef'],
+        'phone':         data['phone'],
+        'paymentMethod': data['paymentMethod'],          # 'online' або 'cod'
+        'paymentStatus': 'pending' if data['paymentMethod']=='online' else 'cod',
+        'createdAt':     datetime.utcnow(),
+        # сюди пізніше Monopay вебхук може додати поля status, webhookData тощо
+    }
+
+    try:
+        result = orders_collection.insert_one(order_doc)
+    except Exception as e:
+        return jsonify({
+            'error': 'DB insert failed',
+            'details': str(e)
+        }), 500
+
+    return jsonify({'orderId': str(result.inserted_id)}), 201
 
 
 @application.route('/api/merchant/invoice/create', methods=['POST'])

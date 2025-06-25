@@ -356,6 +356,7 @@ def create_invoice():
         )
         resp.raise_for_status()
     except requests.RequestException as e:
+        print(str(e))
         return jsonify({
             'error': 'Monopay request failed',
             'details': str(e)

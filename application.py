@@ -9,6 +9,7 @@ from twilio.rest import Client
 from dotenv import load_dotenv
 import requests
 from datetime import datetime
+import json
 
 load_dotenv()
 
@@ -341,6 +342,8 @@ def create_invoice():
         'Content-Type': 'application/json',
         'X-Token': os.getenv('MONOPAY_TOKEN')
     }
+
+    del data["merchantPaymInfo"]
     try:
         resp = requests.post(
             'https://api.monobank.ua/api/merchant/invoice/create',

@@ -323,12 +323,13 @@ def create_order():
 
     try:
         result = orders_collection.insert_one(order_doc)
-        return jsonify({'orderId': str(result.inserted_id)}), 201
     except Exception as e:
         return jsonify({
             'error': 'DB insert failed',
             'details': str(e)
         }), 500
+
+    return jsonify({'orderId': str(result.inserted_id)}), 201
 
 
 @application.route('/api/merchant/invoice/create', methods=['POST'])
@@ -359,22 +360,8 @@ def create_invoice():
             'details': str(e)
         }), 502
 
-    payload = resp.json()
-    invoice_id = payload.get('invoiceId')
-    # grab your orderId from the reference you sent
-    order_id = data.get('merchantPaymInfo', {}).get('reference')
-    if invoice_id and order_id:
-        # persist invoiceId on your order document
-        orders_collection.update_one(
-            {'_id': ObjectId(order_id)},
-            {'$set': {'invoiceId': invoice_id}}
-        )
-
-    # return both to the client
-    return jsonify({
-        'invoiceId': invoice_id,
-        'pageUrl': payload.get('pageUrl')
-    }), resp.status_code
+    # Повертаємо клієнту JSON із полями invoiceId і pageUrl
+    return jsonify(resp.json()), resp.status_code
 
 
 @application.route('/api/monopay/webhook', methods=['POST'])

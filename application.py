@@ -318,6 +318,7 @@ def create_order():
         'paymentMethod': data['paymentMethod'],          # 'online' або 'cod'
         'paymentStatus': 'pending' if data['paymentMethod']=='online' else 'cod',
         'createdAt':     datetime.utcnow(),
+        'invoiceId':     data['invoiceId']
         # сюди пізніше Monopay вебхук може додати поля status, webhookData тощо
     }
 

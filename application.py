@@ -29,6 +29,7 @@ db = client['memoria_test']
 people_collection = db['people']
 areas_collection = db['areas']
 people_moderation_collection = db['people_moderation']
+orders_collection = db['orders']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -288,6 +289,63 @@ def get_warehouses():
     }
     resp = requests.post(NP_BASE_URL, json=payload)
     return jsonify(resp.json())
+
+
+@application.route('/api/merchant/invoice/create', methods=['POST'])
+def create_invoice():
+    data = request.get_json() or {}
+    # Перевіряємо, що всі потрібні поля є
+    required = ['amount', 'redirectUrl', 'webHookUrl']
+    if not all(k in data for k in required):
+        return jsonify({'error': 'Missing one of required fields: ' + ', '.join(required)}), 400
+
+    # Заголовок з токеном Monopay – додайте MONOPAY_TOKEN у ваш .env
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Token': os.getenv('MONOPAY_TOKEN')
+    }
+    try:
+        resp = requests.post(
+            'https://api.monobank.ua/api/merchant/invoice/create',
+            headers=headers,
+            json=data
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return jsonify({
+            'error': 'Monopay request failed',
+            'details': str(e)
+        }), 502
+
+    # Повертаємо клієнту JSON із полями invoiceId і pageUrl
+    return jsonify(resp.json()), resp.status_code
+
+
+@application.route('/api/monopay/webhook', methods=['POST'])
+def monopay_webhook():
+    data = request.get_json() or {}
+    invoice_id = data.get('invoiceId')
+    status     = data.get('status')
+
+    if not invoice_id or not status:
+        return jsonify({'error': 'Invalid webhook payload'}), 400
+
+    # Оновлюємо запис у MongoDB під ключем invoiceId
+    # Добавляємо поле paymentStatus і зберігаємо весь отриманий body
+    orders_collection.update_one(
+        {'invoiceId': invoice_id},
+        {
+            '$set': {
+                'paymentStatus': status,
+                'webhookData': data
+            }
+        },
+        upsert=True
+    )
+
+    # Monopay очікує 200 OK
+    return jsonify({'result': 'ok'}), 200
+
 
 
 if __name__ == '__main__':

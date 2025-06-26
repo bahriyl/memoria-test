@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from twilio.rest import Client
 
 from flask_socketio import SocketIO, join_room, emit
+import eventlet
+
+eventlet.monkey_patch()
 
 load_dotenv()
 
@@ -442,6 +445,14 @@ def post_message(chat_id):
         cid = ObjectId(chat_id)
     except:
         abort(400,'Invalid chat_id')
+
+    # Ensure there’s a chat document for this chatId (only on first message)
+    chat_collection.update_one(
+        {'_id': cid},
+        {'$setOnInsert': {'createdAt': datetime.utcnow()}},
+        upsert=True
+    )
+
     msg = {
         'chatId':    cid,
         'sender':    sender,

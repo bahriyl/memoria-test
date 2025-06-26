@@ -449,9 +449,9 @@ def post_message(chat_id):
         'createdAt': datetime.utcnow()
     }
     message_collection.insert_one(msg)
-    emit('newMessage', {
+    socketio.emit('newMessage', {
         'sender': sender,
-        'text':   text,
+        'text': text,
         'createdAt': msg['createdAt'].isoformat()
     }, room=chat_id)
     return jsonify({'success': True}), 201

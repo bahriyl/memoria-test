@@ -1,15 +1,16 @@
-from flask import Flask, jsonify, request, abort
-from flask_cors import CORS
-from pymongo import MongoClient
-import re
-from bson.objectid import ObjectId
 import os
-from flask import Flask, request, jsonify
-from twilio.rest import Client
-from dotenv import load_dotenv
+import re
 import requests
 from datetime import datetime
-import json
+
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+from dotenv import load_dotenv
+from twilio.rest import Client
+
+from flask_socketio import SocketIO, join_room, emit
 
 load_dotenv()
 
@@ -18,6 +19,8 @@ NP_BASE_URL = 'https://api.novaposhta.ua/v2.0/json/'
 
 application = Flask(__name__)
 CORS(application)
+
+socketio = SocketIO(application, cors_allowed_origins="*")
 
 # init Twilio client
 twilio_client = Client(
@@ -32,6 +35,8 @@ people_collection = db['people']
 areas_collection = db['areas']
 people_moderation_collection = db['people_moderation']
 orders_collection = db['orders']
+chat_collection = db['chats']
+message_collection = db['messages']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -392,6 +397,71 @@ def monopay_webhook():
     return jsonify({'result': 'ok'}), 200
 
 
+@application.route('/api/chats', methods=['POST'])
+def create_chat():
+    """Create a new chat session."""
+    result = chat_collection.insert_one({'createdAt': datetime.utcnow()})
+    return jsonify({'chatId': str(result.inserted_id)}), 201
+
+
+@application.route('/api/chats', methods=['GET'])
+def list_chats():
+    """List all chat sessions for admin."""
+    chats = chat_collection.find().sort('createdAt', -1)
+    out = [{'chatId': str(c['_id']), 'createdAt': c['createdAt'].isoformat()} for c in chats]
+    return jsonify(out)
+
+
+@application.route('/api/chats/<chat_id>/messages', methods=['GET'])
+def get_messages(chat_id):
+    """Fetch full message history."""
+    try:
+        cid = ObjectId(chat_id)
+    except:
+        abort(400,'Invalid chat_id')
+    msgs = message_collection.find({'chatId': cid}).sort('createdAt',1)
+    out = []
+    for m in msgs:
+        out.append({
+            'sender': m['sender'],
+            'text':   m['text'],
+            'createdAt': m['createdAt'].isoformat()
+        })
+    return jsonify(out)
+
+
+@application.route('/api/chats/<chat_id>/messages', methods=['POST'])
+def post_message(chat_id):
+    """Post a message (user or admin) and broadcast."""
+    data   = request.get_json() or {}
+    sender = data.get('sender')
+    text   = (data.get('text') or '').strip()
+    if sender not in ('user','admin') or not text:
+        abort(400,'Invalid payload')
+    try:
+        cid = ObjectId(chat_id)
+    except:
+        abort(400,'Invalid chat_id')
+    msg = {
+        'chatId':    cid,
+        'sender':    sender,
+        'text':      text,
+        'createdAt': datetime.utcnow()
+    }
+    message_collection.insert_one(msg)
+    emit('newMessage', {
+        'sender': sender,
+        'text':   text,
+        'createdAt': msg['createdAt'].isoformat()
+    }, room=chat_id)
+    return jsonify({'success': True}), 201
+
+
+@socketio.on('joinRoom')
+def handle_join(room):
+    """Called by client/admin: socket.emit('joinRoom', chatId)"""
+    join_room(room)
+
 
 if __name__ == '__main__':
-    application.run(host='0.0.0.0')
+    socketio.run(application, host='0.0.0.0', port=5000)

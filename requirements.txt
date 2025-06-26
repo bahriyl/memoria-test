@@ -5,3 +5,5 @@ twilio
 dotenv
 requests
 gunicorn
+flask-socketio
+eventlet

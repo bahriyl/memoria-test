@@ -1,6 +1,7 @@
 import os
 import re
 import requests
+import base64
 from datetime import datetime
 
 from flask import Flask, request, jsonify, abort
@@ -406,19 +407,18 @@ def create_chat():
     result = chat_collection.insert_one({'createdAt': datetime.utcnow()})
     chat_id = str(result.inserted_id)
 
-    # Admin welcome message
     admin_msg = {
         'chatId': result.inserted_id,
         'sender': 'admin',
         'text': "Доброго дня! Напишіть нам свою проблему чи пропозицію щоб ми могли вам допомогти",
-        'createdAt': datetime.utcnow()
+        'createdAt': datetime.utcnow(),
+        'imageData': None
     }
     message_collection.insert_one(admin_msg)
-
-    # Broadcast to connected clients in the room
     socketio.emit('newMessage', {
         'sender': admin_msg['sender'],
         'text': admin_msg['text'],
+        'imageData': admin_msg['imageData'],
         'createdAt': admin_msg['createdAt'].isoformat()
     }, room=chat_id)
 
@@ -453,54 +453,80 @@ def get_messages(chat_id):
 
 @application.route('/api/chats/<chat_id>/messages', methods=['POST'])
 def post_message(chat_id):
-    """Post a message (user or admin) and broadcast. On first user message, send follow-up admin reply."""
-    data = request.get_json() or {}
-    sender = data.get('sender')
-    text = (data.get('text') or '').strip()
-    if sender not in ('user', 'admin') or not text:
+    """Post a message (user or admin) with optional image as Base64 and broadcast."""
+    sender = None
+    text = ''
+    image = None
+
+    # Розбір multipart/form-data або JSON
+    if request.content_type and 'multipart/form-data' in request.content_type:
+        sender = request.form.get('sender')
+        text = (request.form.get('text', '') or '').strip()
+        image = request.files.get('image')
+    else:
+        data = request.get_json() or {}
+        sender = data.get('sender')
+        text = (data.get('text') or '').strip()
+
+    if sender not in ('user', 'admin') or (not text and not image):
         abort(400, 'Invalid payload')
+
     try:
         cid = ObjectId(chat_id)
-    except:
+    except Exception:
         abort(400, 'Invalid chat_id')
 
-    # Count existing user messages prior to insert
+    # Перевіряємо чи є попередні повідомлення від користувача
     existing_user_msgs = message_collection.count_documents({'chatId': cid, 'sender': 'user'})
 
-    # Ensure chat document exists
+    # Створюємо чат, якщо його ще не було
     chat_collection.update_one(
         {'_id': cid},
         {'$setOnInsert': {'createdAt': datetime.utcnow()}},
         upsert=True
     )
 
-    # Insert the incoming message
+    # Кодуємо зображення, якщо воно є
+    image_data = None
+    if image:
+        raw = image.read()
+        b64 = base64.b64encode(raw).decode('utf-8')
+        image_data = f"data:{image.mimetype};base64,{b64}"
+
+    # Зберігаємо повідомлення
     msg = {
         'chatId': cid,
         'sender': sender,
         'text': text,
-        'createdAt': datetime.utcnow()
+        'createdAt': datetime.utcnow(),
+        'imageData': image_data
     }
     message_collection.insert_one(msg)
-    socketio.emit('newMessage', {
+
+    # Розсилаємо повідомлення через Socket.IO
+    payload = {
         'sender': sender,
         'text': text,
+        'imageData': image_data,
         'createdAt': msg['createdAt'].isoformat()
-    }, room=chat_id)
+    }
+    socketio.emit('newMessage', payload, room=chat_id)
 
-    # If this is the first user message, send automated follow-up
+    # Автовідповідь на перше повідомлення користувача
     if sender == 'user' and existing_user_msgs == 0:
-        followup_admin_msg = {
+        followup = {
             'chatId': cid,
             'sender': 'admin',
             'text': "Доброго дня! Очікуйте, на протязі 5 хвилин з вами звʼяжеться наш працівник",
-            'createdAt': datetime.utcnow()
+            'createdAt': datetime.utcnow(),
+            'imageData': None
         }
-        message_collection.insert_one(followup_admin_msg)
+        message_collection.insert_one(followup)
         socketio.emit('newMessage', {
-            'sender': followup_admin_msg['sender'],
-            'text': followup_admin_msg['text'],
-            'createdAt': followup_admin_msg['createdAt'].isoformat()
+            'sender': followup['sender'],
+            'text': followup['text'],
+            'imageData': followup['imageData'],
+            'createdAt': followup['createdAt'].isoformat()
         }, room=chat_id)
 
     return jsonify({'success': True}), 201

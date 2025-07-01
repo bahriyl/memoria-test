@@ -41,6 +41,7 @@ people_moderation_collection = db['people_moderation']
 orders_collection = db['orders']
 chat_collection = db['chats']
 message_collection = db['messages']
+cemeteries_collection = db['cemetries']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -148,6 +149,58 @@ def get_person(person_id):
         "location": person.get('location'),
         "bio": person.get('bio'),
         "photos": person.get('photos')
+    })
+
+
+@application.route('/api/cemeteries', methods=['GET'])
+def cemeteries():
+    search_query = request.args.get('search', '').strip()
+
+    query_filter = {}
+
+    if search_query:
+        query_filter['name'] = {'$regex': re.escape(search_query), '$options': 'i'}
+
+    cemeteries_cursor = cemeteries_collection.find(query_filter)
+
+    cemeteries_list = []
+    for cemetery in cemeteries_cursor:
+        cemeteries_list.append({
+            "id": str(cemetery.get('_id')),
+            "name": cemetery.get('name'),
+            "image": cemetery.get('image'),
+            "address": cemetery.get('address'),
+            "phone": cemetery.get('phone'),
+            "description": cemetery.get('description')
+        })
+
+    return jsonify({
+        "total": len(cemeteries_list),
+        "cemeteries": cemeteries_list
+    })
+
+
+@application.route('/api/cemeteries/<string:cemetery_id>', methods=['GET'])
+def get_cemetery(cemetery_id):
+    # 1) Validate & convert the id
+    try:
+        oid = ObjectId(cemetery_id)
+    except Exception:
+        abort(400, description="Invalid cemetery id")
+
+    # 2) Fetch from Mongo
+    cemetery = cemeteries_collection.find_one({'_id': oid})
+    if not cemetery:
+        abort(404, description="Cemetery not found")
+
+    # 3) Build your response payload
+    return jsonify({
+        "id": str(cemetery.get('_id')),
+        "name": cemetery.get('name'),
+        "image": cemetery.get('image'),
+        "address": cemetery.get('address'),
+        "phone": cemetery.get('phone'),
+        "description": cemetery.get('description')
     })
 
 

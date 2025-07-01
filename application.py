@@ -152,8 +152,8 @@ def get_person(person_id):
     })
 
 
-@application.route('/api/cemeteries', methods=['GET'])
-def cemeteries():
+@application.route('/api/cemeteries_page', methods=['GET'])
+def cemeteries_page():
     search_query = request.args.get('search', '').strip()
 
     query_filter = {}
@@ -180,8 +180,8 @@ def cemeteries():
     })
 
 
-@application.route('/api/cemeteries/<string:cemetery_id>', methods=['GET'])
-def get_cemetery(cemetery_id):
+@application.route('/api/cemeteries_page/<string:cemetery_id>', methods=['GET'])
+def get_cemetery_page(cemetery_id):
     # 1) Validate & convert the id
     try:
         oid = ObjectId(cemetery_id)

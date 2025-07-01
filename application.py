@@ -42,6 +42,7 @@ orders_collection = db['orders']
 chat_collection = db['chats']
 message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
+ritual_services_collection = db['ritual_services']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -254,6 +255,37 @@ def cemeteries():
     cemeteries = sorted([c for c in cemeteries if c])[:10]
 
     return jsonify(cemeteries)
+
+
+@application.route('/api/ritual_services', methods=['GET'])
+def ritual_services():
+    search_query = request.args.get('search', '').strip()
+    address = request.args.get('address', '').strip()
+
+    query_filter = {}
+
+    if search_query:
+        query_filter['name'] = {'$regex': re.escape(search_query), '$options': 'i'}
+
+    if address:
+        query_filter['address'] = {'$regex': re.escape(address), '$options': 'i'}  # частковий, нечутливий до регістру пошук
+
+    ritual_services_cursor = ritual_services_collection.find(query_filter)
+
+    ritual_services_list = []
+    for ritual_service in ritual_services_cursor:
+        ritual_services_list.append({
+            "id": str(ritual_service.get('_id')),
+            "name": ritual_service.get('name'),
+            "address": ritual_service.get('address'),
+            "category": ritual_service.get('category'),
+            "logo": ritual_service.get('logo')
+        })
+
+    return jsonify({
+        "total": len(ritual_services_list),
+        "ritual_services": ritual_services_list
+    })
 
 
 @application.route('/api/send-code', methods=['POST'])

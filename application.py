@@ -279,7 +279,9 @@ def ritual_services():
             "name": ritual_service.get('name'),
             "address": ritual_service.get('address'),
             "category": ritual_service.get('category'),
-            "logo": ritual_service.get('logo')
+            "logo": ritual_service.get('logo'),
+            "latitude": ritual_service.get("latitude"),
+            "longitude": ritual_service.get("longitude")
         })
 
     return jsonify({

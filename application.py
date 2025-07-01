@@ -41,10 +41,11 @@ people_moderation_collection = db['people_moderation']
 orders_collection = db['orders']
 chat_collection = db['chats']
 message_collection = db['messages']
-cemeteries_collection = db['cemetries']
+cemeteries_collection = db['cemeteries']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+
 
 @application.route("/api/binance-p2p", methods=["POST"])
 def binance_p2p_proxy():
@@ -73,6 +74,7 @@ def get_coin_icon():
     return jsonify({
         "icon_thumb": image
     })
+
 
 @application.route('/api/people', methods=['GET'])
 def people():
@@ -232,7 +234,7 @@ def cemeteries():
     Повертає список унікальних назв кладовищ ('cemetries')
     для заданої області, з опційним пошуком по імені кладовища.
     """
-    area   = request.args.get('area', '').strip()
+    area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
     query = {}
 
@@ -259,23 +261,23 @@ def send_code():
     data = request.get_json() or {}
     phone = data.get('phone')
     if not phone:
-        return jsonify({ 'error': 'phone is required' }), 400
+        return jsonify({'error': 'phone is required'}), 400
 
     verification = twilio_client.verify \
         .services(verify_service) \
         .verifications \
         .create(to=phone, channel='sms')
 
-    return jsonify({ 'status': verification.status })  # e.g. "pending"
+    return jsonify({'status': verification.status})  # e.g. "pending"
 
 
 @application.route('/api/verify-code', methods=['POST'])
 def verify_code():
     data = request.get_json() or {}
     phone = data.get('phone')
-    code  = data.get('code')
+    code = data.get('code')
     if not phone or not code:
-        return jsonify({ 'error': 'phone and code are required' }), 400
+        return jsonify({'error': 'phone and code are required'}), 400
 
     check = twilio_client.verify \
         .services(verify_service) \
@@ -283,9 +285,9 @@ def verify_code():
         .create(to=phone, code=code)
 
     if check.status == 'approved':
-        return jsonify({ 'success': True })
+        return jsonify({'success': True})
     else:
-        return jsonify({ 'success': False }), 401
+        return jsonify({'success': False}), 401
 
 
 @application.route('/api/people/add_moderation', methods=['POST'])
@@ -312,14 +314,14 @@ def people_add_moderation():
     }
     people_moderation_collection.insert_one(document)
 
-    return jsonify({ 'success': True })
+    return jsonify({'success': True})
 
 
 @application.route('/api/settlements', methods=['GET'])
 def search_settlements():
     q = request.args.get('q', '').strip()
     if not q:
-        return jsonify({ 'success': False, 'data': [], 'errors': ['Missing q parameter'] }), 400
+        return jsonify({'success': False, 'data': [], 'errors': ['Missing q parameter']}), 400
 
     payload = {
         "apiKey": NP_API_KEY,
@@ -339,7 +341,7 @@ def get_warehouses():
     city_ref = request.args.get('cityRef', '').strip()
     q = request.args.get('q', '').strip()
     if not city_ref:
-        return jsonify({ 'success': False, 'data': [], 'errors': ['Missing cityRef parameter'] }), 400
+        return jsonify({'success': False, 'data': [], 'errors': ['Missing cityRef parameter']}), 400
 
     payload = {
         "apiKey": NP_API_KEY,
@@ -369,18 +371,18 @@ def create_order():
 
     # Формуємо документ замовлення
     order_doc = {
-        'personId':      data['personId'],
-        'personName':    data['personName'],
-        'name':          data['name'],
-        'cityRef':       data['cityRef'],
-        'cityName':      data['cityName'],
-        'branchRef':     data['branchRef'],
-        'branchDesc':    data['branchDesc'],
-        'phone':         data['phone'],
-        'paymentMethod': data['paymentMethod'],          # 'online' або 'cod'
-        'paymentStatus': 'pending' if data['paymentMethod']=='online' else 'cod',
-        'createdAt':     datetime.utcnow(),
-        'invoiceId':     data['invoiceId']
+        'personId': data['personId'],
+        'personName': data['personName'],
+        'name': data['name'],
+        'cityRef': data['cityRef'],
+        'cityName': data['cityName'],
+        'branchRef': data['branchRef'],
+        'branchDesc': data['branchDesc'],
+        'phone': data['phone'],
+        'paymentMethod': data['paymentMethod'],  # 'online' або 'cod'
+        'paymentStatus': 'pending' if data['paymentMethod'] == 'online' else 'cod',
+        'createdAt': datetime.utcnow(),
+        'invoiceId': data['invoiceId']
         # сюди пізніше Monopay вебхук може додати поля status, webhookData тощо
     }
 
@@ -432,7 +434,7 @@ def create_invoice():
 def monopay_webhook():
     data = request.get_json() or {}
     invoice_id = data.get('invoiceId')
-    status     = data.get('status')
+    status = data.get('status')
 
     if not invoice_id or not status:
         return jsonify({'error': 'Invalid webhook payload'}), 400
@@ -492,13 +494,13 @@ def get_messages(chat_id):
     try:
         cid = ObjectId(chat_id)
     except:
-        abort(400,'Invalid chat_id')
-    msgs = message_collection.find({'chatId': cid}).sort('createdAt',1)
+        abort(400, 'Invalid chat_id')
+    msgs = message_collection.find({'chatId': cid}).sort('createdAt', 1)
     out = []
     for m in msgs:
         out.append({
             'sender': m['sender'],
-            'text':   m['text'],
+            'text': m['text'],
             'createdAt': m['createdAt'].isoformat(),
             'imageData': m['imageData']
         })

@@ -446,7 +446,8 @@ def get_messages(chat_id):
         out.append({
             'sender': m['sender'],
             'text':   m['text'],
-            'createdAt': m['createdAt'].isoformat()
+            'createdAt': m['createdAt'].isoformat(),
+            'imageData': m['imageData']
         })
     return jsonify(out)
 

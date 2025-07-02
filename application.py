@@ -1,9 +1,12 @@
+import eventlet
+eventlet.monkey_patch()
+
 import os
 import re
 import requests
 import base64
-from datetime import datetime
-from itsdangerous import TimestampSigner, BadSignature, SignatureExpired
+from datetime import datetime, timedelta
+import jwt
 
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
@@ -11,15 +14,13 @@ from pymongo import MongoClient
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from twilio.rest import Client
-
 from flask_socketio import SocketIO, join_room, emit
-import eventlet
-
-eventlet.monkey_patch()
 
 load_dotenv()
 
-signer = TimestampSigner(os.getenv("SIGNER_SECRET_KEY"))
+JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
+JWT_ALGORITHM = "HS256"
+JWT_EXP_DELTA_SECONDS = 3600  # 1 година
 
 NP_API_KEY = os.getenv('NP_API_KEY')
 NP_BASE_URL = 'https://api.novaposhta.ua/v2.0/json/'
@@ -342,9 +343,28 @@ def ritual_services_login():
     if ritual_service.get("login") != login or ritual_service.get("password") != password:
         abort(401, description="Invalid login or password")
 
-    token = signer.sign(ritual_service_id).decode("utf-8")
+    payload = {
+        "ritual_service_id": ritual_service_id,
+        "exp": datetime.utcnow() + timedelta(seconds=JWT_EXP_DELTA_SECONDS)
+    }
+
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
     return jsonify({"token": token})
+
+
+@application.route('/api/ritual_services/verify_token', methods=['POST'])
+def verify_token():
+    data = request.get_json()
+    token = data.get("token")
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return jsonify({"valid": True, "ritual_service_id": payload["ritual_service_id"]})
+    except jwt.ExpiredSignatureError:
+        abort(401, description="Token expired")
+    except jwt.InvalidTokenError:
+        abort(401, description="Invalid token")
 
 
 @application.route('/api/send-code', methods=['POST'])

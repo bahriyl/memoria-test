@@ -290,6 +290,36 @@ def ritual_services():
     })
 
 
+@application.route('/api/ritual_services/<string:ritual_service_id>', methods=['GET'])
+def get_ritual_service(ritual_service_id):
+    # 1) Validate & convert the id
+    try:
+        oid = ObjectId(ritual_service_id)
+    except Exception:
+        abort(400, description="Invalid ritual service id")
+
+    # 2) Fetch from Mongo
+    ritual_service = ritual_services_collection.find_one({'_id': oid})
+    if not ritual_service:
+        abort(404, description="Ritual service not found")
+
+    # 3) Build your response payload
+    return jsonify({
+        "id": str(ritual_service['_id']),
+        "name": ritual_service.get('name'),
+        "address": ritual_service.get('address'),
+        "category": ritual_service.get('category'),
+        'logo': ritual_service.get('logo'),
+        "latitude": ritual_service.get('latitude')
+        "longitude": ritual_service.get('longitude')
+        "banner": ritual_service.get('banner'),
+        "description": ritual_service.get('description'),
+        "link": ritual_service.get('link'),
+        "phone": ritual_service.get('phone'),
+        "items": ritual_service.get('items')
+    })
+
+
 @application.route('/api/send-code', methods=['POST'])
 def send_code():
     data = request.get_json() or {}

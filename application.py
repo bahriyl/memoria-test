@@ -310,8 +310,8 @@ def get_ritual_service(ritual_service_id):
         "address": ritual_service.get('address'),
         "category": ritual_service.get('category'),
         'logo': ritual_service.get('logo'),
-        "latitude": ritual_service.get('latitude')
-        "longitude": ritual_service.get('longitude')
+        "latitude": ritual_service.get('latitude'),
+        "longitude": ritual_service.get('longitude'),
         "banner": ritual_service.get('banner'),
         "description": ritual_service.get('description'),
         "link": ritual_service.get('link'),

@@ -3,6 +3,7 @@ import re
 import requests
 import base64
 from datetime import datetime
+from itsdangerous import TimestampSigner, BadSignature, SignatureExpired
 
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
@@ -17,6 +18,8 @@ import eventlet
 eventlet.monkey_patch()
 
 load_dotenv()
+
+signer = TimestampSigner(os.getenv("SIGNER_SECRET_KEY"))
 
 NP_API_KEY = os.getenv('NP_API_KEY')
 NP_BASE_URL = 'https://api.novaposhta.ua/v2.0/json/'
@@ -318,6 +321,30 @@ def get_ritual_service(ritual_service_id):
         "phone": ritual_service.get('phone'),
         "items": ritual_service.get('items')
     })
+
+
+@application.route('/api/ritual_services/login', methods=['POST'])
+def ritual_services_login():
+    data = request.get_json() or {}
+    ritual_service_id = data.get('ritual_service_id')
+    login = data.get('login')
+    password = data.get('password')
+
+    try:
+        oid = ObjectId(ritual_service_id)
+    except Exception:
+        abort(400, description="Invalid ritual service id")
+
+    ritual_service = ritual_services_collection.find_one({'_id': oid})
+    if not ritual_service:
+        abort(404, description="Ritual service not found")
+
+    if ritual_service.get("login") != login or ritual_service.get("password") != password:
+        abort(401, description="Invalid login or password")
+
+    token = signer.sign(ritual_service_id).decode("utf-8")
+
+    return jsonify({"token": token})
 
 
 @application.route('/api/send-code', methods=['POST'])

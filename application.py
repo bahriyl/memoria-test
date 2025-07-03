@@ -294,34 +294,74 @@ def ritual_services():
     })
 
 
-@application.route('/api/ritual_services/<string:ritual_service_id>', methods=['GET'])
+@application.route('/api/ritual_services/<string:ritual_service_id>', methods=['GET', 'PUT'])
 def get_ritual_service(ritual_service_id):
-    # 1) Validate & convert the id
-    try:
-        oid = ObjectId(ritual_service_id)
-    except Exception:
-        abort(400, description="Invalid ritual service id")
+    if request.method == 'GET':
+        try:
+            oid = ObjectId(ritual_service_id)
+        except Exception:
+            abort(400, description="Invalid ritual service id")
 
-    # 2) Fetch from Mongo
-    ritual_service = ritual_services_collection.find_one({'_id': oid})
-    if not ritual_service:
-        abort(404, description="Ritual service not found")
+        ritual_service = ritual_services_collection.find_one({'_id': oid})
+        if not ritual_service:
+            abort(404, description="Ritual service not found")
 
-    # 3) Build your response payload
-    return jsonify({
-        "id": str(ritual_service['_id']),
-        "name": ritual_service.get('name'),
-        "address": ritual_service.get('address'),
-        "category": ritual_service.get('category'),
-        'logo': ritual_service.get('logo'),
-        "latitude": ritual_service.get('latitude'),
-        "longitude": ritual_service.get('longitude'),
-        "banner": ritual_service.get('banner'),
-        "description": ritual_service.get('description'),
-        "link": ritual_service.get('link'),
-        "phone": ritual_service.get('phone'),
-        "items": ritual_service.get('items')
-    })
+        return jsonify({
+            "id": str(ritual_service['_id']),
+            "name": ritual_service.get('name'),
+            "address": ritual_service.get('address'),
+            "category": ritual_service.get('category'),
+            'logo': ritual_service.get('logo'),
+            "latitude": ritual_service.get('latitude'),
+            "longitude": ritual_service.get('longitude'),
+            "banner": ritual_service.get('banner'),
+            "description": ritual_service.get('description'),
+            "link": ritual_service.get('link'),
+            "phone": ritual_service.get('phone'),
+            "items": ritual_service.get('items')
+        })
+    elif request.method == 'PUT':
+        data = request.get_json() or {}
+        try:
+            oid = ObjectId(ritual_service_id)
+        except Exception:
+            abort(400, description="Invalid ritual service id")
+
+        ritual_service = ritual_services_collection.find_one({'_id': oid})
+        if not ritual_service:
+            abort(404, description="Ritual service not found")
+
+        update_fields = {}
+
+        # Оновлення опису
+        if 'description' in data:
+            update_fields['description'] = data['description']
+
+        # Оновлення списку категорій з фото
+        if 'items' in data and isinstance(data['items'], list):
+            # Перевірка, що кожен елемент має правильну структуру
+            valid_items = []
+            for item in data['items']:
+                if (
+                        isinstance(item, list) and
+                        len(item) == 2 and
+                        isinstance(item[0], str) and
+                        isinstance(item[1], list)
+                ):
+                    valid_items.append(item)
+                else:
+                    abort(400, description="Invalid format for items")
+            update_fields['items'] = valid_items
+
+        if not update_fields:
+            abort(400, description="Nothing to update")
+
+        ritual_services_collection.update_one(
+            {'_id': oid},
+            {'$set': update_fields}
+        )
+
+        return jsonify({"message": "Ritual service updated successfully"}), 200
 
 
 @application.route('/api/ritual_services/login', methods=['POST'])

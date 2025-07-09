@@ -616,7 +616,7 @@ def create_chat():
     admin_msg = {
         'chatId': result.inserted_id,
         'sender': 'admin',
-        'text': "Доброго дня! Напишіть нам свою проблему чи пропозицію щоб ми могли вам допомогти",
+        'text': "Вітаємо! Чим можемо допомогти?",
         'createdAt': datetime.utcnow(),
         'imageData': None
     }
@@ -724,7 +724,7 @@ def post_message(chat_id):
         followup = {
             'chatId': cid,
             'sender': 'admin',
-            'text': "Доброго дня! Очікуйте, на протязі 5 хвилин з вами звʼяжеться наш працівник",
+            'text': "Дякуємо за Ваше повідомлення! Наш спеціаліст відповість Вам протягом 5 хвилин",
             'createdAt': datetime.utcnow(),
             'imageData': None
         }

@@ -51,6 +51,21 @@ ritual_services_collection = db['ritual_services']
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 
+ALLOWED_UPDATE_FIELDS = {
+    "name",
+    "birthYear",
+    "birthDate",
+    "deathYear",
+    "deathDate",
+    "notable",
+    "avatarUrl",
+    "area",
+    "cemetery",
+    "location",
+    "bio",
+    "photos",
+}
+
 
 @application.route("/api/binance-p2p", methods=["POST"])
 def binance_p2p_proxy():
@@ -157,6 +172,56 @@ def get_person(person_id):
         "bio": person.get('bio'),
         "photos": person.get('photos')
     })
+
+
+@application.route('/api/people/<string:person_id>', methods=['PUT'])
+def update_person(person_id):
+    # 1) Validate & convert the id
+    try:
+        oid = ObjectId(person_id)
+    except Exception:
+        abort(400, description="Invalid person id")
+
+    # 2) Parse JSON body
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        abort(400, description="Request must be a JSON object")
+
+    # 3) Build the update document, only for allowed fields
+    update_doc = {}
+    for field, value in data.items():
+        if field in ALLOWED_UPDATE_FIELDS:
+            update_doc[field] = value
+
+    if not update_doc:
+        abort(400, description=f"No valid fields to update. Allowed: {', '.join(ALLOWED_UPDATE_FIELDS)}")
+
+    # 4) Perform the update
+    result = people_collection.update_one(
+        {'_id': oid},
+        {'$set': update_doc}
+    )
+
+    if result.matched_count == 0:
+        abort(404, description="Person not found")
+
+    # 5) Fetch and return the updated document
+    person = people_collection.find_one({'_id': oid})
+    return jsonify({
+        "id": str(person['_id']),
+        "name": person.get('name'),
+        "birthYear": person.get('birthYear'),
+        "birthDate": person.get('birthDate'),
+        "deathYear": person.get('deathYear'),
+        "deathDate": person.get('deathDate'),
+        "notable": person.get('notable', False),
+        "avatarUrl": person.get('avatarUrl'),
+        "area": person.get('area'),
+        "cemetery": person.get('cemetery'),
+        "location": person.get('location'),
+        "bio": person.get('bio'),
+        "photos": person.get('photos')
+    }), 200
 
 
 @application.route('/api/cemeteries_page', methods=['GET'])

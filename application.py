@@ -47,6 +47,7 @@ chat_collection = db['chats']
 message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
 ritual_services_collection = db['ritual_services']
+location_moderation_collection = db['location_moderation']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -222,6 +223,21 @@ def update_person(person_id):
         "bio": person.get('bio'),
         "photos": person.get('photos')
     }), 200
+
+
+@application.route('/api/people/location_moderation', methods=['POST'])
+def people_location_moderation():
+    data = request.get_json()
+    personId = data.get('personId')
+    location = data.get('location')
+
+    document = {
+        'personId': personId,
+        'location': location
+    }
+    location_moderation_collection.insert_one(document)
+
+    return jsonify({'success': True})
 
 
 @application.route('/api/cemeteries_page', methods=['GET'])

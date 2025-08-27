@@ -65,6 +65,7 @@ ALLOWED_UPDATE_FIELDS = {
     "location",
     "bio",
     "photos",
+    "comments",
 }
 
 
@@ -171,7 +172,8 @@ def get_person(person_id):
         # if you store a location sub-doc it will be passed along here:
         "location": person.get('location'),
         "bio": person.get('bio'),
-        "photos": person.get('photos')
+        "photos": person.get('photos'),
+        "comments": person.get('comments', '')
     })
 
 
@@ -221,7 +223,8 @@ def update_person(person_id):
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
         "bio": person.get('bio'),
-        "photos": person.get('photos')
+        "photos": person.get('photos'),
+        "comments": person.get('comments', ''),
     }), 200
 
 

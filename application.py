@@ -173,7 +173,8 @@ def get_person(person_id):
         "location": person.get('location'),
         "bio": person.get('bio'),
         "photos": person.get('photos'),
-        "comments": person.get('comments', '')
+        "comments": person.get('comments', ''),
+        "premium": person.get('premium', ''),
     })
 
 

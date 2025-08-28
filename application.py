@@ -158,7 +158,7 @@ def get_person(person_id):
         abort(404, description="Person not found")
 
     # 3) Build your response payload
-    return jsonify({
+    response = {
         "id": str(person['_id']),
         "name": person.get('name'),
         "birthYear": person.get('birthYear'),
@@ -169,13 +169,17 @@ def get_person(person_id):
         "avatarUrl": person.get('avatarUrl'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
-        # if you store a location sub-doc it will be passed along here:
         "location": person.get('location'),
         "bio": person.get('bio'),
         "photos": person.get('photos'),
-        "comments": person.get('comments', ''),
-        "premium": person.get('premium', ''),
-    })
+        "comments": person.get('comments', '')
+    }
+
+    # Only include premium if present in the document
+    if 'premium' in person:
+        response['premium'] = person['premium']
+
+    return jsonify(response)
 
 
 @application.route('/api/people/<string:person_id>', methods=['PUT'])

@@ -182,38 +182,56 @@ def get_person(person_id):
     return jsonify(response)
 
 
+def _validate_photos_shape(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description="`photos` must be an array of objects")
+    out = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f"`photos[{i}]` must be an object")
+        url = item.get("url")
+        desc = item.get("description", "")
+        if not isinstance(url, str) or not url.strip():
+            abort(400, description=f"`photos[{i}].url` must be a non-empty string")
+        if not isinstance(desc, str):
+            abort(400, description=f"`photos[{i}].description` must be a string")
+        out.append({"url": url.strip(), "description": desc})
+    return out
+
+
 @application.route('/api/people/<string:person_id>', methods=['PUT'])
 def update_person(person_id):
-    # 1) Validate & convert the id
     try:
         oid = ObjectId(person_id)
     except Exception:
         abort(400, description="Invalid person id")
 
-    # 2) Parse JSON body
     data = request.get_json(silent=True)
-    if not data or not isinstance(data, dict):
+    if not isinstance(data, dict):
         abort(400, description="Request must be a JSON object")
 
-    # 3) Build the update document, only for allowed fields
+    # Reject legacy field if provided
+    if 'photoDescriptions' in data:
+        abort(400, description="`photoDescriptions` is no longer supported. Use `photos: [{url, description}]`.")
+
     update_doc = {}
     for field, value in data.items():
-        if field in ALLOWED_UPDATE_FIELDS:
+        if field not in ALLOWED_UPDATE_FIELDS:
+            continue
+        if field == 'photos':
+            update_doc['photos'] = _validate_photos_shape(value)
+        else:
             update_doc[field] = value
 
     if not update_doc:
-        abort(400, description=f"No valid fields to update. Allowed: {', '.join(ALLOWED_UPDATE_FIELDS)}")
+        abort(400, description=f"No valid fields to update. Allowed: {', '.join(sorted(ALLOWED_UPDATE_FIELDS))}")
 
-    # 4) Perform the update
-    result = people_collection.update_one(
-        {'_id': oid},
-        {'$set': update_doc}
-    )
-
+    result = people_collection.update_one({'_id': oid}, {'$set': update_doc})
     if result.matched_count == 0:
         abort(404, description="Person not found")
 
-    # 5) Fetch and return the updated document
     person = people_collection.find_one({'_id': oid})
     return jsonify({
         "id": str(person['_id']),
@@ -228,8 +246,8 @@ def update_person(person_id):
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
         "bio": person.get('bio'),
-        "photos": person.get('photos'),
-        "comments": person.get('comments', ''),
+        "photos": person.get('photos', []),   # [{url, description}]
+        "comments": person.get('comments', []),
     }), 200
 
 

@@ -65,6 +65,8 @@ ALLOWED_UPDATE_FIELDS = {
     "location",
     "bio",
     "photos",
+    "sharedPending",
+    "sharedPhotos",
     "comments",
 }
 
@@ -144,6 +146,41 @@ def people():
     })
 
 
+def _validate_shared_pending(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description="`sharedPending` must be an array of {url}")
+    out = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f"`sharedPending[{i}]` must be an object")
+        url = item.get("url")
+        if not isinstance(url, str) or not url.strip():
+            abort(400, description=f"`sharedPending[{i}].url` must be a non-empty string")
+        out.append({"url": url.strip()})
+    return out
+
+
+def _validate_shared_photos(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description="`sharedPhotos` must be an array of {url, description}")
+    out = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f"`sharedPhotos[{i}]` must be an object")
+        url = item.get("url")
+        desc = item.get("description", "")
+        if not isinstance(url, str) or not url.strip():
+            abort(400, description=f"`sharedPhotos[{i}].url` must be a non-empty string")
+        if not isinstance(desc, str):
+            abort(400, description=f"`sharedPhotos[{i}].description` must be a string")
+        out.append({"url": url.strip(), "description": desc})
+    return out
+
+
 @application.route('/api/people/<string:person_id>', methods=['GET'])
 def get_person(person_id):
     # 1) Validate & convert the id
@@ -171,14 +208,13 @@ def get_person(person_id):
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
         "bio": person.get('bio'),
-        "photos": person.get('photos'),
-        "comments": person.get('comments', '')
+        "photos": person.get('photos', []),
+        "sharedPending": person.get('sharedPending', []),
+        "sharedPhotos": person.get('sharedPhotos', []),
+        "comments": person.get('comments', [])
     }
-
-    # Only include premium if present in the document
     if 'premium' in person:
         response['premium'] = person['premium']
-
     return jsonify(response)
 
 
@@ -222,6 +258,10 @@ def update_person(person_id):
             continue
         if field == 'photos':
             update_doc['photos'] = _validate_photos_shape(value)
+        elif field == 'sharedPending':
+            update_doc['sharedPending'] = _validate_shared_pending(value)
+        elif field == 'sharedPhotos':
+            update_doc['sharedPhotos'] = _validate_shared_photos(value)
         else:
             update_doc[field] = value
 
@@ -246,8 +286,10 @@ def update_person(person_id):
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
         "bio": person.get('bio'),
-        "photos": person.get('photos', []),   # [{url, description}]
-        "comments": person.get('comments', []),
+        "photos": person.get('photos', []),
+        "sharedPending": person.get('sharedPending', []),
+        "sharedPhotos": person.get('sharedPhotos', []),
+        "comments": person.get('comments', [])
     }), 200
 
 

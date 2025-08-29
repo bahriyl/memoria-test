@@ -8,7 +8,7 @@ import base64
 from datetime import datetime, timedelta
 import jwt
 
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify, abort, make_response
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
@@ -291,6 +291,33 @@ def update_person(person_id):
         "sharedPhotos": person.get('sharedPhotos', []),
         "comments": person.get('comments', [])
     }), 200
+
+
+@application.route('/api/people/<string:person_id>/shared/offer', methods=['OPTIONS', 'POST'])
+def offer_shared_photo(person_id):
+    # CORS preflight: just OK it
+    if request.method == 'OPTIONS':
+        resp = make_response('', 204)
+        return resp
+
+    # Validate id
+    try:
+        oid = ObjectId(person_id)
+    except Exception:
+        abort(400, description="Invalid person id")
+
+    data = request.get_json(silent=True) or {}
+    url = (data.get('url') or '').strip()
+    if not url:
+        abort(400, description="`url` is required")
+
+    # push to sharedPending (keep minimal shape for now)
+    update = {'$push': {'sharedPending': {'url': url, 'createdAt': datetime.utcnow()}}}
+    res = people_collection.update_one({'_id': oid}, update)
+    if res.matched_count == 0:
+        abort(404, description="Person not found")
+
+    return jsonify({'ok': True})
 
 
 @application.route('/api/people/location_moderation', methods=['POST'])

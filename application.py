@@ -472,72 +472,133 @@ def ritual_services():
 
 @application.route('/api/ritual_services/<string:ritual_service_id>', methods=['GET', 'PUT'])
 def get_ritual_service(ritual_service_id):
-    if request.method == 'GET':
-        try:
-            oid = ObjectId(ritual_service_id)
-        except Exception:
-            abort(400, description="Invalid ritual service id")
+    try:
+        oid = ObjectId(ritual_service_id)
+    except Exception:
+        abort(400, description="Invalid ritual service id")
 
+    if request.method == 'GET':
         ritual_service = ritual_services_collection.find_one({'_id': oid})
         if not ritual_service:
             abort(404, description="Ritual service not found")
+
+        # Always return items as albums: [title: str, albums: [{photos, description}], ...]
+        def _normalize_album_entry(x):
+            # Back-compat:
+            # - "string"  -> one-photo album
+            # - ["u1","u2"] -> album with those photos
+            if isinstance(x, str):
+                return {"photos": [x], "description": ""}
+            if isinstance(x, list):
+                # list of URLs (legacy) -> album
+                photos = [u for u in x if isinstance(u, str) and u.strip()]
+                return {"photos": photos, "description": ""}
+            if isinstance(x, dict):
+                photos = [u for u in x.get("photos", []) if isinstance(u, str) and u.strip()]
+                desc = x.get("description", "")
+                if not isinstance(desc, str):
+                    desc = str(desc)
+                return {"photos": photos, "description": desc}
+            # unknown -> empty album
+            return {"photos": [], "description": ""}
+
+        raw_items = ritual_service.get('items') or []
+        norm_items = []
+        if isinstance(raw_items, list):
+            for it in raw_items:
+                # expect [title, albumsLike]
+                if isinstance(it, list) and len(it) == 2 and isinstance(it[0], str):
+                    title = it[0]
+                    raw_albums = it[1] if isinstance(it[1], list) else []
+                    albums = [_normalize_album_entry(a) for a in raw_albums]
+                    # Drop empty albums (no photos)
+                    albums = [a for a in albums if a["photos"]]
+                    norm_items.append([title, albums])
 
         return jsonify({
             "id": str(ritual_service['_id']),
             "name": ritual_service.get('name'),
             "address": ritual_service.get('address'),
             "category": ritual_service.get('category'),
-            'logo': ritual_service.get('logo'),
+            "logo": ritual_service.get('logo'),
             "latitude": ritual_service.get('latitude'),
             "longitude": ritual_service.get('longitude'),
             "banner": ritual_service.get('banner'),
             "description": ritual_service.get('description'),
             "link": ritual_service.get('link'),
             "phone": ritual_service.get('phone'),
-            "items": ritual_service.get('items')
+            "items": norm_items  # <— always normalized for the new UI
         })
-    elif request.method == 'PUT':
-        data = request.get_json() or {}
-        try:
-            oid = ObjectId(ritual_service_id)
-        except Exception:
-            abort(400, description="Invalid ritual service id")
 
-        ritual_service = ritual_services_collection.find_one({'_id': oid})
-        if not ritual_service:
-            abort(404, description="Ritual service not found")
+    # ---------------------------- PUT ----------------------------
+    data = request.get_json(silent=True) or {}
+    ritual_service = ritual_services_collection.find_one({'_id': oid})
+    if not ritual_service:
+        abort(404, description="Ritual service not found")
 
-        update_fields = {}
+    update_fields = {}
 
-        # Оновлення опису
-        if 'description' in data:
-            update_fields['description'] = data['description']
+    if 'description' in data:
+        if not isinstance(data['description'], (str, type(None))):
+            abort(400, description="`description` must be a string")
+        update_fields['description'] = data['description'] or ""
 
-        # Оновлення списку категорій з фото
-        if 'items' in data and isinstance(data['items'], list):
-            # Перевірка, що кожен елемент має правильну структуру
-            valid_items = []
-            for item in data['items']:
-                if (
-                        isinstance(item, list) and
-                        len(item) == 2 and
-                        isinstance(item[0], str) and
-                        isinstance(item[1], list)
-                ):
-                    valid_items.append(item)
+    # Accept and normalize items to the albums shape
+    if 'items' in data:
+        if not isinstance(data['items'], list):
+            abort(400, description="`items` must be an array")
+        normalized_items = []
+
+        def _validate_url(u, i_title, i_album, i_photo):
+            if not isinstance(u, str) or not u.strip():
+                abort(400, description=f"`items[{i_title}][1][{i_album}].photos[{i_photo}]` must be a non-empty string")
+
+        for i_title, item in enumerate(data['items']):
+            # Each item must be [title, albumsLike]
+            if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+                abort(400, description=f"`items[{i_title}]` must be [title: string, albums: array]")
+
+            title, raw_albums = item[0], item[1]
+            if not isinstance(raw_albums, list):
+                abort(400, description=f"`items[{i_title}][1]` must be an array")
+
+            albums_out = []
+            for i_album, a in enumerate(raw_albums):
+                # Back-compat & normalization
+                if isinstance(a, str):
+                    photos = [a]
+                    desc = ""
+                elif isinstance(a, list):
+                    photos = [u for u in a if isinstance(u, str) and u.strip()]
+                    desc = ""
+                elif isinstance(a, dict):
+                    photos = a.get("photos", [])
+                    desc = a.get("description", "")
+                    if not isinstance(desc, str):
+                        desc = str(desc)
+                    if not isinstance(photos, list):
+                        abort(400, description=f"`items[{i_title}][1][{i_album}].photos` must be an array")
                 else:
-                    abort(400, description="Invalid format for items")
-            update_fields['items'] = valid_items
+                    abort(400, description=f"`items[{i_title}][1][{i_album}]` must be string | array | object")
 
-        if not update_fields:
-            abort(400, description="Nothing to update")
+                # Validate photos array
+                if not photos:
+                    # Allow empty album silently? Prefer rejecting:
+                    abort(400, description=f"`items[{i_title}][1][{i_album}].photos` must contain at least one URL")
+                for i_photo, u in enumerate(photos):
+                    _validate_url(u, i_title, i_album, i_photo)
 
-        ritual_services_collection.update_one(
-            {'_id': oid},
-            {'$set': update_fields}
-        )
+                albums_out.append({"photos": [u.strip() for u in photos], "description": desc})
 
-        return jsonify({"message": "Ritual service updated successfully"}), 200
+            normalized_items.append([title, albums_out])
+
+        update_fields['items'] = normalized_items
+
+    if not update_fields:
+        abort(400, description="Nothing to update")
+
+    ritual_services_collection.update_one({'_id': oid}, {'$set': update_fields})
+    return jsonify({"message": "Ritual service updated successfully"}), 200
 
 
 @application.route('/api/ritual_services/login', methods=['POST'])

@@ -412,29 +412,65 @@ def locations():
 @application.route('/api/cemeteries', methods=['GET'])
 def cemeteries():
     """
-    Повертає список унікальних назв кладовищ ('cemetries')
-    для заданої області, з опційним пошуком по імені кладовища.
+    Повертає список об'єктів { name, area }:
+      - name: назва кладовища
+      - area: населений пункт / область, з документа areas_collection.area
+
+    Фільтри:
+      - area   — partial, case-insensitive по полю area
+      - search — partial, case-insensitive по елементам масиву cemetries
     """
     area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
-    query = {}
 
-    # Фільтр по області (partial, case-insensitive)
+    # Будуємо aggregation pipeline
+    pipeline = []
+
+    # 1) Фільтр по населеному пункту/області
     if area:
-        query['area'] = {'$regex': re.escape(area), '$options': 'i'}
+        pipeline.append({
+            '$match': {
+                'area': {'$regex': re.escape(area), '$options': 'i'}
+            }
+        })
 
-    # Фільтр по назві кладовища (partial, case-insensitive)
+    # 2) Беремо лише потрібні поля
+    pipeline.extend([
+        {'$project': {'area': 1, 'cemetries': 1}},
+        {'$unwind': '$cemetries'}
+    ])
+
+    # 3) Фільтр по назві кладовища
     if search:
-        # шукаємо документи, в яких хоч один елемент масива cemetries містить пошуковий рядок
-        query['cemetries'] = {'$regex': re.escape(search), '$options': 'i'}
+        pipeline.append({
+            '$match': {
+                'cemetries': {'$regex': re.escape(search), '$options': 'i'}
+            }
+        })
 
-    # Повертаємо унікальний перелік назв кладовищ із відповідних масивів
-    cemeteries = areas_collection.distinct('cemetries', query)
+    # 4) Прибрати порожні значення
+    pipeline.append({
+        '$match': {
+            'cemetries': {'$nin': [None, '']}
+        }
+    })
 
-    # Приберемо пусті, відсортуємо та обмежимо 10 варіантами
-    cemeteries = sorted([c for c in cemeteries if c])[:10]
+    # 5) Унікальні пари (кладовище, area)
+    pipeline.extend([
+        {'$group': {
+            '_id': {'name': '$cemetries', 'area': '$area'}
+        }},
+        {'$project': {
+            '_id': 0,
+            'name': '$_id.name',
+            'area': '$_id.area'
+        }},
+        {'$sort': {'name': 1}},
+        {'$limit': 10}
+    ])
 
-    return jsonify(cemeteries)
+    items = list(areas_collection.aggregate(pipeline))
+    return jsonify(items)
 
 
 @application.route('/api/ritual_services', methods=['GET'])

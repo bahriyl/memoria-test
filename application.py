@@ -243,7 +243,7 @@ def _validate_photos_shape(value):
     return out
 
 
-ALLOWED_ROLES = {'Батько', 'Мати', 'Брат', 'Сестра'}
+ALLOWED_ROLES = {'Батько', 'Мати', 'Брат', 'Сестра', ' '}
 
 
 def _validate_relatives(value):

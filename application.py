@@ -68,6 +68,7 @@ ALLOWED_UPDATE_FIELDS = {
     "sharedPending",
     "sharedPhotos",
     "comments",
+    "relatives",
 }
 
 
@@ -213,6 +214,11 @@ def get_person(person_id):
         "sharedPhotos": person.get('sharedPhotos', []),
         "comments": person.get('comments', [])
     }
+    if 'relatives' in person:
+        response['relatives'] = [
+            {"personId": str(r['personId']), "role": r.get('role')}
+            for r in person.get('relatives', [])
+        ]
     if 'premium' in person:
         response['premium'] = person['premium']
     return jsonify(response)
@@ -237,6 +243,41 @@ def _validate_photos_shape(value):
     return out
 
 
+ALLOWED_ROLES = {'Батько', 'Мати', 'Брат', 'Сестра'}
+
+
+def _validate_relatives(value):
+    if not isinstance(value, list):
+        abort(400, description="`relatives` must be a list")
+
+    cleaned = []
+    seen = set()
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f"relatives[{i}] must be an object")
+
+        pid = item.get('personId') or item.get('id')
+        role = item.get('role')
+
+        if not pid:
+            abort(400, description=f"relatives[{i}].personId is required")
+        try:
+            oid = ObjectId(pid)
+        except Exception:
+            abort(400, description=f"relatives[{i}].personId is invalid")
+
+        if role not in ALLOWED_ROLES:
+            abort(400, description=f"relatives[{i}].role must be one of: {', '.join(sorted(ALLOWED_ROLES))}")
+
+        # de-dupe by personId (last wins)
+        if oid in seen:
+            cleaned = [r for r in cleaned if r['personId'] != oid]
+        seen.add(oid)
+
+        cleaned.append({'personId': oid, 'role': role})
+    return cleaned
+
+
 @application.route('/api/people/<string:person_id>', methods=['PUT'])
 def update_person(person_id):
     try:
@@ -248,7 +289,6 @@ def update_person(person_id):
     if not isinstance(data, dict):
         abort(400, description="Request must be a JSON object")
 
-    # Reject legacy field if provided
     if 'photoDescriptions' in data:
         abort(400, description="`photoDescriptions` is no longer supported. Use `photos: [{url, description}]`.")
 
@@ -262,6 +302,8 @@ def update_person(person_id):
             update_doc['sharedPending'] = _validate_shared_pending(value)
         elif field == 'sharedPhotos':
             update_doc['sharedPhotos'] = _validate_shared_photos(value)
+        elif field == 'relatives':
+            update_doc['relatives'] = _validate_relatives(value)
         else:
             update_doc[field] = value
 
@@ -289,7 +331,11 @@ def update_person(person_id):
         "photos": person.get('photos', []),
         "sharedPending": person.get('sharedPending', []),
         "sharedPhotos": person.get('sharedPhotos', []),
-        "comments": person.get('comments', [])
+        "comments": person.get('comments', []),
+        "relatives": [
+            {"personId": str(r['personId']), "role": r['role']}
+            for r in person.get('relatives', [])
+        ]
     }), 200
 
 

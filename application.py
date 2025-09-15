@@ -437,14 +437,14 @@ def get_cemetery_page(cemetery_id):
 def locations():
     """
     Повертає список унікальних назв «area»,
-    що містять рядок search, нечутливих до регістру.
+    що починаються з рядка search, нечутливого до регістру.
     """
     search = request.args.get('search', '').strip()
     query = {}
 
     if search:
-        # частковий, нечутливий до регістру пошук по полі area
-        query['area'] = {'$regex': re.escape(search), '$options': 'i'}
+        # пошук тільки з початку рядка, нечутливий до регістру
+        query['area'] = {'$regex': f'^{re.escape(search)}', '$options': 'i'}
 
     # отримуємо усі унікальні значення area з нової колекції
     areas = areas_collection.distinct('area', query)
@@ -463,8 +463,8 @@ def cemeteries():
       - area: населений пункт / область, з документа areas_collection.area
 
     Фільтри:
-      - area   — partial, case-insensitive по полю area
-      - search — partial, case-insensitive по елементам масиву cemetries
+      - area   — початок рядка, case-insensitive по полю area
+      - search — початок рядка, case-insensitive по елементам масиву cemetries
     """
     area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
@@ -472,11 +472,11 @@ def cemeteries():
     # Будуємо aggregation pipeline
     pipeline = []
 
-    # 1) Фільтр по населеному пункту/області
+    # 1) Фільтр по населеному пункту/області (тільки з початку рядка)
     if area:
         pipeline.append({
             '$match': {
-                'area': {'$regex': re.escape(area), '$options': 'i'}
+                'area': {'$regex': f'^{re.escape(area)}', '$options': 'i'}
             }
         })
 
@@ -486,11 +486,11 @@ def cemeteries():
         {'$unwind': '$cemetries'}
     ])
 
-    # 3) Фільтр по назві кладовища
+    # 3) Фільтр по назві кладовища (тільки з початку рядка)
     if search:
         pipeline.append({
             '$match': {
-                'cemetries': {'$regex': re.escape(search), '$options': 'i'}
+                'cemetries': {'$regex': f'^{re.escape(search)}', '$options': 'i'}
             }
         })
 

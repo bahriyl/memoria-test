@@ -437,14 +437,23 @@ def get_cemetery_page(cemetery_id):
 def locations():
     """
     Повертає список унікальних назв «area»,
-    що починаються з рядка search, нечутливого до регістру.
+    що починаються (з 4-го символа) з рядка search, нечутливого до регістру.
+    Наприклад: у БД "м. Львів" -> користувач шукає "л" -> буде знайдено.
     """
     search = request.args.get('search', '').strip()
     query = {}
 
     if search:
-        # пошук тільки з початку рядка, нечутливий до регістру
-        query['area'] = {'$regex': f'^{re.escape(search)}', '$options': 'i'}
+        # Використовуємо $expr, щоб взяти підрядок починаючи з 4-го символа
+        query = {
+            '$expr': {
+                '$regexMatch': {
+                    'input': {'$substrCP': ['$area', 3, {'$strLenCP': '$area'}]},
+                    'regex': f'^{re.escape(search)}',
+                    'options': 'i'
+                }
+            }
+        }
 
     # отримуємо усі унікальні значення area з нової колекції
     areas = areas_collection.distinct('area', query)

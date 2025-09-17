@@ -1,16 +1,17 @@
 import eventlet
+
 eventlet.monkey_patch()
 
 import os
 import re
 import requests
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import jwt
 
 from flask import Flask, request, jsonify, abort, make_response
 from flask_cors import CORS
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from twilio.rest import Client
@@ -48,6 +49,7 @@ message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
 ritual_services_collection = db['ritual_services']
 location_moderation_collection = db['location_moderation']
+liturgies_collection = db['liturgies']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -70,6 +72,18 @@ ALLOWED_UPDATE_FIELDS = {
     "comments",
     "relatives",
 }
+
+try:
+    liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
+except Exception:
+    pass
+
+
+def _to_object_id(s):
+    try:
+        return ObjectId(s)
+    except Exception:
+        abort(400, "Invalid ObjectId format")
 
 
 @application.route("/api/binance-p2p", methods=["POST"])
@@ -539,7 +553,8 @@ def ritual_services():
         query_filter['name'] = {'$regex': re.escape(search_query), '$options': 'i'}
 
     if address:
-        query_filter['address'] = {'$regex': re.escape(address), '$options': 'i'}  # частковий, нечутливий до регістру пошук
+        query_filter['address'] = {'$regex': re.escape(address),
+                                   '$options': 'i'}  # частковий, нечутливий до регістру пошук
 
     ritual_services_cursor = ritual_services_collection.find(query_filter)
 
@@ -1065,6 +1080,101 @@ def post_message(chat_id):
         }, room=chat_id)
 
     return jsonify({'success': True}), 201
+
+
+@application.route("/api/liturgies", methods=["POST"])
+def create_liturgy():
+    """
+    Create a new liturgy (service) record.
+
+    Expected JSON:
+    {
+      "personId": "<string:ObjectId>",           # required
+      "date": "2025-09-21",                      # required (YYYY-MM-DD) or full ISO "2025-09-21T10:00"
+      "time": "10:00",                            # optional (HH:MM); ignored if 'date' already has time
+      "type": "Божественна Літургія",            # optional, default: "Літургія"
+      "intention": "за упокій",                  # optional
+      "churchId": "<string:ObjectId>",           # optional
+      "churchName": "Святоюрський собор",        # optional
+      "churchAddress": "пл. Св. Юра, 5",         # optional
+      "city": "Львів",                           # optional
+      "price": 500,                               # optional number
+      "currency": "UAH",                          # optional, default: "UAH"
+      "status": "planned",                        # optional: planned|completed|canceled (default planned)
+      "notes": "Попросили прочитати суботню",    # optional
+      "createdBy": "<string:ObjectId or email>"   # optional
+    }
+    """
+    data = request.get_json(silent=True) or {}
+
+    # required fields
+    person_id = data.get("personId")
+    if not person_id:
+        abort(400, "personId is required")
+
+    person_oid = _to_object_id(person_id)
+
+    # parse date/time
+    raw_date = (data.get("date") or "").strip()
+    raw_time = (data.get("time") or "").strip()
+    if not raw_date:
+        abort(400, "date is required (YYYY-MM-DD or ISO-8601)")
+
+    # Accept either "YYYY-MM-DD" + optional time OR full ISO in 'date'
+    try:
+        if "T" in raw_date:
+            service_dt = datetime.fromisoformat(raw_date)
+        else:
+            service_dt = datetime.fromisoformat(
+                f"{raw_date}T{raw_time}" if raw_time else f"{raw_date}T00:00"
+            )
+    except ValueError:
+        abort(400, "Invalid date/time format. Use YYYY-MM-DD and optional HH:MM or full ISO-8601")
+
+    now_utc = datetime.now(timezone.utc)
+
+    doc = {
+        "personId": person_oid,
+        "serviceType": (data.get("type") or "Літургія").strip(),
+        "intention": (data.get("intention") or "").strip(),
+        "serviceDate": service_dt,  # stored as datetime
+        "church": {
+            "id": data.get("churchId"),
+            "name": (data.get("churchName") or "").strip(),
+            "address": (data.get("churchAddress") or "").strip(),
+            "city": (data.get("city") or "").strip(),
+        },
+        "status": (data.get("status") or "planned").strip(),
+        "price": data.get("price"),
+        "currency": (data.get("currency") or "UAH").strip(),
+        "notes": (data.get("notes") or "").strip(),
+        "createdBy": data.get("createdBy"),
+        "createdAt": now_utc,
+        "updatedAt": now_utc,
+    }
+
+    # compact empty church fields
+    doc["church"] = {k: v for k, v in doc["church"].items() if v}
+
+    ins = liturgies_collection.insert_one(doc)
+
+    # response: convert ObjectIds & datetimes to strings
+    out = {
+        "_id": str(ins.inserted_id),
+        "personId": str(doc["personId"]),
+        "serviceType": doc["serviceType"],
+        "intention": doc["intention"],
+        "serviceDate": doc["serviceDate"].isoformat(),
+        "church": doc["church"],
+        "status": doc["status"],
+        "price": doc["price"],
+        "currency": doc["currency"],
+        "notes": doc["notes"],
+        "createdBy": doc["createdBy"],
+        "createdAt": doc["createdAt"].isoformat(),
+        "updatedAt": doc["updatedAt"].isoformat(),
+    }
+    return jsonify(out), 201
 
 
 @socketio.on('joinRoom')

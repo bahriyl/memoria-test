@@ -1085,42 +1085,32 @@ def post_message(chat_id):
 @application.route("/api/liturgies", methods=["POST"])
 def create_liturgy():
     """
-    Create a new liturgy (service) record.
-
+    Minimal create: keep only createdAt, serviceDate, churchName, person, price.
     Expected JSON:
     {
-      "personId": "<string:ObjectId>",           # required
-      "date": "2025-09-21",                      # required (YYYY-MM-DD) or full ISO "2025-09-21T10:00"
-      "time": "10:00",                            # optional (HH:MM); ignored if 'date' already has time
-      "type": "Божественна Літургія",            # optional, default: "Літургія"
-      "intention": "за упокій",                  # optional
-      "churchId": "<string:ObjectId>",           # optional
-      "churchName": "Святоюрський собор",        # optional
-      "churchAddress": "пл. Св. Юра, 5",         # optional
-      "city": "Львів",                           # optional
-      "price": 500,                               # optional number
-      "currency": "UAH",                          # optional, default: "UAH"
-      "status": "planned",                        # optional: planned|completed|canceled (default planned)
-      "notes": "Попросили прочитати суботню",    # optional
-      "createdBy": "<string:ObjectId or email>"   # optional
+      "personId": "<ObjectId string>",   # required
+      "date": "2025-09-21" | "2025-09-21T10:00",  # required
+      "time": "10:00",                   # optional (ignored if date has time)
+      "churchName": "Святоюрський собор",# optional
+      "price": 500                       # optional (number)
     }
     """
     data = request.get_json(silent=True) or {}
 
-    # required fields
-    person_id = data.get("personId")
+    # person
+    person_id = (data.get("personId") or "").strip()
     if not person_id:
         abort(400, "personId is required")
+    try:
+        person_oid = ObjectId(person_id)
+    except Exception:
+        abort(400, "Invalid personId")
 
-    person_oid = _to_object_id(person_id)
-
-    # parse date/time
+    # date/time -> serviceDate (datetime)
     raw_date = (data.get("date") or "").strip()
     raw_time = (data.get("time") or "").strip()
     if not raw_date:
         abort(400, "date is required (YYYY-MM-DD or ISO-8601)")
-
-    # Accept either "YYYY-MM-DD" + optional time OR full ISO in 'date'
     try:
         if "T" in raw_date:
             service_dt = datetime.fromisoformat(raw_date)
@@ -1131,50 +1121,56 @@ def create_liturgy():
     except ValueError:
         abort(400, "Invalid date/time format. Use YYYY-MM-DD and optional HH:MM or full ISO-8601")
 
+    # optional fields
+    church_name = (data.get("churchName") or "").strip() or None
+    price = data.get("price")  # keep as-is if number or None
+
     now_utc = datetime.now(timezone.utc)
 
+    # Only the required minimal fields are persisted
     doc = {
-        "personId": person_oid,
-        "serviceType": (data.get("type") or "Літургія").strip(),
-        "intention": (data.get("intention") or "").strip(),
-        "serviceDate": service_dt,  # stored as datetime
-        "church": {
-            "id": data.get("churchId"),
-            "name": (data.get("churchName") or "").strip(),
-            "address": (data.get("churchAddress") or "").strip(),
-            "city": (data.get("city") or "").strip(),
-        },
-        "status": (data.get("status") or "planned").strip(),
-        "price": data.get("price"),
-        "currency": (data.get("currency") or "UAH").strip(),
-        "notes": (data.get("notes") or "").strip(),
-        "createdBy": data.get("createdBy"),
+        "person": person_oid,
+        "serviceDate": service_dt,
+        "churchName": church_name,
+        "price": price,
         "createdAt": now_utc,
-        "updatedAt": now_utc,
     }
-
-    # compact empty church fields
-    doc["church"] = {k: v for k, v in doc["church"].items() if v}
 
     ins = liturgies_collection.insert_one(doc)
 
-    # response: convert ObjectIds & datetimes to strings
+    # Minimal response with only the requested fields
     out = {
         "_id": str(ins.inserted_id),
-        "personId": str(doc["personId"]),
-        "serviceType": doc["serviceType"],
-        "intention": doc["intention"],
+        "person": str(doc["person"]),
         "serviceDate": doc["serviceDate"].isoformat(),
-        "church": doc["church"],
-        "status": doc["status"],
+        "churchName": doc["churchName"],
         "price": doc["price"],
-        "currency": doc["currency"],
-        "notes": doc["notes"],
-        "createdBy": doc["createdBy"],
         "createdAt": doc["createdAt"].isoformat(),
-        "updatedAt": doc["updatedAt"].isoformat(),
     }
     return jsonify(out), 201
+
+
+@application.route("/api/people/<person_id>/liturgies", methods=["GET"])
+def list_liturgies(person_id):
+    """Return all liturgies for a given person, sorted by serviceDate ascending."""
+    try:
+        person_oid = ObjectId(person_id)
+    except Exception:
+        abort(400, "Invalid personId")
+
+    cursor = liturgies_collection.find({"person": person_oid}).sort("serviceDate", ASCENDING)
+
+    results = []
+    for doc in cursor:
+        results.append({
+            "_id": str(doc["_id"]),
+            "person": str(doc["person"]),
+            "serviceDate": doc["serviceDate"].isoformat(),
+            "churchName": doc.get("churchName"),
+            "price": doc.get("price"),
+            "createdAt": doc["createdAt"].isoformat(),
+        })
+    return jsonify(results)
 
 
 @socketio.on('joinRoom')

@@ -71,6 +71,7 @@ ALLOWED_UPDATE_FIELDS = {
     "sharedPhotos",
     "comments",
     "relatives",
+    "heroImage",
 }
 
 try:
@@ -219,6 +220,7 @@ def get_person(person_id):
         "deathDate": person.get('deathDate'),
         "notable": person.get('notable', False),
         "avatarUrl": person.get('avatarUrl'),
+        "heroImage": person.get('heroImage'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
@@ -338,6 +340,7 @@ def update_person(person_id):
         "deathDate": person.get('deathDate'),
         "notable": person.get('notable', False),
         "avatarUrl": person.get('avatarUrl'),
+        "heroImage": person.get('heroImage'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),

@@ -153,6 +153,7 @@ def people():
             "deathYear": person.get('deathYear'),
             "notable": person.get('notable'),
             "avatarUrl": person.get('avatarUrl'),
+            "portraitUrl": person.get('portraitUrl'),
             "area": person.get('area'),
             "cemetery": person.get('cemetery')
         })

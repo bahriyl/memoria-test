@@ -62,6 +62,7 @@ ALLOWED_UPDATE_FIELDS = {
     "deathDate",
     "notable",
     "avatarUrl",
+    "portraitUrl",
     "area",
     "cemetery",
     "location",
@@ -199,18 +200,15 @@ def _validate_shared_photos(value):
 
 @application.route('/api/people/<string:person_id>', methods=['GET'])
 def get_person(person_id):
-    # 1) Validate & convert the id
     try:
         oid = ObjectId(person_id)
     except Exception:
         abort(400, description="Invalid person id")
 
-    # 2) Fetch from Mongo
     person = people_collection.find_one({'_id': oid})
     if not person:
         abort(404, description="Person not found")
 
-    # 3) Build your response payload
     response = {
         "id": str(person['_id']),
         "name": person.get('name'),
@@ -220,6 +218,7 @@ def get_person(person_id):
         "deathDate": person.get('deathDate'),
         "notable": person.get('notable', False),
         "avatarUrl": person.get('avatarUrl'),
+        "portraitUrl": person.get('portraitUrl'),   # ← NEW
         "heroImage": person.get('heroImage'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
@@ -321,6 +320,7 @@ def update_person(person_id):
         elif field == 'relatives':
             update_doc['relatives'] = _validate_relatives(value)
         else:
+            # accepts avatarUrl=None and portraitUrl=None to clear either/both
             update_doc[field] = value
 
     if not update_doc:
@@ -340,6 +340,7 @@ def update_person(person_id):
         "deathDate": person.get('deathDate'),
         "notable": person.get('notable', False),
         "avatarUrl": person.get('avatarUrl'),
+        "portraitUrl": person.get('portraitUrl'),   # ← NEW
         "heroImage": person.get('heroImage'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),

@@ -1,3 +1,5 @@
+import time
+
 import eventlet
 
 eventlet.monkey_patch()
@@ -1076,6 +1078,7 @@ def post_message(chat_id):
             'createdAt': datetime.utcnow(),
             'imageData': None
         }
+        time.sleep(2)
         message_collection.insert_one(followup)
         socketio.emit('newMessage', {
             'sender': followup['sender'],

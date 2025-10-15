@@ -40,6 +40,8 @@ twilio_client = Client(
 )
 verify_service = os.getenv('TWILIO_VERIFY_SERVICE_SID')
 
+API_VIDEO_SECRET_KEY = os.getenv('API_VIDEO_SECRET_KEY')
+
 client = MongoClient('mongodb+srv://tsbgalcontract:mymongodb26@cluster0.kppkt.mongodb.net/test')
 db = client['memoria_test']
 people_collection = db['people']
@@ -1179,6 +1181,37 @@ def list_liturgies(person_id):
             "createdAt": doc["createdAt"].isoformat(),
         })
     return jsonify(results)
+
+
+@application.route("/video/upload-token", methods=["GET"])
+def create_video_upload_token():
+    """
+    Generate a one-time upload token for api.video (delegated upload).
+    Called from frontend before uploading a video.
+    """
+    # Optional: require auth if you use JWT elsewhere
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        r = requests.post(
+            "https://ws.api.video/upload-tokens",
+            headers={"Authorization": f"Bearer {API_VIDEO_SECRET_KEY}",
+                     "Content-Type": "application/json"},
+            json={}  # no params needed
+        )
+        if r.status_code != 201:
+            return jsonify({"error": "Failed to create upload token", "details": r.text}), 500
+
+        data = r.json()
+        token = data.get("token")
+        if not token:
+            return jsonify({"error": "Invalid response from api.video"}), 500
+
+        return jsonify({"token": token})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @socketio.on('joinRoom')

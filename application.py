@@ -6,6 +6,7 @@ eventlet.monkey_patch()
 
 import os
 import re
+import boto3
 import requests
 import base64
 from datetime import datetime, timedelta, timezone
@@ -40,7 +41,19 @@ twilio_client = Client(
 )
 verify_service = os.getenv('TWILIO_VERIFY_SERVICE_SID')
 
-API_VIDEO_SECRET_KEY = os.getenv('API_VIDEO_SECRET_KEY')
+SPACES_KEY = os.environ.get("SPACES_KEY")
+SPACES_SECRET = os.environ.get("SPACES_SECRET")
+SPACES_REGION = os.environ.get("SPACES_REGION")
+SPACES_BUCKET = os.environ.get("SPACES_BUCKET")
+
+# Create S3-compatible client for DigitalOcean Spaces
+s3 = boto3.client(
+    "s3",
+    region_name=SPACES_REGION,
+    endpoint_url=f"https://{SPACES_REGION}.digitaloceanspaces.com",
+    aws_access_key_id=SPACES_KEY,
+    aws_secret_access_key=SPACES_SECRET,
+)
 
 client = MongoClient('mongodb+srv://tsbgalcontract:mymongodb26@cluster0.kppkt.mongodb.net/test')
 db = client['memoria_test']
@@ -223,7 +236,7 @@ def get_person(person_id):
         "deathDate": person.get('deathDate'),
         "notable": person.get('notable', False),
         "avatarUrl": person.get('avatarUrl'),
-        "portraitUrl": person.get('portraitUrl'),   # ← NEW
+        "portraitUrl": person.get('portraitUrl'),  # ← NEW
         "heroImage": person.get('heroImage'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
@@ -345,7 +358,7 @@ def update_person(person_id):
         "deathDate": person.get('deathDate'),
         "notable": person.get('notable', False),
         "avatarUrl": person.get('avatarUrl'),
-        "portraitUrl": person.get('portraitUrl'),   # ← NEW
+        "portraitUrl": person.get('portraitUrl'),  # ← NEW
         "heroImage": person.get('heroImage'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
@@ -1183,33 +1196,62 @@ def list_liturgies(person_id):
     return jsonify(results)
 
 
-@application.route("/video/upload-token", methods=["GET"])
-def create_video_upload_token():
+@application.route("/spaces/video-upload-url", methods=["GET"])
+def spaces_video_upload_url():
     """
-    Generate a one-time upload token for api.video (delegated upload).
-    Called from frontend before uploading a video.
+    Issues a presigned PUT URL so the browser can upload a video straight to DigitalOcean Spaces.
+    Query params:
+      - filename (required): original file name (used to derive object key)
+      - contentType (optional): e.g., video/mp4, video/quicktime; defaults to application/octet-stream
+      - prefix (optional): folder prefix, defaults to "videos/"
+    Returns:
+      {
+        "uploadUrl": "<presigned PUT URL>",
+        "objectUrl": "https://<bucket>.<region>.digitaloceanspaces.com/<key>",
+        "key": "<key>",
+        "expiresIn": 600
+      }
     """
-    # Optional: require auth if you use JWT elsewhere
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Unauthorized"}), 401
+
+    filename = (request.args.get("filename") or "").strip()
+    contentType = (request.args.get("contentType") or "application/octet-stream").strip()
+    prefix = (request.args.get("prefix") or "videos/").strip()
+
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+
+    # Basic filename hardening
+    # keep alnum, dash, underscore, dot; replace others with '_'
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename)
+    if not safe_name:
+        safe_name = f"video_{int(time.time())}.mp4"
+
+    # Compose object key: prefix + timestamped filename to avoid collisions
+    ts = int(time.time())
+    key = f"{prefix.rstrip('/')}/{ts}_{safe_name}"
 
     try:
-        r = requests.post(
-            "https://ws.api.video/upload-tokens",
-            headers={"Authorization": f"Bearer {API_VIDEO_SECRET_KEY}",
-                     "Content-Type": "application/json"},
-            json={}  # no params needed
+        # Generate presigned PUT URL (10 minutes)
+        presigned_url = s3.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={
+                "Bucket": SPACES_BUCKET,
+                "Key": key,
+                "ContentType": contentType,
+            },
+            ExpiresIn=600,
+            HttpMethod="PUT",
         )
-        if r.status_code != 201:
-            return jsonify({"error": "Failed to create upload token", "details": r.text}), 500
 
-        data = r.json()
-        token = data.get("token")
-        if not token:
-            return jsonify({"error": "Invalid response from api.video"}), 500
+        # Public URL (origin). If you use a CDN endpoint, replace this with your CDN base.
+        object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
 
-        return jsonify({"token": token})
+        return jsonify({
+            "uploadUrl": presigned_url,
+            "objectUrl": object_url,
+            "key": key,
+            "expiresIn": 600
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

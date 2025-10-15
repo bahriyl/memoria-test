@@ -8,3 +8,4 @@ gunicorn
 flask-socketio
 eventlet
 PyJWT
+boto3

@@ -610,18 +610,34 @@ def get_ritual_service(ritual_service_id):
         if not ritual_service:
             abort(404, description="Ritual service not found")
 
-        # Always return items as albums: [title: str, albums: [{photos, description}], ...]
+        # ---- Normalization (GET) ----
+        # Always return items as albums: [title: str, albums: [{photos|video, description}], ...]
         def _normalize_album_entry(x):
-            # Back-compat:
-            # - "string"  -> one-photo album
-            # - ["u1","u2"] -> album with those photos
+            """
+            Back-compat:
+              - "string"         -> photo album with one photo
+              - ["u1","u2"]      -> photo album with those photos
+              - {"photos":[...]} -> photo album
+              - {"video":{...}}  -> video album (NEW)
+            """
             if isinstance(x, str):
                 return {"photos": [x], "description": ""}
             if isinstance(x, list):
-                # list of URLs (legacy) -> album
                 photos = [u for u in x if isinstance(u, str) and u.strip()]
                 return {"photos": photos, "description": ""}
             if isinstance(x, dict):
+                # Video first
+                if isinstance(x.get("video"), dict):
+                    v = x["video"]
+                    player = v.get("player") if isinstance(v.get("player"), str) else ""
+                    poster = v.get("poster") if isinstance(v.get("poster"), str) else ""
+                    desc = x.get("description", "")
+                    if not isinstance(desc, str):
+                        desc = str(desc)
+                    if player.strip():
+                        return {"video": {"player": player.strip(), "poster": poster.strip() if poster else ""}, "description": desc}
+                    # If malformed video (no player), fall through to photos parsing.
+
                 photos = [u for u in x.get("photos", []) if isinstance(u, str) and u.strip()]
                 desc = x.get("description", "")
                 if not isinstance(desc, str):
@@ -639,8 +655,12 @@ def get_ritual_service(ritual_service_id):
                     title = it[0]
                     raw_albums = it[1] if isinstance(it[1], list) else []
                     albums = [_normalize_album_entry(a) for a in raw_albums]
-                    # Drop empty albums (no photos)
-                    albums = [a for a in albums if a["photos"]]
+                    # Drop empty albums (no photos AND no video.player)
+                    def _not_empty(a):
+                        if "video" in a and isinstance(a["video"], dict):
+                            return bool(a["video"].get("player"))
+                        return bool(a.get("photos"))
+                    albums = [a for a in albums if _not_empty(a)]
                     norm_items.append([title, albums])
 
         return jsonify({
@@ -655,7 +675,7 @@ def get_ritual_service(ritual_service_id):
             "description": ritual_service.get('description'),
             "link": ritual_service.get('link'),
             "phone": ritual_service.get('phone'),
-            "items": norm_items  # <— always normalized for the new UI
+            "items": norm_items  # normalized for the new UI (photos or video)
         })
 
     # ---------------------------- PUT ----------------------------
@@ -681,6 +701,10 @@ def get_ritual_service(ritual_service_id):
             if not isinstance(u, str) or not u.strip():
                 abort(400, description=f"`items[{i_title}][1][{i_album}].photos[{i_photo}]` must be a non-empty string")
 
+        def _validate_video(player_val, i_title, i_album):
+            if not isinstance(player_val, str) or not player_val.strip():
+                abort(400, description=f"`items[{i_title}][1][{i_album}].video.player` must be a non-empty string")
+
         for i_title, item in enumerate(data['items']):
             # Each item must be [title, albumsLike]
             if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
@@ -696,27 +720,44 @@ def get_ritual_service(ritual_service_id):
                 if isinstance(a, str):
                     photos = [a]
                     desc = ""
-                elif isinstance(a, list):
+                    albums_out.append({"photos": [u.strip() for u in photos], "description": desc})
+                    continue
+
+                if isinstance(a, list):
                     photos = [u for u in a if isinstance(u, str) and u.strip()]
-                    desc = ""
-                elif isinstance(a, dict):
-                    photos = a.get("photos", [])
+                    if not photos:
+                        abort(400, description=f"`items[{i_title}][1][{i_album}].photos` must contain at least one URL")
+                    for i_photo, u in enumerate(photos):
+                        _validate_url(u, i_title, i_album, i_photo)
+                    albums_out.append({"photos": [u.strip() for u in photos], "description": ""})
+                    continue
+
+                if isinstance(a, dict):
                     desc = a.get("description", "")
                     if not isinstance(desc, str):
                         desc = str(desc)
+
+                    # --- NEW: video album ---
+                    if isinstance(a.get("video"), dict):
+                        v = a["video"]
+                        player = v.get("player")
+                        poster = v.get("poster") if isinstance(v.get("poster"), str) else ""
+                        _validate_video(player, i_title, i_album)
+                        albums_out.append({"video": {"player": player.strip(), "poster": poster.strip() if poster else ""}, "description": desc})
+                        continue
+
+                    # photo album object
+                    photos = a.get("photos", [])
                     if not isinstance(photos, list):
                         abort(400, description=f"`items[{i_title}][1][{i_album}].photos` must be an array")
-                else:
-                    abort(400, description=f"`items[{i_title}][1][{i_album}]` must be string | array | object")
+                    if not photos:
+                        abort(400, description=f"`items[{i_title}][1][{i_album}].photos` must contain at least one URL")
+                    for i_photo, u in enumerate(photos):
+                        _validate_url(u, i_title, i_album, i_photo)
+                    albums_out.append({"photos": [u.strip() for u in photos], "description": desc})
+                    continue
 
-                # Validate photos array
-                if not photos:
-                    # Allow empty album silently? Prefer rejecting:
-                    abort(400, description=f"`items[{i_title}][1][{i_album}].photos` must contain at least one URL")
-                for i_photo, u in enumerate(photos):
-                    _validate_url(u, i_title, i_album, i_photo)
-
-                albums_out.append({"photos": [u.strip() for u in photos], "description": desc})
+                abort(400, description=f"`items[{i_title}][1][{i_album}]` must be string | array | object")
 
             normalized_items.append([title, albums_out])
 
@@ -1196,7 +1237,7 @@ def list_liturgies(person_id):
     return jsonify(results)
 
 
-@application.route("/spaces/video-upload-url", methods=["GET"])
+@application.route("/api/spaces/video-upload-url", methods=["GET"])
 def spaces_video_upload_url():
     """
     Issues a presigned PUT URL so the browser can upload a video straight to DigitalOcean Spaces.
@@ -1252,6 +1293,20 @@ def spaces_video_upload_url():
             "key": key,
             "expiresIn": 600
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@application.route("/api/spaces/make-public", methods=["POST"])
+def spaces_make_public():
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip()
+    if not key:
+        return jsonify({"error": "key required"}), 400
+    try:
+        s3.put_object_acl(Bucket=SPACES_BUCKET, Key=key, ACL="public-read")
+        object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
+        return jsonify({"objectUrl": object_url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

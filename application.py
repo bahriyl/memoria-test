@@ -6,6 +6,8 @@ eventlet.monkey_patch()
 
 import os
 import re
+import secrets
+import bcrypt
 import boto3
 import requests
 import base64
@@ -18,7 +20,11 @@ from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from twilio.rest import Client
-from flask_socketio import SocketIO, join_room, emit
+from flask_socketio import SocketIO, join_room
+
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 load_dotenv()
 
@@ -103,6 +109,48 @@ def _to_object_id(s):
         return ObjectId(s)
     except Exception:
         abort(400, "Invalid ObjectId format")
+
+
+def verify_password(raw_password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(raw_password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def hash_password(raw: str) -> str:
+    return bcrypt.hashpw(raw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def validate_new_password(pw: str):
+    if not isinstance(pw, str) or len(pw) < 8:
+        abort(400, description="Пароль має містити щонайменше 8 символів")
+
+
+def send_mail(to_email: str, subject: str, html: str):
+    """Send an HTML email using Gmail SMTP with TLS."""
+    from_email = os.getenv("GMAIL_USER")
+    password = os.getenv("GMAIL_PASS")
+
+    if not from_email or not password:
+        raise RuntimeError("Missing GMAIL_USER or GMAIL_PASS in environment variables")
+
+    # Build message
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        # Connect to Gmail SMTP (TLS)
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()  # Upgrade to secure connection
+            server.login(from_email, password)
+            server.send_message(msg)
+        print(f"[MAIL] Sent to={to_email} subj={subject}")
+    except Exception as e:
+        print(f"[MAIL ERROR] to={to_email}: {e}")
 
 
 @application.route("/api/binance-p2p", methods=["POST"])
@@ -635,7 +683,8 @@ def get_ritual_service(ritual_service_id):
                     if not isinstance(desc, str):
                         desc = str(desc)
                     if player.strip():
-                        return {"video": {"player": player.strip(), "poster": poster.strip() if poster else ""}, "description": desc}
+                        return {"video": {"player": player.strip(), "poster": poster.strip() if poster else ""},
+                                "description": desc}
                     # If malformed video (no player), fall through to photos parsing.
 
                 photos = [u for u in x.get("photos", []) if isinstance(u, str) and u.strip()]
@@ -655,11 +704,13 @@ def get_ritual_service(ritual_service_id):
                     title = it[0]
                     raw_albums = it[1] if isinstance(it[1], list) else []
                     albums = [_normalize_album_entry(a) for a in raw_albums]
+
                     # Drop empty albums (no photos AND no video.player)
                     def _not_empty(a):
                         if "video" in a and isinstance(a["video"], dict):
                             return bool(a["video"].get("player"))
                         return bool(a.get("photos"))
+
                     albums = [a for a in albums if _not_empty(a)]
                     norm_items.append([title, albums])
 
@@ -743,7 +794,9 @@ def get_ritual_service(ritual_service_id):
                         player = v.get("player")
                         poster = v.get("poster") if isinstance(v.get("poster"), str) else ""
                         _validate_video(player, i_title, i_album)
-                        albums_out.append({"video": {"player": player.strip(), "poster": poster.strip() if poster else ""}, "description": desc})
+                        albums_out.append(
+                            {"video": {"player": player.strip(), "poster": poster.strip() if poster else ""},
+                             "description": desc})
                         continue
 
                     # photo album object
@@ -917,39 +970,60 @@ def get_warehouses():
 @application.route('/api/orders', methods=['POST'])
 def create_order():
     data = request.get_json() or {}
-    # Обов’язкові поля
-    required = ['personId', 'name', 'cityRef', 'branchRef', 'phone', 'paymentMethod']
-    missing = [k for k in required if k not in data]
-    if missing:
-        return jsonify({
-            'error': 'Missing required fields',
-            'fields': missing
-        }), 400
 
-    # Формуємо документ замовлення
+    # Required fields (add email)
+    required = ['personId', 'name', 'cityRef', 'branchRef', 'phone', 'paymentMethod', 'email']
+    missing = [k for k in required if k not in data or (isinstance(data[k], str) and not data[k].strip())]
+    if missing:
+        return jsonify({'error': 'Missing required fields', 'fields': missing}), 400
+
+    # Validate email
+    email = (data.get('email') or '').strip().lower()
+
+    # Validate personId & fetch person
+    try:
+        person_oid = ObjectId(data['personId'])
+    except Exception:
+        return jsonify({'error': 'Invalid personId'}), 400
+
+    person = people_collection.find_one({'_id': person_oid})
+    if not person:
+        return jsonify({'error': 'Person not found'}), 404
+
+    # Upsert/Update person's email (do not create a new person here)
+    try:
+        people_collection.update_one(
+            {'_id': person_oid},
+            {'$set': {
+                'email': email,
+                'updatedAt': datetime.utcnow()
+            }}
+        )
+    except Exception as e:
+        return jsonify({'error': 'Failed to update person email', 'details': str(e)}), 500
+
+    # Build order document (store email as well for audit)
     order_doc = {
         'personId': data['personId'],
-        'personName': data['personName'],
+        'personName': data.get('personName'),  # may be None; keep as-is
         'name': data['name'],
         'cityRef': data['cityRef'],
-        'cityName': data['cityName'],
+        'cityName': data.get('cityName'),  # optional
         'branchRef': data['branchRef'],
-        'branchDesc': data['branchDesc'],
+        'branchDesc': data.get('branchDesc'),  # optional
         'phone': data['phone'],
-        'paymentMethod': data['paymentMethod'],  # 'online' або 'cod'
+        'email': email,  # <- saved on order too
+        'paymentMethod': data['paymentMethod'],  # 'online' or 'cod'
         'paymentStatus': 'pending' if data['paymentMethod'] == 'online' else 'cod',
         'createdAt': datetime.utcnow(),
-        'invoiceId': data['invoiceId']
-        # сюди пізніше Monopay вебхук може додати поля status, webhookData тощо
+        'invoiceId': data.get('invoiceId')  # optional
+        # webhook(s) can append status / payload later
     }
 
     try:
         result = orders_collection.insert_one(order_doc)
     except Exception as e:
-        return jsonify({
-            'error': 'DB insert failed',
-            'details': str(e)
-        }), 500
+        return jsonify({'error': 'DB insert failed', 'details': str(e)}), 500
 
     return jsonify({'orderId': str(result.inserted_id)}), 201
 
@@ -1309,6 +1383,127 @@ def spaces_make_public():
         return jsonify({"objectUrl": object_url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@application.post("/api/premium/request-reset")
+def premium_request_reset():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+
+    # Always 200 to avoid email enumeration
+    if not email:
+        return jsonify({"ok": True})
+
+    person = people_collection.find_one({"premium.login": email})
+    if person:
+        # 6-digit code, zero-padded
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        expires = datetime.utcnow() + timedelta(minutes=15)
+
+        people_collection.update_one(
+            {"_id": person["_id"]},
+            {"$set": {"premium.reset": {"code": code, "expiresAt": expires, "attempts": 0}}}
+        )
+
+        send_mail(
+            email,
+            "Код для відновлення пароля",
+            f"""
+            <p>Ваш код для відновлення пароля:</p>
+            <p style="font-size:20px;font-weight:700;letter-spacing:3px">{code}</p>
+            <p>Діє протягом 15 хвилин.</p>
+            """
+        )
+
+    return jsonify({"ok": True})
+
+
+@application.post("/api/premium/reset")
+def premium_reset():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    code = (data.get("code") or "").strip()
+    new_pw = (data.get("newPassword") or "")
+
+    if not email or not code:
+        abort(400, description="Потрібні email та код")
+    validate_new_password(new_pw)
+
+    p = people_collection.find_one({"premium.login": email})
+    if not p:
+        # Don't leak whether email exists
+        abort(400, description="Невірний код або прострочено")
+
+    reset = (p.get("premium") or {}).get("reset") or {}
+    expires_at = reset.get("expiresAt")
+    stored_code = (reset.get("code") or "").strip()
+    attempts = int(reset.get("attempts") or 0)
+
+    # Basic protections
+    if attempts >= 5:
+        abort(400, description="Перевищено кількість спроб. Запросіть новий код.")
+    if not stored_code or not isinstance(expires_at, datetime) or expires_at < datetime.utcnow():
+        abort(400, description="Невірний код або прострочено")
+
+    # Constant-time compare
+    ok = secrets.compare_digest(code, stored_code)
+    if not ok:
+        people_collection.update_one(
+            {"_id": p["_id"]},
+            {"$set": {"premium.reset.attempts": attempts + 1}}
+        )
+        abort(400, description="Невірний код")
+
+    # Success → set new password (bcrypt) & clear reset
+    people_collection.update_one(
+        {"_id": p["_id"]},
+        {"$set": {
+            "premium.password": hash_password(new_pw),
+            "premium.updatedAt": datetime.utcnow()
+         },
+         "$unset": {"premium.reset": ""}}
+    )
+    return jsonify({"ok": True})
+
+
+@application.post("/api/people/login")
+def people_login():
+    """
+    Authenticates a premium person by login & password.
+    Returns a JWT-like random token (stored in-memory or to be verified separately).
+    """
+    data = request.get_json(silent=True) or {}
+    login = (data.get("login") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+    person_id = (data.get("person_id") or "").strip()
+
+    if not login or not password:
+        abort(400, description="Потрібно вказати логін і пароль")
+
+    person = people_collection.find_one({"premium.login": login})
+    if not person:
+        abort(401, description="Невірний логін або пароль")
+
+    premium = person.get("premium", {})
+    hashed_pw = premium.get("password")
+
+    if not hashed_pw or not verify_password(password, hashed_pw):
+        abort(401, description="Невірний логін або пароль")
+
+    # Generate temporary token (you can later switch to JWT)
+    token = secrets.token_urlsafe(32)
+    expires = datetime.utcnow() + timedelta(days=1)
+
+    people_collection.update_one(
+        {"_id": person["_id"]},
+        {"$set": {"premium.session": {"token": token, "expiresAt": expires}}}
+    )
+
+    return jsonify({
+        "token": token,
+        "personId": str(person["_id"]),
+        "expiresAt": expires.isoformat() + "Z"
+    }), 200
 
 
 @socketio.on('joinRoom')

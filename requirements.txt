@@ -9,3 +9,4 @@ flask-socketio
 eventlet
 PyJWT
 boto3
+bcrypt

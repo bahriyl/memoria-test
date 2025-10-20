@@ -1472,30 +1472,37 @@ def premium_request_reset():
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
 
-    # Always 200 to avoid email enumeration
     if not email:
-        return jsonify({"ok": True})
+        return jsonify({"error": "Email is required"}), 400
 
     person = people_collection.find_one({"premium.login": email})
-    if person:
-        # 6-digit code, zero-padded
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        expires = datetime.utcnow() + timedelta(minutes=15)
+    if not person:
+        # Return an error if the user does not exist
+        return jsonify({
+            "ok": False,
+            "error": "Користувача з такою електронною поштою не знайдено."
+        }), 404
 
-        people_collection.update_one(
-            {"_id": person["_id"]},
-            {"$set": {"premium.reset": {"code": code, "expiresAt": expires, "attempts": 0}}}
-        )
+    # Generate 6-digit code
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    expires = datetime.utcnow() + timedelta(minutes=15)
 
-        send_mail(
-            email,
-            "Код для відновлення пароля",
-            f"""
-            <p>Ваш код для відновлення пароля:</p>
-            <p style="font-size:20px;font-weight:700;letter-spacing:3px">{code}</p>
-            <p>Діє протягом 15 хвилин.</p>
-            """
-        )
+    # Update DB with reset code and expiry
+    people_collection.update_one(
+        {"_id": person["_id"]},
+        {"$set": {"premium.reset": {"code": code, "expiresAt": expires, "attempts": 0}}}
+    )
+
+    # Send email with code
+    send_mail(
+        email,
+        "Код для відновлення пароля",
+        f"""
+        <p>Ваш код для відновлення пароля:</p>
+        <p style="font-size:20px;font-weight:700;letter-spacing:3px">{code}</p>
+        <p>Діє протягом 15 хвилин.</p>
+        """
+    )
 
     return jsonify({"ok": True})
 

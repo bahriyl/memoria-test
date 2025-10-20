@@ -1435,7 +1435,6 @@ def spaces_video_upload_url():
             Params={
                 "Bucket": SPACES_BUCKET,
                 "Key": key,
-                "ContentType": contentType,
             },
             ExpiresIn=600,
             HttpMethod="PUT",

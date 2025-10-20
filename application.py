@@ -61,6 +61,19 @@ s3 = boto3.client(
     aws_secret_access_key=SPACES_SECRET,
 )
 
+s3.put_bucket_cors(
+    Bucket=SPACES_BUCKET,
+    CORSConfiguration={
+        "CORSRules": [{
+            "AllowedOrigins": ["https://memoria-front-test-app-b2jwh.ondigitalocean.app", "http://localhost:3000"],
+            "AllowedMethods": ["GET", "HEAD", "PUT", "OPTIONS"],
+            "AllowedHeaders": ["*"],
+            "ExposeHeaders": ["ETag", "Content-Length", "Content-Type", "Accept-Ranges"],
+            "MaxAgeSeconds": 3000
+        }]
+    }
+)
+
 client = MongoClient('mongodb+srv://tsbgalcontract:mymongodb26@cluster0.kppkt.mongodb.net/test')
 db = client['memoria_test']
 people_collection = db['people']

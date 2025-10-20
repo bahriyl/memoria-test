@@ -264,6 +264,38 @@ def _validate_shared_photos(value):
     return out
 
 
+def _normalize_media_item(item):
+    # "https://..." legacy
+    if isinstance(item, str):
+        u = item.strip()
+        return {"url": u, "description": ""} if u else None
+
+    if not isinstance(item, dict):
+        return None
+
+    desc = item.get("description", "")
+    if not isinstance(desc, str):
+        desc = str(desc)
+
+    # photo
+    url = item.get("url")
+    if isinstance(url, str) and url.strip():
+        return {"url": url.strip(), "description": desc}
+
+    # video
+    v = item.get("video")
+    if isinstance(v, dict):
+        player = v.get("player")
+        poster = v.get("poster", "")
+        if isinstance(player, str) and player.strip():
+            out_v = {"player": player.strip()}
+            if isinstance(poster, str) and poster.strip():
+                out_v["poster"] = poster.strip()
+            return {"video": out_v, "description": desc}
+
+    return None
+
+
 @application.route('/api/people/<string:person_id>', methods=['GET'])
 def get_person(person_id):
     try:
@@ -274,6 +306,14 @@ def get_person(person_id):
     person = people_collection.find_one({'_id': oid})
     if not person:
         abort(404, description="Person not found")
+
+    raw_photos = person.get('photos', [])
+    photos_norm = []
+    if isinstance(raw_photos, list):
+        for it in raw_photos:
+            n = _normalize_media_item(it)
+            if n:
+                photos_norm.append(n)
 
     response = {
         "id": str(person['_id']),
@@ -290,7 +330,7 @@ def get_person(person_id):
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
         "bio": person.get('bio'),
-        "photos": person.get('photos', []),
+        "photos": photos_norm,
         "sharedPending": person.get('sharedPending', []),
         "sharedPhotos": person.get('sharedPhotos', []),
         "comments": person.get('comments', [])
@@ -306,21 +346,64 @@ def get_person(person_id):
 
 
 def _validate_photos_shape(value):
+    """
+    Accepts:
+      - { url: <string>, description?: <string> }
+      - { video: { player: <string>, poster?: <string> }, description?: <string> }
+      - Back-compat: "https://..." -> {url: "...", description: ""}
+    """
     if value is None:
         return []
     if not isinstance(value, list):
         abort(400, description="`photos` must be an array of objects")
+
     out = []
     for i, item in enumerate(value):
+        # Back-compat string
+        if isinstance(item, str):
+            u = item.strip()
+            if not u:
+                abort(400, description=f"`photos[{i}]` string must be a non-empty URL")
+            out.append({"url": u, "description": ""})
+            continue
+
         if not isinstance(item, dict):
             abort(400, description=f"`photos[{i}]` must be an object")
-        url = item.get("url")
+
+        # Normalize empty strings to "missing"
+        def _clean_str(s):
+            return s.strip() if isinstance(s, str) else s
+
         desc = item.get("description", "")
-        if not isinstance(url, str) or not url.strip():
-            abort(400, description=f"`photos[{i}].url` must be a non-empty string")
         if not isinstance(desc, str):
             abort(400, description=f"`photos[{i}].description` must be a string")
-        out.append({"url": url.strip(), "description": desc})
+
+        url = _clean_str(item.get("url"))
+        video = item.get("video")
+
+        # ✅ VIDEO first (even if url=="" present)
+        if isinstance(video, dict):
+            player = _clean_str(video.get("player"))
+            poster = _clean_str(video.get("poster", ""))  # optional
+
+            if not player:
+                abort(400, description=f"`photos[{i}].video.player` must be a non-empty string")
+
+            vobj = {"player": player}
+            if poster:
+                vobj["poster"] = poster
+
+            out.append({"video": vobj, "description": desc})
+            continue
+
+        # ✅ PHOTO next
+        if url is not None:
+            if not url:
+                abort(400, description=f"`photos[{i}].url` must be a non-empty string")
+            out.append({"url": url, "description": desc})
+            continue
+
+        abort(400, description=f"`photos[{i}]` must contain either `url` or `video`")
     return out
 
 

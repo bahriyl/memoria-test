@@ -1179,7 +1179,7 @@ def create_chat():
     admin_msg = {
         'chatId': result.inserted_id,
         'sender': 'admin',
-        'text': "Вітаємо! Чим можемо допомогти?",
+        'text': "Вітаємо! Чим можемо вам допомогти?",
         'createdAt': datetime.utcnow(),
         'imageData': None
     }

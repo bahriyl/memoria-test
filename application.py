@@ -30,7 +30,7 @@ load_dotenv()
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = "HS256"
-JWT_EXP_DELTA_SECONDS = 3600  # 1 година
+JWT_EXP_DELTA_SECONDS = 43200
 
 NP_API_KEY = os.getenv('NP_API_KEY')
 NP_BASE_URL = 'https://api.novaposhta.ua/v2.0/json/'

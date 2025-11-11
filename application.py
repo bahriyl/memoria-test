@@ -19,7 +19,6 @@ from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
-from twilio.rest import Client
 from flask_socketio import SocketIO, join_room
 
 import smtplib
@@ -40,12 +39,9 @@ CORS(application)
 
 socketio = SocketIO(application, cors_allowed_origins="*")
 
-# init Twilio client
-twilio_client = Client(
-    os.getenv('TWILIO_ACCOUNT_SID'),
-    os.getenv('TWILIO_AUTH_TOKEN')
-)
-verify_service = os.getenv('TWILIO_VERIFY_SERVICE_SID')
+KYIVSTAR_OTP_SEND_URL = "https://api-gateway.kyivstar.ua/mock/rest/v1/verification/sms"
+KYIVSTAR_OTP_VERIFY_URL = "https://api-gateway.kyivstar.ua/mock/rest/v1/verification/sms/check"
+KYIVSTAR_ACCESS_TOKEN = os.environ.get("KYIVSTAR_ACCESS_TOKEN")
 
 SPACES_KEY = os.environ.get("SPACES_KEY")
 SPACES_SECRET = os.environ.get("SPACES_SECRET")
@@ -245,6 +241,83 @@ def _validate_shared_pending(value):
     return out
 
 
+def mask_phone(phone: str) -> str:
+    phone = (phone or '').strip()
+    if not phone:
+        return ''
+
+    digits = re.sub(r'\D', '', phone)
+    if not digits:
+        return phone
+
+    suffix_len = min(4, len(digits))
+    suffix = digits[-suffix_len:]
+
+    if digits.startswith('380') and len(digits) > suffix_len:
+        middle_len = len(digits) - 3 - suffix_len
+        masked = '380' + ('*' * max(0, middle_len)) + suffix
+        return f"+{masked}" if phone.startswith('+') else masked
+
+    prefix_len = min(3, max(1, len(digits) - suffix_len))
+    prefix = digits[:prefix_len]
+    middle_len = len(digits) - prefix_len - suffix_len
+    masked = prefix + ('*' * max(0, middle_len)) + suffix
+    if phone.startswith('+'):
+        return f"+{masked}"
+    return masked
+
+
+def sanitize_premium_payload(premium_doc):
+    if not isinstance(premium_doc, dict):
+        return None
+
+    phone = (premium_doc.get('phone') or '').strip()
+    payload = {'locked': True, 'hasPhone': bool(phone)}
+    masked = mask_phone(phone)
+    if masked:
+        payload['phoneMasked'] = masked
+    return payload
+
+
+def verify_sms_code_with_kyivstar(phone: str, code: str):
+    payload = {
+        "subscriberId": str(phone),
+        "validationCode": str(code)
+    }
+
+    try:
+        resp = requests.post(
+            KYIVSTAR_OTP_VERIFY_URL,
+            json=payload,
+            headers=kyivstar_headers(),
+            timeout=10
+        )
+    except requests.RequestException as exc:
+        return False, {
+            "error": "kyivstar_otp_verify_exception",
+            "details": str(exc)
+        }, 502
+
+    if resp.status_code != 200:
+        return False, {
+            "error": "kyivstar_otp_verify_failed",
+            "status_code": resp.status_code,
+            "details": resp.text
+        }, resp.status_code
+
+    res = resp.json()
+    status = (res.get("resource", {}).get("status") or '').upper()
+
+    if status == 'VALID':
+        return True, {"status": status}, 200
+    if status == 'INVALID':
+        return False, {"status": status}, 401
+    return False, {
+        "status": status,
+        "details": res
+    }, 400
+
+
 def _validate_shared_photos(value):
     if value is None:
         return []
@@ -341,7 +414,9 @@ def get_person(person_id):
             for r in person.get('relatives', [])
         ]
     if 'premium' in person:
-        response['premium'] = person['premium']
+        premium_payload = sanitize_premium_payload(person.get('premium'))
+        if premium_payload:
+            response['premium'] = premium_payload
     return jsonify(response)
 
 
@@ -949,38 +1024,123 @@ def verify_token():
         abort(401, description="Invalid token")
 
 
+def kyivstar_headers():
+    """Повертає стандартні заголовки для Kyivstar API."""
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {KYIVSTAR_ACCESS_TOKEN}"
+    }
+
+
 @application.route('/api/send-code', methods=['POST'])
 def send_code():
+    """Надсилає користувачу SMS з OTP кодом через Kyivstar API."""
     data = request.get_json() or {}
-    phone = data.get('phone')
-    if not phone:
+    phone = (data.get('phone') or '').strip()
+    person_id = (data.get('personId') or '').strip()
+
+    person = None
+    if person_id:
+        try:
+            oid = ObjectId(person_id)
+        except Exception:
+            return jsonify({'error': 'invalid_person_id'}), 400
+        person = people_collection.find_one({'_id': oid}, {'premium': 1})
+        if not person:
+            return jsonify({'error': 'person_not_found'}), 404
+        premium = person.get('premium') or {}
+        phone = (premium.get('phone') or '').strip()
+        if not phone:
+            return jsonify({'error': 'phone_not_set'}), 400
+    elif not phone:
         return jsonify({'error': 'phone is required'}), 400
 
-    verification = twilio_client.verify \
-        .services(verify_service) \
-        .verifications \
-        .create(to=phone, channel='sms')
+    try:
+        payload = {"to": str(phone)}
+        resp = requests.post(KYIVSTAR_OTP_SEND_URL, json=payload, headers=kyivstar_headers(), timeout=10)
 
-    return jsonify({'status': verification.status})  # e.g. "pending"
+        if resp.status_code != 200:
+            return jsonify({
+                "error": "kyivstar_otp_send_failed",
+                "status_code": resp.status_code,
+                "details": resp.text
+            }), 502
+
+        res = resp.json()
+        status = res.get("resource", {}).get("status")
+        message_id = res.get("resource", {}).get("messageId")
+
+        if person:
+            people_collection.update_one(
+                {'_id': person['_id']},
+                {'$set': {
+                    'premium.resetSms': {
+                        'phone': phone,
+                        'messageId': message_id,
+                        'status': status,
+                        'sentAt': datetime.utcnow()
+                    }
+                }}
+            )
+
+        return jsonify({
+            "status": status,  # очікувано "SUCCESS"
+            "message_id": message_id,
+            "req_id": res.get("reqId"),
+            "cid": res.get("cid")
+        })
+
+    except requests.RequestException as e:
+        return jsonify({
+            "error": "kyivstar_otp_send_exception",
+            "details": str(e)
+        }), 502
 
 
 @application.route('/api/verify-code', methods=['POST'])
 def verify_code():
+    """Перевіряє OTP код користувача через Kyivstar API."""
     data = request.get_json() or {}
-    phone = data.get('phone')
-    code = data.get('code')
-    if not phone or not code:
-        return jsonify({'error': 'phone and code are required'}), 400
+    phone = (data.get('phone') or '').strip()
+    code = (data.get('code') or '').strip()
+    person_id = (data.get('personId') or '').strip()
 
-    check = twilio_client.verify \
-        .services(verify_service) \
-        .verification_checks \
-        .create(to=phone, code=code)
+    if not code:
+        return jsonify({'error': 'code is required'}), 400
 
-    if check.status == 'approved':
-        return jsonify({'success': True})
-    else:
-        return jsonify({'success': False}), 401
+    person = None
+    if person_id:
+        try:
+            oid = ObjectId(person_id)
+        except Exception:
+            return jsonify({'error': 'invalid_person_id'}), 400
+        person = people_collection.find_one({'_id': oid}, {'premium': 1})
+        if not person:
+            return jsonify({'error': 'person_not_found'}), 404
+        premium = person.get('premium') or {}
+        phone = (premium.get('phone') or '').strip()
+        if not phone:
+            return jsonify({'error': 'phone_not_set'}), 400
+    elif not phone:
+        return jsonify({'error': 'phone is required'}), 400
+
+    ok, payload, status_code = verify_sms_code_with_kyivstar(phone, code)
+    if not ok:
+        return jsonify(payload or {}), status_code or 400
+
+    if person:
+        people_collection.update_one(
+            {'_id': person['_id']},
+            {'$set': {
+                'premium.resetSms.lastStatus': payload.get('status'),
+                'premium.resetSms.verifiedAt': datetime.utcnow()
+            }}
+        )
+
+    return jsonify({
+        "success": True,
+        "status": payload.get('status', 'VALID')
+    })
 
 
 @application.route('/api/people/add_moderation', methods=['POST'])
@@ -1510,13 +1670,50 @@ def premium_request_reset():
 @application.post("/api/premium/reset")
 def premium_reset():
     data = request.get_json(silent=True) or {}
+    person_id = (data.get("personId") or "").strip()
     email = (data.get("email") or "").strip().lower()
     code = (data.get("code") or "").strip()
     new_pw = (data.get("newPassword") or "")
 
+    validate_new_password(new_pw)
+
+    if person_id:
+        if not code:
+            abort(400, description="Введіть код")
+        try:
+            oid = ObjectId(person_id)
+        except Exception:
+            abort(400, description="Invalid person id")
+
+        person = people_collection.find_one({'_id': oid})
+        if not person:
+            abort(404, description="Person not found")
+
+        premium = person.get('premium') or {}
+        phone = (premium.get('phone') or '').strip()
+        if not phone:
+            abort(400, description="Для цієї особи не вказано номер телефону")
+
+        ok, payload, status_code = verify_sms_code_with_kyivstar(phone, code)
+        if not ok:
+            status = (payload or {}).get('status')
+            if status == 'INVALID':
+                abort(400, description="Невірний код")
+            message = (payload or {}).get('details') or (payload or {}).get('error') or 'Не вдалося підтвердити код'
+            abort(status_code or 400, description=message)
+
+        people_collection.update_one(
+            {'_id': person['_id']},
+            {"$set": {
+                "premium.password": hash_password(new_pw),
+                "premium.updatedAt": datetime.utcnow()
+             },
+             "$unset": {"premium.reset": "", "premium.resetSms": ""}}
+        )
+        return jsonify({"ok": True})
+
     if not email or not code:
         abort(400, description="Потрібні email та код")
-    validate_new_password(new_pw)
 
     p = people_collection.find_one({"premium.login": email})
     if not p:
@@ -1558,7 +1755,7 @@ def premium_reset():
 @application.post("/api/people/login")
 def people_login():
     """
-    Authenticates a premium person by login & password.
+    Authenticates a premium person by password (person scoped) or legacy login.
     Returns a JWT-like random token (stored in-memory or to be verified separately).
     """
     data = request.get_json(silent=True) or {}
@@ -1566,10 +1763,21 @@ def people_login():
     password = (data.get("password") or "").strip()
     person_id = (data.get("person_id") or "").strip()
 
-    if not login or not password:
-        abort(400, description="Потрібно вказати логін і пароль")
+    if not password:
+        abort(400, description="Потрібно вказати пароль")
 
-    person = people_collection.find_one({"premium.login": login})
+    person = None
+    if person_id:
+        try:
+            oid = ObjectId(person_id)
+        except Exception:
+            abort(400, description="Invalid person id")
+        person = people_collection.find_one({'_id': oid})
+    elif login:
+        person = people_collection.find_one({"premium.login": login})
+    else:
+        abort(400, description="Потрібно вказати person_id або логін")
+
     if not person:
         abort(401, description="Невірний логін або пароль")
 

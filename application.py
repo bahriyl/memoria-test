@@ -191,33 +191,44 @@ def people():
     area = request.args.get('area', '').strip()
     cemetery = request.args.get('cemetery', '').strip()
 
-    query_filter = {}
+    # Будуємо список умов і комбінуємо їх через $and,
+    # при цьому areaId та area об'єднуємо через $or (як дублюючі ключі місця).
+    conditions = []
 
     if search_query:
-        query_filter['name'] = {'$regex': re.escape(search_query), '$options': 'i'}
+        conditions.append({'name': {'$regex': re.escape(search_query), '$options': 'i'}})
 
     if birth_year and birth_year.isdigit():
-        query_filter['birthYear'] = int(birth_year)
+        conditions.append({'birthYear': int(birth_year)})
 
     if death_year and death_year.isdigit():
-        query_filter['deathYear'] = int(death_year)
+        conditions.append({'deathYear': int(death_year)})
 
-    # Якщо передано areaId (GeoNames), фільтруємо по ньому — це унікальний і стабільний ключ.
+    area_or = []
     if area_id:
-        query_filter['areaId'] = area_id
-    elif area:
-        # Фолбек для старих клієнтів: area з фронта може бути у форматі "Місто, Область, ...".
+        area_or.append({'areaId': area_id})
+    if area:
+        # area з фронта може бути у форматі "Місто, Область, ...".
         # Для фільтрації по документах осіб використовуємо лише перше слово/частину (місто),
         # щоб збігатися з рядками виду "м. Самбір, Львівська обл.".
         city_part = area.split(',')[0].strip()
         if city_part:
             pattern = r'\b' + re.escape(city_part) + r'\b'
-            query_filter['area'] = {'$regex': pattern, '$options': 'i'}
+            area_or.append({'area': {'$regex': pattern, '$options': 'i'}})
+    if area_or:
+        conditions.append({'$or': area_or})
 
     if cemetery:
-        query_filter['cemetery'] = {'$regex': re.escape(cemetery), '$options': 'i'}
+        conditions.append({'cemetery': {'$regex': re.escape(cemetery), '$options': 'i'}})
 
-    people_cursor = people_collection.find(query_filter)
+    if not conditions:
+        mongo_filter = {}
+    elif len(conditions) == 1:
+        mongo_filter = conditions[0]
+    else:
+        mongo_filter = {'$and': conditions}
+
+    people_cursor = people_collection.find(mongo_filter)
 
     people_list = []
     for person in people_cursor:
@@ -762,9 +773,10 @@ def locations():
 @application.route('/api/cemeteries', methods=['GET'])
 def cemeteries():
     """
-    Повертає список об'єктів { name, area }:
+    Повертає список об'єктів { name, area, areaId }:
       - name: назва кладовища
       - area: населений пункт / область, з документа areas_collection.area
+      - areaId: GeoNames ID населеного пункту (areas_collection.areaId)
 
     Фільтри (будь-який з них опційний):
       - areaId — унікальний GeoNames ID населеного пункту
@@ -801,7 +813,7 @@ def cemeteries():
 
     # 2) Беремо лише потрібні поля
     pipeline.extend([
-        {'$project': {'area': 1, 'cemetries': 1}},
+        {'$project': {'area': 1, 'areaId': 1, 'cemetries': 1}},
         {'$unwind': '$cemetries'}
     ])
 
@@ -820,15 +832,16 @@ def cemeteries():
         }
     })
 
-    # 5) Унікальні пари (кладовище, area)
+    # 5) Унікальні пари (кладовище, area, areaId)
     pipeline.extend([
         {'$group': {
-            '_id': {'name': '$cemetries', 'area': '$area'}
+            '_id': {'name': '$cemetries', 'area': '$area', 'areaId': '$areaId'}
         }},
         {'$project': {
             '_id': 0,
             'name': '$_id.name',
-            'area': '$_id.area'
+            'area': '$_id.area',
+            'areaId': '$_id.areaId'
         }},
         {'$sort': {'name': 1}},
         {'$limit': 10}

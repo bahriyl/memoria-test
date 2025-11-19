@@ -766,23 +766,41 @@ def cemeteries():
       - name: назва кладовища
       - area: населений пункт / область, з документа areas_collection.area
 
-    Фільтри:
-      - area   — початок рядка, case-insensitive по полю area
+    Фільтри (будь-який з них опційний):
+      - areaId — унікальний GeoNames ID населеного пункту
+      - area   — місто (перша частина рядка "Місто, Область, ..."),
+                 шукається як окреме слово в полі area (case-insensitive),
+                 використовується як фолбек, якщо немає areaId
       - search — початок рядка, case-insensitive по елементам масиву cemetries
     """
+    area_id = request.args.get('areaId', '').strip()
     area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
+
+    print(area_id)
+    print(type(area_id))
 
     # Будуємо aggregation pipeline
     pipeline = []
 
-    # 1) Фільтр по населеному пункту/області (тільки з початку рядка)
-    if area:
+    # 1) Фільтр по населеному пункту:
+    #    якщо передано areaId — використовуємо його;
+    #    інакше фолбек на текстовий area (місто як окреме слово).
+    if area_id:
         pipeline.append({
             '$match': {
-                'area': {'$regex': f'^{re.escape(area)}', '$options': 'i'}
+                'areaId': area_id
             }
         })
+    elif area:
+        city_part = area.split(',')[0].strip()
+        if city_part:
+            pattern = r'\b' + re.escape(city_part) + r'\b'
+            pipeline.append({
+                '$match': {
+                    'area': {'$regex': pattern, '$options': 'i'}
+                }
+            })
 
     # 2) Беремо лише потрібні поля
     pipeline.extend([

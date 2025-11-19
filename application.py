@@ -777,9 +777,6 @@ def cemeteries():
     area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
 
-    print(area_id)
-    print(type(area_id))
-
     # Будуємо aggregation pipeline
     pipeline = []
 

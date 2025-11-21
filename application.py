@@ -69,6 +69,7 @@ cemeteries_collection = db['cemeteries']
 ritual_services_collection = db['ritual_services']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
+church_days_collection = db['church_days']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -100,6 +101,11 @@ GEONAMES_LANG = "uk"
 
 try:
     liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    church_days_collection.create_index([("name", ASCENDING)], unique=True)
 except Exception:
     pass
 
@@ -1633,6 +1639,96 @@ def list_liturgies(person_id):
             "createdAt": doc["createdAt"].isoformat(),
         })
     return jsonify(results)
+
+
+def _normalize_weekday(value):
+    """
+    Normalize a weekday representation to an integer in [0, 6] (Sunday=0 ... Saturday=6).
+    Accepts integers or strings containing an integer.
+    """
+    if isinstance(value, int):
+        day = value
+    elif isinstance(value, str):
+        v = value.strip()
+        if not v.isdigit():
+            abort(400, description="Weekdays must be integers 0..6")
+        day = int(v, 10)
+    else:
+        abort(400, description="Weekdays must be integers 0..6")
+
+    if day < 0 or day > 6:
+        abort(400, description="Weekdays must be in range 0..6 (Sunday=0 ... Saturday=6)")
+    return day
+
+
+@application.route("/api/liturgy/church-active-days", methods=["GET"])
+def get_church_active_days():
+    """
+    Return active weekdays for a given church name.
+    Query: ?churchName=...
+    - If churchName is missing/empty → treat as “no church selected” and return empty days.
+    - If church has no stored config → also return empty days.
+    Response:
+      {
+        "churchName": "<name or null>",
+        "activeWeekdays": [0,1,2]  # Sunday=0 ... Saturday=6
+      }
+    """
+    name = (request.args.get("churchName") or "").strip()
+    if not name:
+        # No church selected on frontend
+        return jsonify({"churchName": None, "activeWeekdays": []})
+
+    doc = church_days_collection.find_one({"name": name})
+    if not doc:
+        # Known church with no config yet → empty schedule
+        return jsonify({"churchName": name, "activeWeekdays": []})
+
+    raw_days = doc.get("activeWeekdays") or []
+    cleaned = []
+    for d in raw_days:
+        try:
+            cleaned.append(_normalize_weekday(d))
+        except Exception:
+            # ignore malformed stored values instead of failing the request
+            continue
+    # Deduplicate & sort
+    cleaned = sorted(set(cleaned))
+    return jsonify({"churchName": doc.get("name"), "activeWeekdays": cleaned})
+
+
+@application.route("/api/liturgy/church-active-days", methods=["PUT"])
+def set_church_active_days():
+    """
+    Upsert active weekdays configuration for a church.
+    Expected JSON:
+      {
+        "churchName": "Собор Св. Юра",          # required, non-empty
+        "activeWeekdays": [0, 1, 2, 3, 4]      # required, array of ints (0=Sun..6=Sat)
+      }
+    """
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("churchName") or "").strip()
+    if not name:
+        abort(400, description="'churchName' is required")
+
+    raw_days = payload.get("activeWeekdays")
+    if not isinstance(raw_days, list):
+        abort(400, description="'activeWeekdays' must be an array of integers 0..6")
+
+    cleaned = []
+    for d in raw_days:
+        cleaned.append(_normalize_weekday(d))
+
+    cleaned = sorted(set(cleaned))
+
+    church_days_collection.update_one(
+        {"name": name},
+        {"$set": {"name": name, "activeWeekdays": cleaned}},
+        upsert=True,
+    )
+
+    return jsonify({"churchName": name, "activeWeekdays": cleaned})
 
 
 @application.route("/api/spaces/video-upload-url", methods=["GET"])

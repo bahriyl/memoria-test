@@ -25,7 +25,13 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+from badwords import ProfanityFilter
+
 load_dotenv()
+
+
+profanity_filter = ProfanityFilter()
+profanity_filter.init(["ru", "ua"])
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = "HS256"
@@ -515,6 +521,29 @@ def _validate_photos_shape(value):
     return out
 
 
+def _sanitize_comment_authors(comments):
+    if not isinstance(comments, list):
+        abort(400, description="`comments` must be a list of objects")
+
+    sanitized = []
+    for c in comments:
+        if not isinstance(c, dict):
+            abort(400, description="Each comment must be a JSON object")
+
+        author = c.get("author", "")
+        if author is not None and not isinstance(author, str):
+            abort(400, description="`author` must be a string")
+
+        if author:
+            # Перевірка, чи містить ненормативну лексику
+            if profanity_filter.filter_text(author, match_threshold=0.9):
+                abort(400, description=f"Author contains forbidden words")
+
+        sanitized.append(c)
+
+    return sanitized
+
+
 ALLOWED_ROLES = {'Батько', 'Мати', 'Брат', 'Сестра', ' '}
 
 
@@ -568,6 +597,7 @@ def update_person(person_id):
     for field, value in data.items():
         if field not in ALLOWED_UPDATE_FIELDS:
             continue
+
         if field == 'photos':
             update_doc['photos'] = _validate_photos_shape(value)
         elif field == 'sharedPending':
@@ -576,6 +606,8 @@ def update_person(person_id):
             update_doc['sharedPhotos'] = _validate_shared_photos(value)
         elif field == 'relatives':
             update_doc['relatives'] = _validate_relatives(value)
+        elif field == 'comments':
+            update_doc['comments'] = _sanitize_comment_authors(value)
         else:
             # accepts avatarUrl=None and portraitUrl=None to clear either/both
             update_doc[field] = value
@@ -597,7 +629,7 @@ def update_person(person_id):
         "deathDate": person.get('deathDate'),
         "notable": person.get('notable', False),
         "avatarUrl": person.get('avatarUrl'),
-        "portraitUrl": person.get('portraitUrl'),  # ← NEW
+        "portraitUrl": person.get('portraitUrl'),
         "heroImage": person.get('heroImage'),
         "areaId": person.get('areaId'),
         "area": person.get('area'),

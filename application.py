@@ -1505,19 +1505,23 @@ def post_message(chat_id):
     """Post a message (user or admin) with optional image as Base64 and broadcast."""
     sender = None
     text = ''
-    image = None
+    image_files = []
 
     # Розбір multipart/form-data або JSON
     if request.content_type and 'multipart/form-data' in request.content_type:
         sender = request.form.get('sender')
         text = (request.form.get('text', '') or '').strip()
-        image = request.files.get('image')
+        image_files = request.files.getlist('image')
     else:
         data = request.get_json() or {}
         sender = data.get('sender')
         text = (data.get('text') or '').strip()
 
-    if sender not in ('user', 'admin') or (not text and not image):
+    image_files = [img for img in image_files if img and img.filename]
+    if len(image_files) > 5:
+        abort(400, 'Too many images')
+
+    if sender not in ('user', 'admin') or (not text and not image_files):
         abort(400, 'Invalid payload')
 
     try:
@@ -1537,10 +1541,17 @@ def post_message(chat_id):
 
     # Кодуємо зображення, якщо воно є
     image_data = None
-    if image:
-        raw = image.read()
-        b64 = base64.b64encode(raw).decode('utf-8')
-        image_data = f"data:{image.mimetype};base64,{b64}"
+    if image_files:
+        if len(image_files) == 1:
+            raw = image_files[0].read()
+            b64 = base64.b64encode(raw).decode('utf-8')
+            image_data = f"data:{image_files[0].mimetype};base64,{b64}"
+        else:
+            image_data = []
+            for image in image_files:
+                raw = image.read()
+                b64 = base64.b64encode(raw).decode('utf-8')
+                image_data.append(f"data:{image.mimetype};base64,{b64}")
 
     # Зберігаємо повідомлення
     msg = {

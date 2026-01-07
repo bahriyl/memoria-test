@@ -1334,47 +1334,69 @@ def create_order():
     data = request.get_json() or {}
 
     # Required fields (add email)
-    required = ['personId', 'name', 'cityRef', 'branchRef', 'phone', 'paymentMethod', 'email']
+    required = ['name', 'cityRef', 'branchRef', 'phone', 'paymentMethod']
     missing = [k for k in required if k not in data or (isinstance(data[k], str) and not data[k].strip())]
     if missing:
         return jsonify({'error': 'Missing required fields', 'fields': missing}), 400
 
-    # Validate email
+    raw_person_ids = data.get('personIds')
+    if raw_person_ids is None:
+        raw_person_ids = [data.get('personId')] if data.get('personId') else []
+    if not isinstance(raw_person_ids, list):
+        return jsonify({'error': 'Invalid personIds'}), 400
+
+    person_ids = [str(pid).strip() for pid in raw_person_ids if str(pid).strip()]
+    if not person_ids:
+        return jsonify({'error': 'Missing personId'}), 400
+
+    # Validate email (optional)
     email = (data.get('email') or '').strip().lower()
 
-    # Validate personId & fetch person
-    try:
-        person_oid = ObjectId(data['personId'])
-    except Exception:
-        return jsonify({'error': 'Invalid personId'}), 400
+    # Validate personIds & fetch persons
+    person_oids = []
+    persons = []
+    for pid in person_ids:
+        try:
+            person_oid = ObjectId(pid)
+        except Exception:
+            return jsonify({'error': 'Invalid personId'}), 400
+        person = people_collection.find_one({'_id': person_oid})
+        if not person:
+            return jsonify({'error': 'Person not found'}), 404
+        person_oids.append(person_oid)
+        persons.append(person)
 
-    person = people_collection.find_one({'_id': person_oid})
-    if not person:
-        return jsonify({'error': 'Person not found'}), 404
+    # Update person's email if provided
+    if email:
+        try:
+            for person_oid in person_oids:
+                people_collection.update_one(
+                    {'_id': person_oid},
+                    {'$set': {
+                        'email': email,
+                        'updatedAt': datetime.utcnow()
+                    }}
+                )
+        except Exception as e:
+            return jsonify({'error': 'Failed to update person email', 'details': str(e)}), 500
 
-    # Upsert/Update person's email (do not create a new person here)
-    try:
-        people_collection.update_one(
-            {'_id': person_oid},
-            {'$set': {
-                'email': email,
-                'updatedAt': datetime.utcnow()
-            }}
-        )
-    except Exception as e:
-        return jsonify({'error': 'Failed to update person email', 'details': str(e)}), 500
+    person_names = data.get('personNames')
+    if not isinstance(person_names, list) or len(person_names) != len(persons):
+        person_names = [p.get('name') for p in persons]
 
     # Build order document (store email as well for audit)
     order_doc = {
-        'personId': data['personId'],
-        'personName': data.get('personName'),  # may be None; keep as-is
+        'personId': person_ids[0],
+        'personIds': person_ids,
+        'personName': data.get('personName') or (person_names[0] if person_names else None),
+        'personNames': person_names,
         'name': data['name'],
         'cityRef': data['cityRef'],
         'cityName': data.get('cityName'),  # optional
         'branchRef': data['branchRef'],
         'branchDesc': data.get('branchDesc'),  # optional
         'phone': data['phone'],
-        'email': email,  # <- saved on order too
+        'email': email or None,  # optional
         'paymentMethod': data['paymentMethod'],  # 'online' or 'cod'
         'paymentStatus': 'pending' if data['paymentMethod'] == 'online' else 'cod',
         'createdAt': datetime.utcnow(),

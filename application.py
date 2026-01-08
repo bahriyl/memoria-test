@@ -1467,6 +1467,16 @@ def monopay_webhook():
         upsert=True
     )
 
+    liturgies_collection.update_one(
+        {'invoiceId': invoice_id},
+        {
+            '$set': {
+                'paymentStatus': status,
+                'webhookData': data
+            }
+        }
+    )
+
     # Monopay очікує 200 OK
     return jsonify({'result': 'ok'}), 200
 
@@ -1625,7 +1635,12 @@ def create_liturgy():
       "date": "2025-09-21" | "2025-09-21T10:00",  # required
       "time": "10:00",                   # optional (ignored if date has time)
       "churchName": "Святоюрський собор",# optional
-      "price": 500                       # optional (number)
+      "price": 500,                      # optional (number)
+      "phone": "+380(67)-123-4567",      # optional
+      "invoiceId": "monopay_invoice",    # optional
+      "paymentMethod": "online",         # optional
+      "paymentStatus": "pending",        # optional
+      "personName": "Ім'я Прізвище"      # optional
     }
     """
     data = request.get_json(silent=True) or {}
@@ -1657,15 +1672,27 @@ def create_liturgy():
     # optional fields
     church_name = (data.get("churchName") or "").strip() or None
     price = data.get("price")  # keep as-is if number or None
+    phone = (data.get("phone") or "").strip() or None
+    invoice_id = (data.get("invoiceId") or "").strip() or None
+    payment_method = (data.get("paymentMethod") or "").strip() or None
+    payment_status = (data.get("paymentStatus") or "").strip() or None
+    person_name = (data.get("personName") or "").strip() or None
+    if invoice_id and not payment_status:
+        payment_status = "pending"
 
     now_utc = datetime.now(timezone.utc)
 
     # Only the required minimal fields are persisted
     doc = {
         "person": person_oid,
+        "personName": person_name,
         "serviceDate": service_dt,
         "churchName": church_name,
         "price": price,
+        "phone": phone,
+        "invoiceId": invoice_id,
+        "paymentMethod": payment_method,
+        "paymentStatus": payment_status,
         "createdAt": now_utc,
     }
 
@@ -1675,9 +1702,14 @@ def create_liturgy():
     out = {
         "_id": str(ins.inserted_id),
         "person": str(doc["person"]),
+        "personName": doc.get("personName"),
         "serviceDate": doc["serviceDate"].isoformat(),
         "churchName": doc["churchName"],
         "price": doc["price"],
+        "phone": doc.get("phone"),
+        "invoiceId": doc.get("invoiceId"),
+        "paymentMethod": doc.get("paymentMethod"),
+        "paymentStatus": doc.get("paymentStatus"),
         "createdAt": doc["createdAt"].isoformat(),
     }
     return jsonify(out), 201
@@ -1698,12 +1730,33 @@ def list_liturgies(person_id):
         results.append({
             "_id": str(doc["_id"]),
             "person": str(doc["person"]),
+            "personName": doc.get("personName"),
             "serviceDate": doc["serviceDate"].isoformat(),
             "churchName": doc.get("churchName"),
             "price": doc.get("price"),
+            "phone": doc.get("phone"),
+            "invoiceId": doc.get("invoiceId"),
+            "paymentMethod": doc.get("paymentMethod"),
+            "paymentStatus": doc.get("paymentStatus"),
             "createdAt": doc["createdAt"].isoformat(),
         })
     return jsonify(results)
+
+
+@application.route("/api/liturgies/payment-status", methods=["GET"])
+def liturgy_payment_status():
+    invoice_id = (request.args.get("invoiceId") or "").strip()
+    if not invoice_id:
+        abort(400, "invoiceId is required")
+
+    doc = liturgies_collection.find_one({"invoiceId": invoice_id})
+    if not doc:
+        return jsonify({"status": "not_found"}), 404
+
+    return jsonify({
+        "status": doc.get("paymentStatus") or "unknown",
+        "invoiceId": invoice_id
+    })
 
 
 def _normalize_weekday(value):

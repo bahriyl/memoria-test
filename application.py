@@ -544,7 +544,7 @@ def _sanitize_comment_authors(comments):
     return sanitized
 
 
-ALLOWED_ROLES = {'Батько', 'Мати', 'Брат', 'Сестра', ' '}
+ALLOWED_ROLES = {"Мати", "Батько", "Брат", "Сестра", "Чоловік", "Дружина", "Син", "Донька", "Дідусь", "Бабуся", "Онук", "Онука", "Дядько", "Тітка", "Без статусу"}
 
 
 def _validate_relatives(value):

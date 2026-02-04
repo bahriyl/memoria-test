@@ -1,9 +1,7 @@
-import time
-
 import eventlet
-
 eventlet.monkey_patch()
 
+import time
 import os
 import re
 import secrets

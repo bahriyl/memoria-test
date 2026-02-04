@@ -71,6 +71,7 @@ SPACES_KEY = os.environ.get("SPACES_KEY")
 SPACES_SECRET = os.environ.get("SPACES_SECRET")
 SPACES_REGION = os.environ.get("SPACES_REGION")
 SPACES_BUCKET = os.environ.get("SPACES_BUCKET")
+SKIP_SPACES_UPLOAD = os.environ.get("SKIP_SPACES_UPLOAD", "").lower() in ("1", "true", "yes", "on")
 
 # Create S3-compatible client for DigitalOcean Spaces
 s3 = boto3.client(
@@ -2293,6 +2294,12 @@ def compress_video_job_status(job_id):
     if not job:
         return jsonify({"error": "job not found"}), 404
     return jsonify(job)
+
+@application.route("/api/config", methods=["GET"])
+def get_app_config():
+    return jsonify({
+        "skipSpacesUpload": bool(SKIP_SPACES_UPLOAD)
+    })
 
 
 @application.route("/api/spaces/video-upload-url", methods=["GET"])

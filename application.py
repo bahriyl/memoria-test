@@ -11,10 +11,14 @@ import bcrypt
 import boto3
 import requests
 import base64
+import io
+import tempfile
+import subprocess
+import shutil
 from datetime import datetime, timedelta, timezone
 import jwt
 
-from flask import Flask, request, jsonify, abort, make_response
+from flask import Flask, request, jsonify, abort, make_response, send_file, after_this_request
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
@@ -32,6 +36,17 @@ load_dotenv()
 
 profanity_filter = ProfanityFilter()
 profanity_filter.init(["ru", "ua"])
+
+try:
+    from PIL import Image, ImageOps
+except Exception:
+    Image = None
+    ImageOps = None
+
+try:
+    import imageio_ffmpeg
+except Exception:
+    imageio_ffmpeg = None
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = "HS256"
@@ -1847,6 +1862,209 @@ def set_church_active_days():
     )
 
     return jsonify({"churchName": name, "activeWeekdays": cleaned})
+
+
+@application.route("/api/media/compress/image", methods=["POST"])
+def compress_image():
+    """
+    Compress/resize an image and return the optimized file.
+    Multipart form-data:
+      - file: image file
+    Query params (optional):
+      - maxWidth (int): max width in px (default 1600)
+      - maxHeight (int): max height in px (default 1600)
+      - quality (int): 1..95 (default 82)
+      - format: jpeg|jpg|webp|png (default jpeg)
+    """
+    if Image is None:
+        return jsonify({"error": "Pillow is not installed"}), 500
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "file required"}), 400
+
+    def _int_param(name, default, min_v=None, max_v=None):
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            val = int(raw)
+        except Exception:
+            return default
+        if min_v is not None and val < min_v:
+            val = min_v
+        if max_v is not None and val > max_v:
+            val = max_v
+        return val
+
+    max_w = _int_param("maxWidth", 1600, 200, 8000)
+    max_h = _int_param("maxHeight", 1600, 200, 8000)
+    quality = _int_param("quality", 82, 30, 95)
+    fmt_raw = (request.args.get("format") or "jpeg").strip().lower()
+    if fmt_raw in ("jpg", "jpeg"):
+        fmt = "JPEG"
+        mime = "image/jpeg"
+        ext = "jpg"
+    elif fmt_raw == "webp":
+        fmt = "WEBP"
+        mime = "image/webp"
+        ext = "webp"
+    elif fmt_raw == "png":
+        fmt = "PNG"
+        mime = "image/png"
+        ext = "png"
+    else:
+        fmt = "JPEG"
+        mime = "image/jpeg"
+        ext = "jpg"
+
+    try:
+        img = Image.open(file.stream)
+        if ImageOps is not None:
+            img = ImageOps.exif_transpose(img)
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img.thumbnail((max_w, max_h), resample)
+        if fmt == "JPEG" and img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        out = io.BytesIO()
+        save_kwargs = {}
+        if fmt in ("JPEG", "WEBP"):
+            save_kwargs["quality"] = quality
+            save_kwargs["optimize"] = True
+        img.save(out, format=fmt, **save_kwargs)
+        out.seek(0)
+    except Exception as e:
+        return jsonify({"error": f"failed to compress image: {e}"}), 500
+
+    filename = os.path.splitext(file.filename or "image")[0] or "image"
+    download_name = f"{filename}.{ext}"
+    return send_file(out, mimetype=mime, as_attachment=False, download_name=download_name)
+
+
+@application.route("/api/media/compress/video", methods=["POST"])
+def compress_video():
+    """
+    Compress a video using ffmpeg and return an optimized mp4.
+    Multipart form-data:
+      - file: video file
+    Query params (optional):
+      - maxWidth (int): max width in px (default 1280)
+      - maxHeight (int): max height in px (default 1280)
+      - crf (int): 18..35 (default 28)
+      - preset (str): ultrafast|superfast|veryfast|faster|fast|medium|slow (default veryfast)
+    """
+    if imageio_ffmpeg is None:
+        return jsonify({"error": "imageio-ffmpeg is not installed"}), 500
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "file required"}), 400
+
+    def _int_param(name, default, min_v=None, max_v=None):
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            val = int(raw)
+        except Exception:
+            return default
+        if min_v is not None and val < min_v:
+            val = min_v
+        if max_v is not None and val > max_v:
+            val = max_v
+        return val
+
+    max_w = _int_param("maxWidth", 1280, 320, 3840)
+    max_h = _int_param("maxHeight", 1280, 320, 3840)
+    crf = _int_param("crf", 28, 18, 35)
+    preset = (request.args.get("preset") or "veryfast").strip().lower()
+    allowed_presets = {
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+    }
+    if preset not in allowed_presets:
+        preset = "veryfast"
+
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        return jsonify({"error": f"ffmpeg not available: {e}"}), 500
+
+    tmpdir = tempfile.mkdtemp(prefix="memoria_video_")
+    in_name = os.path.basename(file.filename or "input")
+    in_path = os.path.join(tmpdir, in_name)
+    out_path = os.path.join(tmpdir, "output.mp4")
+
+    try:
+        file.save(in_path)
+
+        scale_filter = (
+            f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+        )
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i",
+            in_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            scale_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            return jsonify({
+                "error": "ffmpeg failed",
+                "details": proc.stderr[-4000:] if proc.stderr else "unknown error"
+            }), 500
+
+        @after_this_request
+        def cleanup(response):
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            return response
+
+        base = os.path.splitext(in_name)[0] or "video"
+        return send_file(
+            out_path,
+            mimetype="video/mp4",
+            as_attachment=False,
+            download_name=f"{base}.mp4",
+        )
+    except Exception as e:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        return jsonify({"error": f"failed to compress video: {e}"}), 500
 
 
 @application.route("/api/spaces/video-upload-url", methods=["GET"])

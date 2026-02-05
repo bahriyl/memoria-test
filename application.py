@@ -7,6 +7,7 @@ import re
 import secrets
 import bcrypt
 import boto3
+from boto3.s3.transfer import TransferConfig
 import requests
 import base64
 import io
@@ -2290,11 +2291,30 @@ def compress_video_job():
 
             safe_name = f"compressed_{int(time.time())}.mp4"
             key = f"{safe_prefix}{safe_name}"
+
+            total_size = 0
+            try:
+                total_size = os.path.getsize(out_path)
+            except Exception:
+                total_size = 0
+
+            uploaded_bytes = 0
+
+            def _upload_cb(bytes_amount):
+                nonlocal uploaded_bytes, total_size
+                uploaded_bytes += bytes_amount
+                if total_size > 0:
+                    pct = 90 + int(min(9, (uploaded_bytes / total_size) * 9))
+                    _video_job_update(job_id, progress=pct)
+
+            config = TransferConfig(multipart_threshold=5 * 1024 * 1024)
             s3.upload_file(
                 out_path,
                 SPACES_BUCKET,
                 key,
                 ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
+                Config=config,
+                Callback=_upload_cb,
             )
             object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
 
@@ -2478,11 +2498,30 @@ def compress_video_job_upload():
 
             safe_name = f"compressed_{int(time.time())}.mp4"
             key = f"{safe_prefix}{safe_name}"
+
+            total_size = 0
+            try:
+                total_size = os.path.getsize(out_path)
+            except Exception:
+                total_size = 0
+
+            uploaded_bytes = 0
+
+            def _upload_cb(bytes_amount):
+                nonlocal uploaded_bytes, total_size
+                uploaded_bytes += bytes_amount
+                if total_size > 0:
+                    pct = 90 + int(min(9, (uploaded_bytes / total_size) * 9))
+                    _video_job_update(job_id, progress=pct)
+
+            config = TransferConfig(multipart_threshold=5 * 1024 * 1024)
             s3.upload_file(
                 out_path,
                 SPACES_BUCKET,
                 key,
                 ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
+                Config=config,
+                Callback=_upload_cb,
             )
             object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
 

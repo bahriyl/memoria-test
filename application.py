@@ -2184,6 +2184,7 @@ def compress_video_job():
 
     payload = request.get_json(silent=True) or {}
     source_url = (payload.get("sourceUrl") or "").strip()
+    source_key = (payload.get("sourceKey") or "").strip()
     if not source_url:
         return jsonify({"error": "sourceUrl required"}), 400
 
@@ -2353,6 +2354,15 @@ def compress_video_job():
                 ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
             )
             object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
+
+            if source_key:
+                try:
+                    s3.delete_object(Bucket=SPACES_BUCKET, Key=source_key)
+                except Exception as e:
+                    try:
+                        application.logger.warning("%s failed to delete source %s: %s", log_prefix, source_key, e)
+                    except Exception:
+                        pass
 
             _video_job_update(job_id, status="done", phase="done", progress=100, outputUrl=object_url)
         except Exception as e:

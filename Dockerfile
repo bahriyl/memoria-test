@@ -14,4 +14,4 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-CMD ["sh", "-c", "gunicorn application:application --bind 0.0.0.0:${PORT:-8080}"]
+CMD ["sh", "-c", "gunicorn --worker-class eventlet --workers 1 application:application --bind 0.0.0.0:${PORT:-8080}"]

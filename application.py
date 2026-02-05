@@ -50,10 +50,6 @@ try:
 except Exception:
     imageio_ffmpeg = None
 
-try:
-    from moviepy.editor import VideoFileClip
-except Exception:
-    VideoFileClip = None
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = "HS256"
@@ -1894,59 +1890,6 @@ def _ffmpeg_get_duration_seconds(ffmpeg_exe, in_path):
         return 0
 
 
-def _even_size(value):
-    v = int(value)
-    if v % 2 != 0:
-        v -= 1
-    return max(v, 2)
-
-
-def _calc_target_size(width, height, max_w, max_h):
-    if width <= 0 or height <= 0:
-        return (max_w, max_h)
-    scale = min(max_w / width, max_h / height, 1.0)
-    tw = _even_size(width * scale)
-    th = _even_size(height * scale)
-    return (tw, th)
-
-
-def _compress_with_moviepy(in_path, out_path, max_w, max_h, crf, preset):
-    if VideoFileClip is None:
-        raise RuntimeError("moviepy is not installed")
-    clip = None
-    try:
-        clip = VideoFileClip(in_path)
-        rotation = getattr(clip, "rotation", 0) or 0
-        rotation = rotation % 360
-        if rotation:
-            clip = clip.rotate(rotation)
-        w, h = clip.size
-        tw, th = _calc_target_size(w, h, max_w, max_h)
-        if (tw, th) != (w, h):
-            clip = clip.resize(newsize=(tw, th))
-        ffmpeg_params = [
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
-            "-movflags",
-            "+faststart",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-        clip.write_videofile(
-            out_path,
-            codec="libx264",
-            audio_codec="aac",
-            ffmpeg_params=ffmpeg_params,
-            logger=None,
-        )
-    finally:
-        try:
-            if clip:
-                clip.close()
-        except Exception:
-            pass
 
 
 @application.route("/api/liturgy/church-active-days", methods=["GET"])
@@ -2108,8 +2051,8 @@ def compress_video():
       - crf (int): 18..35 (default 28)
       - preset (str): ultrafast|superfast|veryfast|faster|fast|medium|slow (default veryfast)
     """
-    if VideoFileClip is None:
-        return jsonify({"error": "moviepy is not installed"}), 500
+    if imageio_ffmpeg is None:
+        return jsonify({"error": "imageio-ffmpeg is not installed"}), 500
 
     file = request.files.get("file")
     if not file:
@@ -2155,9 +2098,48 @@ def compress_video():
     try:
         file.save(in_path)
 
-        _compress_with_moviepy(in_path, out_path, max_w, max_h, crf, preset)
-        if not os.path.exists(out_path):
-            return jsonify({"error": "compression failed"}), 500
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        scale_filter = (
+            f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+            ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        )
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i",
+            in_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            scale_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            return jsonify({
+                "error": "ffmpeg failed",
+                "details": proc.stderr[-4000:] if proc.stderr else "unknown error"
+            }), 500
 
         @after_this_request
         def cleanup(response):
@@ -2197,8 +2179,8 @@ def compress_video_job():
       }
     Returns: { jobId }
     """
-    if VideoFileClip is None:
-        return jsonify({"error": "moviepy is not installed"}), 500
+    if imageio_ffmpeg is None:
+        return jsonify({"error": "imageio-ffmpeg is not installed"}), 500
 
     payload = request.get_json(silent=True) or {}
     source_url = (payload.get("sourceUrl") or "").strip()
@@ -2283,9 +2265,82 @@ def compress_video_job():
                             _video_job_update(job_id, progress=pct)
 
             _video_job_update(job_id, phase="compressing", progress=10)
-            _compress_with_moviepy(in_path, out_path, max_w, max_h, crf, preset)
-            if not os.path.exists(out_path):
-                raise RuntimeError("compression failed")
+
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            application.logger.info("%s ffmpeg=%s", log_prefix, ffmpeg_exe)
+            duration = _ffmpeg_get_duration_seconds(ffmpeg_exe, in_path)
+            scale_filter = (
+                f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+                ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
+            )
+
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                in_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-vf",
+                scale_filter,
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                str(crf),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-ac",
+                "2",
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                out_path,
+            ]
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            ffmpeg_log = []
+            if proc.stdout:
+                for line in proc.stdout:
+                    if not line:
+                        continue
+                    if len(ffmpeg_log) < 2000:
+                        ffmpeg_log.append(line.rstrip())
+                    if line.startswith("out_time_ms=") and duration > 0:
+                        try:
+                            out_ms = int(line.strip().split("=", 1)[1])
+                            pct = min(90, 10 + int((out_ms / (duration * 1_000_000)) * 80))
+                            _video_job_update(job_id, progress=pct)
+                        except Exception:
+                            pass
+            ret = proc.wait()
+            if ret != 0 or not os.path.exists(out_path):
+                try:
+                    application.logger.error(
+                        "%s ffmpeg failed ret=%s log_tail=%s",
+                        log_prefix,
+                        ret,
+                        "\n".join(ffmpeg_log[-200:]),
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError("ffmpeg failed")
 
             _video_job_update(job_id, phase="uploading", progress=90)
 

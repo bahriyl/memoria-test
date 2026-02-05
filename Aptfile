@@ -16,3 +16,5 @@ libgbm1
 libwayland-client0
 libwayland-cursor0
 libwayland-egl1
+libblas3
+liblapack3

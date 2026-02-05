@@ -1889,7 +1889,9 @@ def _ffmpeg_get_duration_seconds(ffmpeg_exe, in_path):
             text=True,
             timeout=15,
         )
-    return _ffmpeg_parse_duration_seconds(proc.stderr)
+        return _ffmpeg_parse_duration_seconds(proc.stderr)
+    except Exception:
+        return 0
 
 
 def _even_size(value):
@@ -1945,8 +1947,6 @@ def _compress_with_moviepy(in_path, out_path, max_w, max_h, crf, preset):
                 clip.close()
         except Exception:
             pass
-    except Exception:
-        return 0
 
 
 @application.route("/api/liturgy/church-active-days", methods=["GET"])

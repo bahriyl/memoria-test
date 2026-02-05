@@ -2053,6 +2053,7 @@ def compress_video():
 
         scale_filter = (
             f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+            ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
         )
 
         cmd = [
@@ -2184,11 +2185,23 @@ def compress_video_job():
         in_path = os.path.join(tmpdir, "input")
         out_path = os.path.join(tmpdir, "output.mp4")
         ffmpeg_exe = None
+        log_prefix = f"[video_job:{job_id}]"
         try:
             _video_job_update(job_id, status="processing", phase="downloading", progress=0)
 
             with requests.get(source_url, stream=True, timeout=30) as r:
                 r.raise_for_status()
+                try:
+                    application.logger.info(
+                        "%s download %s status=%s content-type=%s content-length=%s",
+                        log_prefix,
+                        source_url,
+                        r.status_code,
+                        r.headers.get("content-type"),
+                        r.headers.get("content-length"),
+                    )
+                except Exception:
+                    pass
                 total = int(r.headers.get("content-length") or 0)
                 downloaded = 0
                 with open(in_path, "wb") as f:
@@ -2204,9 +2217,11 @@ def compress_video_job():
             _video_job_update(job_id, phase="compressing", progress=10)
 
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            application.logger.info("%s ffmpeg=%s", log_prefix, ffmpeg_exe)
             duration = _ffmpeg_get_duration_seconds(ffmpeg_exe, in_path)
             scale_filter = (
                 f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+                ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
             )
 
             cmd = [
@@ -2241,13 +2256,20 @@ def compress_video_job():
             ]
 
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
 
+            ffmpeg_log = []
             if proc.stdout:
                 for line in proc.stdout:
                     if not line:
                         continue
+                    if len(ffmpeg_log) < 2000:
+                        ffmpeg_log.append(line.rstrip())
                     if line.startswith("out_time_ms=") and duration > 0:
                         try:
                             out_ms = int(line.strip().split("=", 1)[1])
@@ -2257,6 +2279,15 @@ def compress_video_job():
                             pass
             ret = proc.wait()
             if ret != 0 or not os.path.exists(out_path):
+                try:
+                    application.logger.error(
+                        "%s ffmpeg failed ret=%s log_tail=%s",
+                        log_prefix,
+                        ret,
+                        "\n".join(ffmpeg_log[-200:]),
+                    )
+                except Exception:
+                    pass
                 raise RuntimeError("ffmpeg failed")
 
             _video_job_update(job_id, phase="uploading", progress=90)
@@ -2273,6 +2304,10 @@ def compress_video_job():
 
             _video_job_update(job_id, status="done", phase="done", progress=100, outputUrl=object_url)
         except Exception as e:
+            try:
+                application.logger.exception("%s job failed: %s", log_prefix, e)
+            except Exception:
+                pass
             _video_job_update(job_id, status="error", phase="error", error=str(e))
         finally:
             try:

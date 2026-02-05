@@ -2114,6 +2114,139 @@ def compress_video():
         return jsonify({"error": f"failed to compress video: {e}"}), 500
 
 
+@application.route("/api/media/compress/video/upload", methods=["POST"])
+def compress_video_upload():
+    """
+    Compress a video and upload the compressed mp4 to Spaces.
+    Multipart form-data:
+      - file: video file
+    Query params (optional):
+      - maxWidth (int): max width in px (default 1280)
+      - maxHeight (int): max height in px (default 1280)
+      - crf (int): 18..35 (default 28)
+      - preset (str): ultrafast|superfast|veryfast|faster|fast|medium|slow (default veryfast)
+      - prefix (str): folder prefix, defaults to "videos/"
+    Returns:
+      { "objectUrl": "<public url>", "key": "<key>" }
+    """
+    if imageio_ffmpeg is None:
+        return jsonify({"error": "imageio-ffmpeg is not installed"}), 500
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "file required"}), 400
+
+    def _int_param(name, default, min_v=None, max_v=None):
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            val = int(raw)
+        except Exception:
+            return default
+        if min_v is not None and val < min_v:
+            val = min_v
+        if max_v is not None and val > max_v:
+            val = max_v
+        return val
+
+    max_w = _int_param("maxWidth", 1280, 320, 3840)
+    max_h = _int_param("maxHeight", 1280, 320, 3840)
+    crf = _int_param("crf", 28, 18, 35)
+    preset = (request.args.get("preset") or "veryfast").strip().lower()
+    allowed_presets = {
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+    }
+    if preset not in allowed_presets:
+        preset = "veryfast"
+
+    prefix = (request.args.get("prefix") or "videos/").strip()
+    safe_prefix = prefix.rstrip("/") + "/"
+
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        return jsonify({"error": f"ffmpeg not available: {e}"}), 500
+
+    tmpdir = tempfile.mkdtemp(prefix="memoria_video_")
+    in_name = os.path.basename(file.filename or "input")
+    in_path = os.path.join(tmpdir, in_name)
+    out_path = os.path.join(tmpdir, "output.mp4")
+
+    try:
+        file.save(in_path)
+
+        scale_filter = (
+            f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+            ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        )
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i",
+            in_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            scale_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            application.logger.error(
+                "[video_upload] ffmpeg failed ret=%s log_tail=%s",
+                proc.returncode,
+                "\n".join((proc.stdout or "").splitlines()[-200:]),
+            )
+            return jsonify({"error": "ffmpeg failed"}), 500
+
+        safe_name = f"compressed_{int(time.time())}.mp4"
+        key = f"{safe_prefix}{safe_name}"
+        s3.upload_file(
+            out_path,
+            SPACES_BUCKET,
+            key,
+            ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
+        )
+        object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
+
+        return jsonify({"objectUrl": object_url, "key": key})
+    except Exception as e:
+        application.logger.exception("[video_upload] failed: %s", e)
+        return jsonify({"error": f"failed to compress video: {e}"}), 500
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 @application.route("/api/media/compress/video/job", methods=["POST"])
 def compress_video_job():
     """

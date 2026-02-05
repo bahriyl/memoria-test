@@ -12,6 +12,7 @@ import base64
 import io
 import tempfile
 import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 import jwt
 
@@ -1966,6 +1967,125 @@ def compress_image():
     filename = os.path.splitext(file.filename or "image")[0] or "image"
     download_name = f"{filename}.{ext}"
     return send_file(out, mimetype=mime, as_attachment=False, download_name=download_name)
+
+
+@application.route("/api/media/compress/video", methods=["POST"])
+def compress_video():
+    """
+    Compress/resize a video and return the optimized MP4.
+    Multipart form-data:
+      - file: video file
+    Query params (optional):
+      - maxWidth (int): max width in px (default 1280)
+      - maxHeight (int): max height in px (default 720)
+      - crf (int): 18..35 (default 28)
+      - preset: ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow (default veryfast)
+      - audioBitrate (int): kbps (default 128)
+      - format: mp4 (default mp4)
+    """
+    if shutil.which("ffmpeg") is None:
+        return jsonify({"error": "ffmpeg is not installed"}), 500
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "file required"}), 400
+
+    def _int_param(name, default, min_v=None, max_v=None):
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            val = int(raw)
+        except Exception:
+            return default
+        if min_v is not None and val < min_v:
+            val = min_v
+        if max_v is not None and val > max_v:
+            val = max_v
+        return val
+
+    max_w = _int_param("maxWidth", 1280, 320, 3840)
+    max_h = _int_param("maxHeight", 720, 240, 2160)
+    crf = _int_param("crf", 28, 18, 35)
+    audio_bitrate = _int_param("audioBitrate", 128, 32, 320)
+
+    preset = (request.args.get("preset") or "veryfast").strip().lower()
+    allowed_presets = {
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+    }
+    if preset not in allowed_presets:
+        preset = "veryfast"
+
+    fmt_raw = (request.args.get("format") or "mp4").strip().lower()
+    if fmt_raw != "mp4":
+        fmt_raw = "mp4"
+    ext = "mp4"
+    mime = "video/mp4"
+
+    tmp_dir = tempfile.mkdtemp(prefix="compress_video_")
+    in_path = os.path.join(tmp_dir, "input")
+    out_path = os.path.join(tmp_dir, f"output.{ext}")
+
+    try:
+        file.save(in_path)
+        scale = f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+        vf = f"{scale},scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            in_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{audio_bitrate}k",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            out_path,
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", errors="ignore")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify({"error": "failed to compress video", "details": err[-2000:]}), 500
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify({"error": f"failed to compress video: {e}"}), 500
+
+    @after_this_request
+    def _cleanup(response):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return response
+
+    filename = os.path.splitext(file.filename or "video")[0] or "video"
+    download_name = f"{filename}.{ext}"
+    return send_file(out_path, mimetype=mime, as_attachment=False, download_name=download_name)
 
 
 @application.route("/api/spaces/video-upload-url", methods=["GET"])

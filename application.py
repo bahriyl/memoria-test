@@ -69,6 +69,7 @@ SPACES_KEY = os.environ.get("SPACES_KEY")
 SPACES_SECRET = os.environ.get("SPACES_SECRET")
 SPACES_REGION = os.environ.get("SPACES_REGION")
 SPACES_BUCKET = os.environ.get("SPACES_BUCKET")
+SPACES_CORS_ORIGINS = [o.strip() for o in os.environ.get("SPACES_CORS_ORIGINS", "").split(",") if o.strip()]
 
 # Create S3-compatible client for DigitalOcean Spaces
 s3 = boto3.client(
@@ -78,6 +79,35 @@ s3 = boto3.client(
     aws_access_key_id=SPACES_KEY,
     aws_secret_access_key=SPACES_SECRET,
 )
+
+def _ensure_spaces_cors():
+    if not SPACES_BUCKET or not SPACES_CORS_ORIGINS:
+        return
+    try:
+        s3.put_bucket_cors(
+            Bucket=SPACES_BUCKET,
+            CORSConfiguration={
+                "CORSRules": [
+                    {
+                        "AllowedOrigins": SPACES_CORS_ORIGINS,
+                        "AllowedMethods": ["GET", "HEAD"],
+                        "AllowedHeaders": ["*"],
+                        "ExposeHeaders": [
+                            "ETag",
+                            "Content-Range",
+                            "Accept-Ranges",
+                            "Content-Length",
+                        ],
+                        "MaxAgeSeconds": 3000,
+                    }
+                ]
+            },
+        )
+        application.logger.info("Spaces CORS configured for %s", SPACES_CORS_ORIGINS)
+    except Exception as e:
+        application.logger.warning("Failed to set Spaces CORS: %s", e)
+
+_ensure_spaces_cors()
 
 client = MongoClient('mongodb+srv://tsbgalcontract:mymongodb26@cluster0.kppkt.mongodb.net/test')
 db = client['memoria_test']
@@ -92,6 +122,7 @@ ritual_services_collection = db['ritual_services']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 church_days_collection = db['church_days']
+video_jobs_collection = db['video_jobs']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -1798,17 +1829,34 @@ def _normalize_weekday(value):
 def _video_job_update(job_id, **kwargs):
     with VIDEO_COMPRESS_LOCK:
         job = VIDEO_COMPRESS_JOBS.get(job_id)
-        if not job:
-            return
-        job.update(kwargs)
+        if job:
+            job.update(kwargs)
+        else:
+            job = {"status": "queued", "phase": "queued", "progress": 0, "outputUrl": "", "error": ""}
+            job.update(kwargs)
+            VIDEO_COMPRESS_JOBS[job_id] = job
+    try:
+        payload = dict(job)
+        payload["jobId"] = job_id
+        payload["updatedAt"] = datetime.now(timezone.utc)
+        video_jobs_collection.update_one({"jobId": job_id}, {"$set": payload}, upsert=True)
+    except Exception:
+        pass
 
 
 def _video_job_get(job_id):
     with VIDEO_COMPRESS_LOCK:
         job = VIDEO_COMPRESS_JOBS.get(job_id)
-        if not job:
-            return None
-        return dict(job)
+        if job:
+            return dict(job)
+    try:
+        doc = video_jobs_collection.find_one({"jobId": job_id}, {"_id": 0})
+        if doc:
+            doc.pop("jobId", None)
+            return doc
+    except Exception:
+        return None
+    return None
 
 
 def _ffmpeg_parse_duration_seconds(text):
@@ -2308,14 +2356,14 @@ def compress_video_job():
     safe_prefix = prefix.rstrip("/") + "/"
 
     job_id = secrets.token_urlsafe(10)
-    with VIDEO_COMPRESS_LOCK:
-        VIDEO_COMPRESS_JOBS[job_id] = {
-            "status": "queued",
-            "phase": "queued",
-            "progress": 0,
-            "outputUrl": "",
-            "error": "",
-        }
+    _video_job_update(
+        job_id,
+        status="queued",
+        phase="queued",
+        progress=0,
+        outputUrl="",
+        error="",
+    )
 
     def _run_job():
         tmpdir = tempfile.mkdtemp(prefix="memoria_vjob_")
@@ -2516,14 +2564,14 @@ def compress_video_job_upload():
     safe_prefix = prefix.rstrip("/") + "/"
 
     job_id = secrets.token_urlsafe(10)
-    with VIDEO_COMPRESS_LOCK:
-        VIDEO_COMPRESS_JOBS[job_id] = {
-            "status": "queued",
-            "phase": "queued",
-            "progress": 0,
-            "outputUrl": "",
-            "error": "",
-        }
+    _video_job_update(
+        job_id,
+        status="queued",
+        phase="queued",
+        progress=0,
+        outputUrl="",
+        error="",
+    )
 
     tmpdir = tempfile.mkdtemp(prefix="memoria_vjob_")
     in_name = os.path.basename(file.filename or "input")

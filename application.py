@@ -69,7 +69,6 @@ SPACES_KEY = os.environ.get("SPACES_KEY")
 SPACES_SECRET = os.environ.get("SPACES_SECRET")
 SPACES_REGION = os.environ.get("SPACES_REGION")
 SPACES_BUCKET = os.environ.get("SPACES_BUCKET")
-SPACES_CORS_ORIGINS = [o.strip() for o in os.environ.get("SPACES_CORS_ORIGINS", "").split(",") if o.strip()]
 
 # Create S3-compatible client for DigitalOcean Spaces
 s3 = boto3.client(
@@ -80,34 +79,6 @@ s3 = boto3.client(
     aws_secret_access_key=SPACES_SECRET,
 )
 
-def _ensure_spaces_cors():
-    if not SPACES_BUCKET or not SPACES_CORS_ORIGINS:
-        return
-    try:
-        s3.put_bucket_cors(
-            Bucket=SPACES_BUCKET,
-            CORSConfiguration={
-                "CORSRules": [
-                    {
-                        "AllowedOrigins": SPACES_CORS_ORIGINS,
-                        "AllowedMethods": ["GET", "HEAD"],
-                        "AllowedHeaders": ["*"],
-                        "ExposeHeaders": [
-                            "ETag",
-                            "Content-Range",
-                            "Accept-Ranges",
-                            "Content-Length",
-                        ],
-                        "MaxAgeSeconds": 3000,
-                    }
-                ]
-            },
-        )
-        application.logger.info("Spaces CORS configured for %s", SPACES_CORS_ORIGINS)
-    except Exception as e:
-        application.logger.warning("Failed to set Spaces CORS: %s", e)
-
-_ensure_spaces_cors()
 
 client = MongoClient('mongodb+srv://tsbgalcontract:mymongodb26@cluster0.kppkt.mongodb.net/test')
 db = client['memoria_test']
@@ -122,7 +93,6 @@ ritual_services_collection = db['ritual_services']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 church_days_collection = db['church_days']
-video_jobs_collection = db['video_jobs']
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -1829,34 +1799,17 @@ def _normalize_weekday(value):
 def _video_job_update(job_id, **kwargs):
     with VIDEO_COMPRESS_LOCK:
         job = VIDEO_COMPRESS_JOBS.get(job_id)
-        if job:
-            job.update(kwargs)
-        else:
-            job = {"status": "queued", "phase": "queued", "progress": 0, "outputUrl": "", "error": ""}
-            job.update(kwargs)
-            VIDEO_COMPRESS_JOBS[job_id] = job
-    try:
-        payload = dict(job)
-        payload["jobId"] = job_id
-        payload["updatedAt"] = datetime.now(timezone.utc)
-        video_jobs_collection.update_one({"jobId": job_id}, {"$set": payload}, upsert=True)
-    except Exception:
-        pass
+        if not job:
+            return
+        job.update(kwargs)
 
 
 def _video_job_get(job_id):
     with VIDEO_COMPRESS_LOCK:
         job = VIDEO_COMPRESS_JOBS.get(job_id)
-        if job:
-            return dict(job)
-    try:
-        doc = video_jobs_collection.find_one({"jobId": job_id}, {"_id": 0})
-        if doc:
-            doc.pop("jobId", None)
-            return doc
-    except Exception:
-        return None
-    return None
+        if not job:
+            return None
+        return dict(job)
 
 
 def _ffmpeg_parse_duration_seconds(text):
@@ -2121,8 +2074,6 @@ def compress_video():
             preset,
             "-crf",
             str(crf),
-            "-pix_fmt",
-            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
@@ -2162,141 +2113,6 @@ def compress_video():
         except Exception:
             pass
         return jsonify({"error": f"failed to compress video: {e}"}), 500
-
-
-@application.route("/api/media/compress/video/upload", methods=["POST"])
-def compress_video_upload():
-    """
-    Compress a video and upload the compressed mp4 to Spaces.
-    Multipart form-data:
-      - file: video file
-    Query params (optional):
-      - maxWidth (int): max width in px (default 1280)
-      - maxHeight (int): max height in px (default 1280)
-      - crf (int): 18..35 (default 28)
-      - preset (str): ultrafast|superfast|veryfast|faster|fast|medium|slow (default veryfast)
-      - prefix (str): folder prefix, defaults to "videos/"
-    Returns:
-      { "objectUrl": "<public url>", "key": "<key>" }
-    """
-    if imageio_ffmpeg is None:
-        return jsonify({"error": "imageio-ffmpeg is not installed"}), 500
-
-    file = request.files.get("file")
-    if not file:
-        return jsonify({"error": "file required"}), 400
-
-    def _int_param(name, default, min_v=None, max_v=None):
-        raw = request.args.get(name)
-        if raw is None or raw == "":
-            return default
-        try:
-            val = int(raw)
-        except Exception:
-            return default
-        if min_v is not None and val < min_v:
-            val = min_v
-        if max_v is not None and val > max_v:
-            val = max_v
-        return val
-
-    max_w = _int_param("maxWidth", 1280, 320, 3840)
-    max_h = _int_param("maxHeight", 1280, 320, 3840)
-    crf = _int_param("crf", 28, 18, 35)
-    preset = (request.args.get("preset") or "veryfast").strip().lower()
-    allowed_presets = {
-        "ultrafast",
-        "superfast",
-        "veryfast",
-        "faster",
-        "fast",
-        "medium",
-        "slow",
-        "slower",
-        "veryslow",
-    }
-    if preset not in allowed_presets:
-        preset = "veryfast"
-
-    prefix = (request.args.get("prefix") or "videos/").strip()
-    safe_prefix = prefix.rstrip("/") + "/"
-
-    try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception as e:
-        return jsonify({"error": f"ffmpeg not available: {e}"}), 500
-
-    tmpdir = tempfile.mkdtemp(prefix="memoria_video_")
-    in_name = os.path.basename(file.filename or "input")
-    in_path = os.path.join(tmpdir, in_name)
-    out_path = os.path.join(tmpdir, "output.mp4")
-
-    try:
-        file.save(in_path)
-
-        scale_filter = (
-            f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
-            ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
-        )
-
-        cmd = [
-            ffmpeg_exe,
-            "-y",
-            "-i",
-            in_path,
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-vf",
-            scale_filter,
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "96k",
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
-            out_path,
-        ]
-
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if proc.returncode != 0 or not os.path.exists(out_path):
-            application.logger.error(
-                "[video_upload] ffmpeg failed ret=%s log_tail=%s",
-                proc.returncode,
-                "\n".join((proc.stdout or "").splitlines()[-200:]),
-            )
-            return jsonify({"error": "ffmpeg failed"}), 500
-
-        safe_name = f"compressed_{int(time.time())}.mp4"
-        key = f"{safe_prefix}{safe_name}"
-        s3.upload_file(
-            out_path,
-            SPACES_BUCKET,
-            key,
-            ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
-        )
-        object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
-
-        return jsonify({"objectUrl": object_url, "key": key})
-    except Exception as e:
-        application.logger.exception("[video_upload] failed: %s", e)
-        return jsonify({"error": f"failed to compress video: {e}"}), 500
-    finally:
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
 
 
 @application.route("/api/media/compress/video/job", methods=["POST"])
@@ -2356,14 +2172,14 @@ def compress_video_job():
     safe_prefix = prefix.rstrip("/") + "/"
 
     job_id = secrets.token_urlsafe(10)
-    _video_job_update(
-        job_id,
-        status="queued",
-        phase="queued",
-        progress=0,
-        outputUrl="",
-        error="",
-    )
+    with VIDEO_COMPRESS_LOCK:
+        VIDEO_COMPRESS_JOBS[job_id] = {
+            "status": "queued",
+            "phase": "queued",
+            "progress": 0,
+            "outputUrl": "",
+            "error": "",
+        }
 
     def _run_job():
         tmpdir = tempfile.mkdtemp(prefix="memoria_vjob_")
@@ -2422,16 +2238,14 @@ def compress_video_job():
                 scale_filter,
             "-c:v",
             "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "96k",
+                "-preset",
+                preset,
+                "-crf",
+                str(crf),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
                 "-ac",
                 "2",
                 "-movflags",
@@ -2507,183 +2321,6 @@ def compress_video_job():
     return jsonify({"jobId": job_id})
 
 
-@application.route("/api/media/compress/video/job/upload", methods=["POST"])
-def compress_video_job_upload():
-    """
-    Start an async video compression job by uploading the source file directly.
-    Multipart form-data:
-      - file: video file
-    Query params (optional):
-      - prefix (str): folder prefix, defaults to "videos/"
-      - maxWidth (int): max width in px (default 1280)
-      - maxHeight (int): max height in px (default 1280)
-      - crf (int): 18..35 (default 28)
-      - preset (str): ultrafast|superfast|veryfast|faster|fast|medium|slow (default veryfast)
-    Returns: { jobId }
-    """
-    if imageio_ffmpeg is None:
-        return jsonify({"error": "imageio-ffmpeg is not installed"}), 500
-
-    file = request.files.get("file")
-    if not file:
-        return jsonify({"error": "file required"}), 400
-
-    def _int_param(name, default, min_v=None, max_v=None):
-        raw = request.args.get(name)
-        if raw is None or raw == "":
-            return default
-        try:
-            val = int(raw)
-        except Exception:
-            return default
-        if min_v is not None and val < min_v:
-            val = min_v
-        if max_v is not None and val > max_v:
-            val = max_v
-        return val
-
-    max_w = _int_param("maxWidth", 1280, 320, 3840)
-    max_h = _int_param("maxHeight", 1280, 320, 3840)
-    crf = _int_param("crf", 28, 18, 35)
-    preset = (request.args.get("preset") or "veryfast").strip().lower()
-    allowed_presets = {
-        "ultrafast",
-        "superfast",
-        "veryfast",
-        "faster",
-        "fast",
-        "medium",
-        "slow",
-        "slower",
-        "veryslow",
-    }
-    if preset not in allowed_presets:
-        preset = "veryfast"
-
-    prefix = (request.args.get("prefix") or "videos/").strip()
-    safe_prefix = prefix.rstrip("/") + "/"
-
-    job_id = secrets.token_urlsafe(10)
-    _video_job_update(
-        job_id,
-        status="queued",
-        phase="queued",
-        progress=0,
-        outputUrl="",
-        error="",
-    )
-
-    tmpdir = tempfile.mkdtemp(prefix="memoria_vjob_")
-    in_name = os.path.basename(file.filename or "input")
-    in_path = os.path.join(tmpdir, in_name)
-    out_path = os.path.join(tmpdir, "output.mp4")
-    file.save(in_path)
-
-    def _run_job_local():
-        ffmpeg_exe = None
-        log_prefix = f"[video_job:{job_id}]"
-        try:
-            _video_job_update(job_id, status="processing", phase="compressing", progress=10)
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            application.logger.info("%s ffmpeg=%s", log_prefix, ffmpeg_exe)
-            duration = _ffmpeg_get_duration_seconds(ffmpeg_exe, in_path)
-            scale_filter = (
-                f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
-                ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
-            )
-
-            cmd = [
-                ffmpeg_exe,
-                "-y",
-                "-i",
-                in_path,
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                "-vf",
-                scale_filter,
-                "-c:v",
-                "libx264",
-                "-preset",
-                preset,
-                "-crf",
-                str(crf),
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "96k",
-                "-ac",
-                "2",
-                "-movflags",
-                "+faststart",
-                "-progress",
-                "pipe:1",
-                "-nostats",
-                out_path,
-            ]
-
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-            )
-
-            ffmpeg_log = []
-            if proc.stdout:
-                for line in proc.stdout:
-                    if not line:
-                        continue
-                    if len(ffmpeg_log) < 2000:
-                        ffmpeg_log.append(line.rstrip())
-                    if line.startswith("out_time_ms=") and duration > 0:
-                        try:
-                            out_ms = int(line.strip().split("=", 1)[1])
-                            pct = min(90, 10 + int((out_ms / (duration * 1_000_000)) * 80))
-                            _video_job_update(job_id, progress=pct)
-                        except Exception:
-                            pass
-            ret = proc.wait()
-            if ret != 0 or not os.path.exists(out_path):
-                try:
-                    application.logger.error(
-                        "%s ffmpeg failed ret=%s log_tail=%s",
-                        log_prefix,
-                        ret,
-                        "\n".join(ffmpeg_log[-200:]),
-                    )
-                except Exception:
-                    pass
-                raise RuntimeError("ffmpeg failed")
-
-            _video_job_update(job_id, phase="uploading", progress=90)
-
-            safe_name = f"compressed_{int(time.time())}.mp4"
-            key = f"{safe_prefix}{safe_name}"
-            s3.upload_file(
-                out_path,
-                SPACES_BUCKET,
-                key,
-                ExtraArgs={"ACL": "public-read", "ContentType": "video/mp4"},
-            )
-            object_url = f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{key}"
-
-            _video_job_update(job_id, status="done", phase="done", progress=100, outputUrl=object_url)
-        except Exception as e:
-            try:
-                application.logger.exception("%s job failed: %s", log_prefix, e)
-            except Exception:
-                pass
-            _video_job_update(job_id, status="error", phase="error", error=str(e))
-        finally:
-            try:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
-
-    eventlet.spawn_n(_run_job_local)
-
-    return jsonify({"jobId": job_id})
 
 
 @application.route("/api/media/compress/video/job/<string:job_id>", methods=["GET"])

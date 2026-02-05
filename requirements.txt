@@ -13,3 +13,4 @@ bcrypt
 git+https://github.com/FlacSy/badwords.git
 Pillow
 imageio-ffmpeg
+moviepy

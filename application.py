@@ -69,6 +69,7 @@ SPACES_KEY = os.environ.get("SPACES_KEY")
 SPACES_SECRET = os.environ.get("SPACES_SECRET")
 SPACES_REGION = os.environ.get("SPACES_REGION")
 SPACES_BUCKET = os.environ.get("SPACES_BUCKET")
+SPACES_CORS_ORIGINS = [o.strip() for o in os.environ.get("SPACES_CORS_ORIGINS", "").split(",") if o.strip()]
 
 # Create S3-compatible client for DigitalOcean Spaces
 s3 = boto3.client(
@@ -78,6 +79,36 @@ s3 = boto3.client(
     aws_access_key_id=SPACES_KEY,
     aws_secret_access_key=SPACES_SECRET,
 )
+
+def _ensure_spaces_cors():
+    if not SPACES_BUCKET or not SPACES_CORS_ORIGINS:
+        return
+    try:
+        s3.put_bucket_cors(
+            Bucket=SPACES_BUCKET,
+            CORSConfiguration={
+                "CORSRules": [
+                    {
+                        "AllowedOrigins": SPACES_CORS_ORIGINS,
+                        "AllowedMethods": ["GET", "HEAD", "PUT", "POST"],
+                        "AllowedHeaders": ["*"],
+                        "ExposeHeaders": [
+                            "ETag",
+                            "Content-Range",
+                            "Accept-Ranges",
+                            "Content-Length",
+                            "Location",
+                        ],
+                        "MaxAgeSeconds": 3000,
+                    }
+                ]
+            },
+        )
+        application.logger.info("Spaces CORS configured for %s", SPACES_CORS_ORIGINS)
+    except Exception as e:
+        application.logger.warning("Failed to set Spaces CORS: %s", e)
+
+_ensure_spaces_cors()
 
 
 client = MongoClient('mongodb+srv://tsbgalcontract:mymongodb26@cluster0.kppkt.mongodb.net/test')

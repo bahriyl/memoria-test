@@ -13,6 +13,7 @@ import io
 import tempfile
 import shutil
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 import jwt
 
@@ -55,6 +56,24 @@ application = Flask(__name__)
 CORS(application)
 
 socketio = SocketIO(application, cors_allowed_origins="*")
+
+_compress_video_jobs = {}
+_compress_video_lock = threading.Lock()
+
+def _set_compress_job(job_id, **updates):
+    with _compress_video_lock:
+        job = _compress_video_jobs.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+
+def _get_compress_job(job_id):
+    with _compress_video_lock:
+        return _compress_video_jobs.get(job_id)
+
+def _remove_compress_job(job_id):
+    with _compress_video_lock:
+        return _compress_video_jobs.pop(job_id, None)
 
 KYIVSTAR_OTP_SEND_URL = "https://api-gateway.kyivstar.ua/mock/rest/v1/verification/sms"
 KYIVSTAR_OTP_VERIFY_URL = "https://api-gateway.kyivstar.ua/mock/rest/v1/verification/sms/check"
@@ -1969,41 +1988,21 @@ def compress_image():
     return send_file(out, mimetype=mime, as_attachment=False, download_name=download_name)
 
 
-@application.route("/api/media/compress/video", methods=["POST"])
-def compress_video():
-    """
-    Compress/resize a video and return the optimized MP4.
-    Multipart form-data:
-      - file: video file
-    Query params (optional):
-      - maxWidth (int): max width in px (default 1280)
-      - maxHeight (int): max height in px (default 720)
-      - crf (int): 18..35 (default 28)
-      - preset: ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow (default veryfast)
-      - audioBitrate (int): kbps (default 128)
-      - format: mp4 (default mp4)
-    """
-    if shutil.which("ffmpeg") is None:
-        return jsonify({"error": "ffmpeg is not installed"}), 500
+def _int_param(name, default, min_v=None, max_v=None):
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = int(raw)
+    except Exception:
+        return default
+    if min_v is not None and val < min_v:
+        val = min_v
+    if max_v is not None and val > max_v:
+        val = max_v
+    return val
 
-    file = request.files.get("file")
-    if not file:
-        return jsonify({"error": "file required"}), 400
-
-    def _int_param(name, default, min_v=None, max_v=None):
-        raw = request.args.get(name)
-        if raw is None or raw == "":
-            return default
-        try:
-            val = int(raw)
-        except Exception:
-            return default
-        if min_v is not None and val < min_v:
-            val = min_v
-        if max_v is not None and val > max_v:
-            val = max_v
-        return val
-
+def _parse_video_compress_params():
     max_w = _int_param("maxWidth", 1280, 320, 3840)
     max_h = _int_param("maxHeight", 720, 240, 2160)
     crf = _int_param("crf", 28, 18, 35)
@@ -2029,14 +2028,233 @@ def compress_video():
         fmt_raw = "mp4"
     ext = "mp4"
     mime = "video/mp4"
+    return {
+        "max_w": max_w,
+        "max_h": max_h,
+        "crf": crf,
+        "audio_bitrate": audio_bitrate,
+        "preset": preset,
+        "ext": ext,
+        "mime": mime,
+    }
 
+def _probe_video_duration(path):
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nk=1:nw=1",
+            path,
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore").strip()
+        if not out:
+            return None
+        return float(out)
+    except Exception:
+        return None
+
+def _run_video_compress_job(job_id):
+    job = _get_compress_job(job_id)
+    if not job:
+        return
+
+    params = job["params"]
+    in_path = job["input_path"]
+    out_path = job["output_path"]
+    duration = job.get("duration")
+    tmp_dir = job.get("tmp_dir")
+
+    scale = f"scale='min(iw,{params['max_w']})':'min(ih,{params['max_h']})':force_original_aspect_ratio=decrease"
+    vf = f"{scale},scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        in_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        params["preset"],
+        "-crf",
+        str(params["crf"]),
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-b:a",
+        f"{params['audio_bitrate']}k",
+        "-ac",
+        "2",
+        "-ar",
+        "44100",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        out_path,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        if proc.stdout:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("out_time_ms=") and duration:
+                    try:
+                        out_ms = int(line.split("=", 1)[1])
+                        pct = max(0.0, min(100.0, (out_ms / (duration * 1_000_000.0)) * 100.0))
+                        _set_compress_job(job_id, percent=pct, status="compressing")
+                    except Exception:
+                        pass
+                elif line.startswith("progress="):
+                    val = line.split("=", 1)[1].strip()
+                    if val == "end":
+                        _set_compress_job(job_id, percent=100.0, status="done")
+        rc = proc.wait()
+        if rc != 0:
+            _set_compress_job(job_id, status="error", error="failed to compress video")
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        else:
+            _set_compress_job(job_id, status="done", percent=100.0)
+    except Exception as e:
+        _set_compress_job(job_id, status="error", error=f"failed to compress video: {e}")
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+@application.route("/api/media/compress/video/start", methods=["POST"])
+def compress_video_start():
+    """
+    Start a video compression job and return a jobId for progress polling.
+    Multipart form-data:
+      - file: video file
+    Query params: same as /api/media/compress/video
+    """
+    if shutil.which("ffmpeg") is None:
+        return jsonify({"error": "ffmpeg is not installed"}), 500
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "file required"}), 400
+
+    params = _parse_video_compress_params()
     tmp_dir = tempfile.mkdtemp(prefix="compress_video_")
     in_path = os.path.join(tmp_dir, "input")
-    out_path = os.path.join(tmp_dir, f"output.{ext}")
+    out_path = os.path.join(tmp_dir, f"output.{params['ext']}")
 
     try:
         file.save(in_path)
-        scale = f"scale='min(iw,{max_w})':'min(ih,{max_h})':force_original_aspect_ratio=decrease"
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return jsonify({"error": f"failed to save input: {e}"}), 500
+
+    duration = _probe_video_duration(in_path)
+    job_id = secrets.token_urlsafe(16)
+    with _compress_video_lock:
+        _compress_video_jobs[job_id] = {
+            "status": "queued",
+            "percent": 0.0,
+            "error": None,
+            "tmp_dir": tmp_dir,
+            "input_path": in_path,
+            "output_path": out_path,
+            "params": params,
+            "duration": duration,
+            "filename": os.path.splitext(file.filename or "video")[0] or "video",
+            "created_at": time.time(),
+        }
+
+    _set_compress_job(job_id, status="compressing")
+    eventlet.spawn_n(_run_video_compress_job, job_id)
+
+    return jsonify({"jobId": job_id}), 200
+
+@application.route("/api/media/compress/video/progress", methods=["GET"])
+def compress_video_progress():
+    job_id = request.args.get("jobId") or ""
+    job = _get_compress_job(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify({
+        "status": job.get("status"),
+        "percent": job.get("percent"),
+        "error": job.get("error"),
+    }), 200
+
+@application.route("/api/media/compress/video/result", methods=["GET"])
+def compress_video_result():
+    job_id = request.args.get("jobId") or ""
+    job = _get_compress_job(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    if job.get("status") != "done":
+        return jsonify({"status": job.get("status"), "error": job.get("error")}), 202
+
+    out_path = job.get("output_path")
+    if not out_path or not os.path.exists(out_path):
+        return jsonify({"error": "output missing"}), 500
+
+    @after_this_request
+    def _cleanup(response):
+        tmp_dir = job.get("tmp_dir")
+        _remove_compress_job(job_id)
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return response
+
+    download_name = f"{job.get('filename')}.{job['params']['ext']}"
+    return send_file(out_path, mimetype=job["params"]["mime"], as_attachment=False, download_name=download_name)
+
+
+@application.route("/api/media/compress/video", methods=["POST"])
+def compress_video():
+    """
+    Compress/resize a video and return the optimized MP4.
+    Multipart form-data:
+      - file: video file
+    Query params (optional):
+      - maxWidth (int): max width in px (default 1280)
+      - maxHeight (int): max height in px (default 720)
+      - crf (int): 18..35 (default 28)
+      - preset: ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow (default veryfast)
+      - audioBitrate (int): kbps (default 128)
+      - format: mp4 (default mp4)
+    """
+    if shutil.which("ffmpeg") is None:
+        return jsonify({"error": "ffmpeg is not installed"}), 500
+
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "file required"}), 400
+
+    params = _parse_video_compress_params()
+
+    tmp_dir = tempfile.mkdtemp(prefix="compress_video_")
+    in_path = os.path.join(tmp_dir, "input")
+    out_path = os.path.join(tmp_dir, f"output.{params['ext']}")
+
+    try:
+        file.save(in_path)
+        scale = f"scale='min(iw,{params['max_w']})':'min(ih,{params['max_h']})':force_original_aspect_ratio=decrease"
         vf = f"{scale},scale=trunc(iw/2)*2:trunc(ih/2)*2"
         cmd = [
             "ffmpeg",
@@ -2052,9 +2270,9 @@ def compress_video():
             "-c:v",
             "libx264",
             "-preset",
-            preset,
+            params["preset"],
             "-crf",
-            str(crf),
+            str(params["crf"]),
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -2062,7 +2280,7 @@ def compress_video():
             "-c:a",
             "aac",
             "-b:a",
-            f"{audio_bitrate}k",
+            f"{params['audio_bitrate']}k",
             "-ac",
             "2",
             "-ar",
@@ -2084,8 +2302,8 @@ def compress_video():
         return response
 
     filename = os.path.splitext(file.filename or "video")[0] or "video"
-    download_name = f"{filename}.{ext}"
-    return send_file(out_path, mimetype=mime, as_attachment=False, download_name=download_name)
+    download_name = f"{filename}.{params['ext']}"
+    return send_file(out_path, mimetype=params["mime"], as_attachment=False, download_name=download_name)
 
 
 @application.route("/api/spaces/video-upload-url", methods=["GET"])

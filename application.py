@@ -507,7 +507,7 @@ def get_person(person_id):
         "photos": photos_norm,
         "sharedPending": person.get('sharedPending', []),
         "sharedPhotos": person.get('sharedPhotos', []),
-        "comments": person.get('comments', [])
+        "comments": _sort_comments(person.get('comments', []))
     }
     if 'relatives' in person:
         response['relatives'] = [
@@ -587,6 +587,41 @@ def _sanitize_comment_authors(comments):
     if not isinstance(comments, list):
         abort(400, description="`comments` must be a list of objects")
 
+    def _parse_comment_moment(comment_obj):
+        date_time_raw = (comment_obj.get("dateTime") or "").strip() if isinstance(comment_obj.get("dateTime"), str) else ""
+        if date_time_raw:
+            try:
+                return datetime.fromisoformat(date_time_raw.replace("Z", "+00:00"))
+            except Exception:
+                abort(400, description="`dateTime` must be a valid ISO datetime string")
+
+        date_raw = (comment_obj.get("date") or "").strip() if isinstance(comment_obj.get("date"), str) else ""
+        if not date_raw:
+            return None
+
+        m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", date_raw)
+        if not m:
+            return None
+
+        dd = int(m.group(1))
+        mm = int(m.group(2))
+        yyyy = int(m.group(3))
+
+        hh = 0
+        mi = 0
+        time_raw = (comment_obj.get("time") or "").strip() if isinstance(comment_obj.get("time"), str) else ""
+        if time_raw:
+            tm = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", time_raw)
+            if not tm:
+                abort(400, description="`time` must be in HH:MM format")
+            hh = int(tm.group(1))
+            mi = int(tm.group(2))
+
+        try:
+            return datetime(yyyy, mm, dd, hh, mi)
+        except Exception:
+            return None
+
     sanitized = []
     for c in comments:
         if not isinstance(c, dict):
@@ -601,9 +636,67 @@ def _sanitize_comment_authors(comments):
             if profanity_filter.filter_text(author, match_threshold=0.9):
                 abort(400, description=f"Author contains forbidden words")
 
-        sanitized.append(c)
+        text = c.get("text", "")
+        if text is not None and not isinstance(text, str):
+            abort(400, description="`text` must be a string")
+
+        if "date" in c and c.get("date") is not None and not isinstance(c.get("date"), str):
+            abort(400, description="`date` must be a string")
+        if "time" in c and c.get("time") is not None and not isinstance(c.get("time"), str):
+            abort(400, description="`time` must be a string")
+        if "dateTime" in c and c.get("dateTime") is not None and not isinstance(c.get("dateTime"), str):
+            abort(400, description="`dateTime` must be a string")
+
+        normalized = dict(c)
+        moment = _parse_comment_moment(normalized)
+        if moment is not None:
+            normalized["dateTime"] = moment.isoformat()
+            if "time" not in normalized or not isinstance(normalized.get("time"), str) or not normalized.get("time").strip():
+                normalized["time"] = moment.strftime("%H:%M")
+
+        sanitized.append(normalized)
 
     return sanitized
+
+
+def _comment_sort_key(comment_obj):
+    if not isinstance(comment_obj, dict):
+        return datetime.min
+
+    date_time_raw = comment_obj.get("dateTime")
+    if isinstance(date_time_raw, str) and date_time_raw.strip():
+        try:
+            return datetime.fromisoformat(date_time_raw.strip().replace("Z", "+00:00"))
+        except Exception:
+            pass
+
+    date_raw = comment_obj.get("date")
+    if isinstance(date_raw, str):
+        m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})$", date_raw.strip())
+        if m:
+            dd = int(m.group(1))
+            mm = int(m.group(2))
+            yyyy = int(m.group(3))
+            hh = 0
+            mi = 0
+            time_raw = comment_obj.get("time")
+            if isinstance(time_raw, str):
+                tm = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", time_raw.strip())
+                if tm:
+                    hh = int(tm.group(1))
+                    mi = int(tm.group(2))
+            try:
+                return datetime(yyyy, mm, dd, hh, mi)
+            except Exception:
+                pass
+
+    return datetime.min
+
+
+def _sort_comments(comments):
+    if not isinstance(comments, list):
+        return []
+    return sorted(comments, key=_comment_sort_key, reverse=True)
 
 
 ALLOWED_ROLES = {"Мати", "Батько", "Брат", "Сестра", "Чоловік", "Дружина", "Син", "Донька", "Дідусь", "Бабуся", "Онук", "Онука", "Дядько", "Тітка", "Без статусу"}
@@ -701,7 +794,7 @@ def update_person(person_id):
         "photos": person.get('photos', []),
         "sharedPending": person.get('sharedPending', []),
         "sharedPhotos": person.get('sharedPhotos', []),
-        "comments": person.get('comments', []),
+        "comments": _sort_comments(person.get('comments', [])),
         "relatives": [
             {"personId": str(r['personId']), "role": r['role']}
             for r in person.get('relatives', [])

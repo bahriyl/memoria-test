@@ -591,7 +591,12 @@ def _sanitize_comment_authors(comments):
         date_time_raw = (comment_obj.get("dateTime") or "").strip() if isinstance(comment_obj.get("dateTime"), str) else ""
         if date_time_raw:
             try:
-                return datetime.fromisoformat(date_time_raw.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(date_time_raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt
             except Exception:
                 abort(400, description="`dateTime` must be a valid ISO datetime string")
 
@@ -618,7 +623,7 @@ def _sanitize_comment_authors(comments):
             mi = int(tm.group(2))
 
         try:
-            return datetime(yyyy, mm, dd, hh, mi)
+            return datetime(yyyy, mm, dd, hh, mi, tzinfo=timezone.utc)
         except Exception:
             return None
 
@@ -661,12 +666,17 @@ def _sanitize_comment_authors(comments):
 
 def _comment_sort_key(comment_obj):
     if not isinstance(comment_obj, dict):
-        return datetime.min
+        return float("-inf")
 
     date_time_raw = comment_obj.get("dateTime")
     if isinstance(date_time_raw, str) and date_time_raw.strip():
         try:
-            return datetime.fromisoformat(date_time_raw.strip().replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(date_time_raw.strip().replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.timestamp()
         except Exception:
             pass
 
@@ -686,17 +696,31 @@ def _comment_sort_key(comment_obj):
                     hh = int(tm.group(1))
                     mi = int(tm.group(2))
             try:
-                return datetime(yyyy, mm, dd, hh, mi)
+                dt = datetime(yyyy, mm, dd, hh, mi, tzinfo=timezone.utc)
+                return dt.timestamp()
             except Exception:
                 pass
 
-    return datetime.min
+    return float("-inf")
 
 
 def _sort_comments(comments):
     if not isinstance(comments, list):
         return []
-    return sorted(comments, key=_comment_sort_key, reverse=True)
+
+    def _safe_sort_key(comment_obj):
+        key = _comment_sort_key(comment_obj)
+        if isinstance(key, datetime):
+            if key.tzinfo is None:
+                key = key.replace(tzinfo=timezone.utc)
+            else:
+                key = key.astimezone(timezone.utc)
+            return key.timestamp()
+        if isinstance(key, (int, float)):
+            return float(key)
+        return float("-inf")
+
+    return sorted(comments, key=_safe_sort_key, reverse=True)
 
 
 ALLOWED_ROLES = {"Мати", "Батько", "Брат", "Сестра", "Чоловік", "Дружина", "Син", "Донька", "Дідусь", "Бабуся", "Онук", "Онука", "Дядько", "Тітка", "Без статусу"}

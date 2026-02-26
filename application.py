@@ -379,6 +379,72 @@ def sanitize_premium_payload(premium_doc):
     return payload
 
 
+def _clean_nonempty_string(value):
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _build_ritual_link_candidates(raw_link):
+    original = _clean_nonempty_string(raw_link)
+    if not original:
+        return []
+
+    bases = set()
+    for seed in (original, original.lower()):
+        no_proto = re.sub(r"^https?://", "", seed, flags=re.IGNORECASE).strip().rstrip("/")
+        if not no_proto:
+            continue
+        bases.add(no_proto)
+        if no_proto.startswith("www."):
+            bases.add(no_proto[4:])
+        else:
+            bases.add(f"www.{no_proto}")
+
+    candidates = {original}
+    for base in bases:
+        candidates.add(base)
+        candidates.add(f"{base}/")
+        candidates.add(f"http://{base}")
+        candidates.add(f"http://{base}/")
+        candidates.add(f"https://{base}")
+        candidates.add(f"https://{base}/")
+
+    return [c for c in candidates if c]
+
+
+def _build_premium_partner_payload(raw_partner):
+    if not isinstance(raw_partner, dict):
+        return None
+
+    name = _clean_nonempty_string(raw_partner.get("name"))
+    address = _clean_nonempty_string(raw_partner.get("address"))
+    logo = _clean_nonempty_string(raw_partner.get("logo"))
+
+    payload = {}
+    if name:
+        payload["name"] = name
+    if address:
+        payload["address"] = address
+    if logo:
+        payload["logo"] = logo
+    return payload or None
+
+
+def _resolve_premium_partner(link_value):
+    candidates = _build_ritual_link_candidates(link_value)
+    if not candidates:
+        return None
+
+    ritual_service = ritual_services_collection.find_one(
+        {"link": {"$in": candidates}},
+        {"name": 1, "address": 1, "logo": 1}
+    )
+    if not ritual_service:
+        return None
+    return _build_premium_partner_payload(ritual_service)
+
+
 def verify_sms_code_with_kyivstar(phone: str, code: str):
     payload = {
         "subscriberId": str(phone),
@@ -518,6 +584,12 @@ def get_person(person_id):
         premium_payload = sanitize_premium_payload(person.get('premium'))
         if premium_payload:
             response['premium'] = premium_payload
+            partner_link = _clean_nonempty_string(person.get('premiumPartnerLink'))
+            if partner_link:
+                response['premiumPartnerLink'] = partner_link
+                partner_payload = _resolve_premium_partner(partner_link)
+                if partner_payload:
+                    response['premiumPartner'] = partner_payload
     return jsonify(response)
 
 
@@ -799,7 +871,7 @@ def update_person(person_id):
         abort(404, description="Person not found")
 
     person = people_collection.find_one({'_id': oid})
-    return jsonify({
+    response = {
         "id": str(person['_id']),
         "name": person.get('name'),
         "birthYear": person.get('birthYear'),
@@ -823,7 +895,18 @@ def update_person(person_id):
             {"personId": str(r['personId']), "role": r['role']}
             for r in person.get('relatives', [])
         ]
-    }), 200
+    }
+    if 'premium' in person:
+        premium_payload = sanitize_premium_payload(person.get('premium'))
+        if premium_payload:
+            response['premium'] = premium_payload
+            partner_link = _clean_nonempty_string(person.get('premiumPartnerLink'))
+            if partner_link:
+                response['premiumPartnerLink'] = partner_link
+                partner_payload = _resolve_premium_partner(partner_link)
+                if partner_payload:
+                    response['premiumPartner'] = partner_payload
+    return jsonify(response), 200
 
 
 @application.route('/api/people/<string:person_id>/shared/offer', methods=['OPTIONS', 'POST'])

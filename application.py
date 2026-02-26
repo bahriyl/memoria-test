@@ -385,34 +385,6 @@ def _clean_nonempty_string(value):
     return value.strip()
 
 
-def _build_ritual_link_candidates(raw_link):
-    original = _clean_nonempty_string(raw_link)
-    if not original:
-        return []
-
-    bases = set()
-    for seed in (original, original.lower()):
-        no_proto = re.sub(r"^https?://", "", seed, flags=re.IGNORECASE).strip().rstrip("/")
-        if not no_proto:
-            continue
-        bases.add(no_proto)
-        if no_proto.startswith("www."):
-            bases.add(no_proto[4:])
-        else:
-            bases.add(f"www.{no_proto}")
-
-    candidates = {original}
-    for base in bases:
-        candidates.add(base)
-        candidates.add(f"{base}/")
-        candidates.add(f"http://{base}")
-        candidates.add(f"http://{base}/")
-        candidates.add(f"https://{base}")
-        candidates.add(f"https://{base}/")
-
-    return [c for c in candidates if c]
-
-
 def _build_premium_partner_payload(raw_partner):
     if not isinstance(raw_partner, dict):
         return None
@@ -431,18 +403,50 @@ def _build_premium_partner_payload(raw_partner):
     return payload or None
 
 
-def _resolve_premium_partner(link_value):
-    candidates = _build_ritual_link_candidates(link_value)
-    if not candidates:
-        return None
+def _resolve_premium_partner_by_id(raw_ritual_service_id):
+    ritual_service_id = _clean_nonempty_string(raw_ritual_service_id)
+    if not ritual_service_id:
+        return None, ""
+
+    try:
+        oid = ObjectId(ritual_service_id)
+    except Exception:
+        return None, ""
 
     ritual_service = ritual_services_collection.find_one(
-        {"link": {"$in": candidates}},
-        {"name": 1, "address": 1, "logo": 1}
+        {"_id": oid},
+        {"name": 1, "address": 1, "logo": 1, "link": 1}
     )
     if not ritual_service:
-        return None
-    return _build_premium_partner_payload(ritual_service)
+        return None, ""
+
+    partner_payload = _build_premium_partner_payload(ritual_service)
+    partner_link = _clean_nonempty_string(ritual_service.get("link"))
+    return partner_payload, partner_link
+
+
+def _attach_premium_partner_to_response(response, person_doc):
+    if 'premium' not in person_doc:
+        return
+
+    premium_payload = sanitize_premium_payload(person_doc.get('premium'))
+    if not premium_payload:
+        return
+
+    response['premium'] = premium_payload
+
+    partner_payload = None
+    partner_link = ""
+    partner_service_id = _clean_nonempty_string(person_doc.get('premiumPartnerRitualServiceId'))
+    if partner_service_id:
+        response['premiumPartnerRitualServiceId'] = partner_service_id
+        partner_payload, partner_link = _resolve_premium_partner_by_id(partner_service_id)
+
+    if partner_link:
+        response['premiumPartnerLink'] = partner_link
+
+    if partner_payload:
+        response['premiumPartner'] = partner_payload
 
 
 def verify_sms_code_with_kyivstar(phone: str, code: str):
@@ -580,16 +584,7 @@ def get_person(person_id):
             {"personId": str(r['personId']), "role": r.get('role')}
             for r in person.get('relatives', [])
         ]
-    if 'premium' in person:
-        premium_payload = sanitize_premium_payload(person.get('premium'))
-        if premium_payload:
-            response['premium'] = premium_payload
-            partner_link = _clean_nonempty_string(person.get('premiumPartnerLink'))
-            if partner_link:
-                response['premiumPartnerLink'] = partner_link
-                partner_payload = _resolve_premium_partner(partner_link)
-                if partner_payload:
-                    response['premiumPartner'] = partner_payload
+    _attach_premium_partner_to_response(response, person)
     return jsonify(response)
 
 
@@ -896,16 +891,7 @@ def update_person(person_id):
             for r in person.get('relatives', [])
         ]
     }
-    if 'premium' in person:
-        premium_payload = sanitize_premium_payload(person.get('premium'))
-        if premium_payload:
-            response['premium'] = premium_payload
-            partner_link = _clean_nonempty_string(person.get('premiumPartnerLink'))
-            if partner_link:
-                response['premiumPartnerLink'] = partner_link
-                partner_payload = _resolve_premium_partner(partner_link)
-                if partner_payload:
-                    response['premiumPartner'] = partner_payload
+    _attach_premium_partner_to_response(response, person)
     return jsonify(response), 200
 
 

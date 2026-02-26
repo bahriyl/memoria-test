@@ -134,6 +134,7 @@ orders_collection = db['orders']
 chat_collection = db['chats']
 message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
+churches_collection = db['churches']
 ritual_services_collection = db['ritual_services']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
@@ -174,6 +175,11 @@ except Exception:
 
 try:
     church_days_collection.create_index([("name", ASCENDING)], unique=True)
+except Exception:
+    pass
+
+try:
+    churches_collection.create_index([("name", ASCENDING)])
 except Exception:
     pass
 
@@ -986,6 +992,55 @@ def get_cemetery_page(cemetery_id):
         "address": cemetery.get('address'),
         "phone": cemetery.get('phone'),
         "description": cemetery.get('description')
+    })
+
+
+@application.route('/api/churches_page', methods=['GET'])
+def churches_page():
+    search_query = request.args.get('search', '').strip()
+
+    query_filter = {}
+
+    if search_query:
+        query_filter['name'] = {'$regex': re.escape(search_query), '$options': 'i'}
+
+    churches_cursor = churches_collection.find(query_filter)
+
+    churches_list = []
+    for church in churches_cursor:
+        churches_list.append({
+            "id": str(church.get('_id')),
+            "name": church.get('name'),
+            "image": church.get('image'),
+            "address": church.get('address'),
+            "phone": church.get('phone'),
+            "description": church.get('description')
+        })
+
+    return jsonify({
+        "total": len(churches_list),
+        "churches": churches_list
+    })
+
+
+@application.route('/api/churches_page/<string:church_id>', methods=['GET'])
+def get_church_page(church_id):
+    try:
+        oid = ObjectId(church_id)
+    except Exception:
+        abort(400, description="Invalid church id")
+
+    church = churches_collection.find_one({'_id': oid})
+    if not church:
+        abort(404, description="Church not found")
+
+    return jsonify({
+        "id": str(church.get('_id')),
+        "name": church.get('name'),
+        "image": church.get('image'),
+        "address": church.get('address'),
+        "phone": church.get('phone'),
+        "description": church.get('description')
     })
 
 

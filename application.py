@@ -1449,7 +1449,6 @@ def people_add_moderation():
     deathYear = data.get('deathYear')
     area = data.get('area')
     cemetery = data.get('cemetery')
-    occupation = data.get('occupation', '')
     link = data.get('link', '')
     bio = data.get('bio', '')
 
@@ -1459,7 +1458,6 @@ def people_add_moderation():
         'deathYear': deathYear,
         'area': area,
         'cemetery': cemetery,
-        'occupation': occupation,
         'link': link,
         'bio': bio
     }

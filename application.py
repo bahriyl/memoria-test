@@ -1669,13 +1669,15 @@ def create_chat():
         'sender': 'admin',
         'text': "Вітаємо! Чим можемо вам допомогти?",
         'createdAt': datetime.utcnow(),
-        'imageData': None
+        'imageData': None,
+        'attachments': []
     }
     message_collection.insert_one(admin_msg)
     socketio.emit('newMessage', {
         'sender': admin_msg['sender'],
         'text': admin_msg['text'],
         'imageData': admin_msg['imageData'],
+        'attachments': admin_msg['attachments'],
         'createdAt': admin_msg['createdAt'].isoformat()
     }, room=chat_id)
 
@@ -1704,17 +1706,77 @@ def get_messages(chat_id):
             'sender': m['sender'],
             'text': m['text'],
             'createdAt': m['createdAt'].isoformat(),
-            'imageData': m['imageData']
+            'imageData': m.get('imageData'),
+            'attachments': _message_attachments_for_output(m)
         })
     return jsonify(out)
 
 
+_CHAT_ATTACHMENT_TYPES = {"image", "video"}
+
+
+def _parse_data_url_mime(data_url):
+    if not isinstance(data_url, str):
+        return ""
+    match = re.match(r"^data:([^;,]+)", data_url.strip(), flags=re.IGNORECASE)
+    return (match.group(1) or "").strip() if match else ""
+
+
+def _normalize_chat_attachment(item):
+    if not isinstance(item, dict):
+        return None
+    media_type = str(item.get("type") or "").strip().lower()
+    url = str(item.get("url") or "").strip()
+    if media_type not in _CHAT_ATTACHMENT_TYPES or not url:
+        return None
+    mime_type = str(item.get("mimeType") or "").strip() or _parse_data_url_mime(url)
+    out = {"type": media_type, "url": url}
+    if mime_type:
+        out["mimeType"] = mime_type
+    return out
+
+
+def _attachments_from_image_data(image_data):
+    if isinstance(image_data, list):
+        values = image_data
+    elif isinstance(image_data, str) and image_data.strip():
+        values = [image_data]
+    else:
+        values = []
+
+    out = []
+    for value in values:
+        url = str(value or "").strip()
+        if not url:
+            continue
+        item = {"type": "image", "url": url}
+        mime_type = _parse_data_url_mime(url)
+        if mime_type:
+            item["mimeType"] = mime_type
+        out.append(item)
+    return out
+
+
+def _message_attachments_for_output(message):
+    raw_attachments = message.get("attachments")
+    out = []
+    if isinstance(raw_attachments, list):
+        for item in raw_attachments:
+            normalized = _normalize_chat_attachment(item)
+            if normalized:
+                out.append(normalized)
+    if out:
+        return out
+    return _attachments_from_image_data(message.get("imageData"))
+
+
 @application.route('/api/chats/<chat_id>/messages', methods=['POST'])
 def post_message(chat_id):
-    """Post a message (user or admin) with optional image as Base64 and broadcast."""
+    """Post a message (user or admin) with optional media attachments and broadcast."""
     sender = None
     text = ''
     image_files = []
+    attachments = []
 
     # Розбір multipart/form-data або JSON
     if request.content_type and 'multipart/form-data' in request.content_type:
@@ -1725,12 +1787,26 @@ def post_message(chat_id):
         data = request.get_json() or {}
         sender = data.get('sender')
         text = (data.get('text') or '').strip()
+        raw_attachments = data.get('attachments', [])
+        if raw_attachments is None:
+            raw_attachments = []
+        if not isinstance(raw_attachments, list):
+            abort(400, 'Invalid payload')
+        if len(raw_attachments) > 5:
+            abort(400, 'Too many attachments')
+        for raw_item in raw_attachments:
+            normalized = _normalize_chat_attachment(raw_item)
+            if not normalized:
+                abort(400, 'Invalid attachment')
+            attachments.append(normalized)
 
     image_files = [img for img in image_files if img and img.filename]
     if len(image_files) > 5:
         abort(400, 'Too many images')
+    if len(image_files) + len(attachments) > 5:
+        abort(400, 'Too many attachments')
 
-    if sender not in ('user', 'admin') or (not text and not image_files):
+    if sender not in ('user', 'admin') or (not text and not image_files and not attachments):
         abort(400, 'Invalid payload')
 
     try:
@@ -1748,8 +1824,9 @@ def post_message(chat_id):
         upsert=True
     )
 
-    # Кодуємо зображення, якщо воно є
+    # Кодуємо зображення, якщо воно є (legacy multipart flow)
     image_data = None
+    message_attachments = list(attachments)
     if image_files:
         if len(image_files) == 1:
             raw = image_files[0].read()
@@ -1761,6 +1838,7 @@ def post_message(chat_id):
                 raw = image.read()
                 b64 = base64.b64encode(raw).decode('utf-8')
                 image_data.append(f"data:{image.mimetype};base64,{b64}")
+        message_attachments.extend(_attachments_from_image_data(image_data))
 
     # Зберігаємо повідомлення
     msg = {
@@ -1768,7 +1846,8 @@ def post_message(chat_id):
         'sender': sender,
         'text': text,
         'createdAt': datetime.utcnow(),
-        'imageData': image_data
+        'imageData': image_data,
+        'attachments': message_attachments
     }
     message_collection.insert_one(msg)
 
@@ -1777,6 +1856,7 @@ def post_message(chat_id):
         'sender': sender,
         'text': text,
         'imageData': image_data,
+        'attachments': message_attachments,
         'createdAt': msg['createdAt'].isoformat()
     }
     socketio.emit('newMessage', payload, room=chat_id)
@@ -1788,7 +1868,8 @@ def post_message(chat_id):
             'sender': 'admin',
             'text': "Дякуємо за Ваше повідомлення! Наш спеціаліст відповість Вам протягом 5 хвилин",
             'createdAt': datetime.utcnow(),
-            'imageData': None
+            'imageData': None,
+            'attachments': []
         }
         time.sleep(2)
         message_collection.insert_one(followup)
@@ -1796,6 +1877,7 @@ def post_message(chat_id):
             'sender': followup['sender'],
             'text': followup['text'],
             'imageData': followup['imageData'],
+            'attachments': followup['attachments'],
             'createdAt': followup['createdAt'].isoformat()
         }, room=chat_id)
 

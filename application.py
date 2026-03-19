@@ -1567,24 +1567,67 @@ def verify_code():
 
 @application.route('/api/people/add_moderation', methods=['POST'])
 def people_add_moderation():
-    data = request.get_json()
-    name = data.get('name')
-    birthYear = data.get('birthYear')
-    deathYear = data.get('deathYear')
-    area = data.get('area')
-    cemetery = data.get('cemetery')
-    link = data.get('link', '')
-    bio = data.get('bio', '')
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'invalid_payload', 'message': 'JSON object expected'}), 400
+
+    def _parse_iso_date(value, field_name):
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.strptime(raw, '%Y-%m-%d')
+        except ValueError:
+            raise ValueError(f'{field_name} must be a valid date in YYYY-MM-DD format')
+        return dt.strftime('%Y-%m-%d')
+
+    def _normalize_year(value):
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if value.is_integer() else None
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            return int(raw) if raw.isdigit() else None
+        return None
+
+    try:
+        birth_date = _parse_iso_date(data.get('birthDate'), 'birthDate')
+        death_date = _parse_iso_date(data.get('deathDate'), 'deathDate')
+    except ValueError as exc:
+        return jsonify({'error': 'validation_error', 'message': str(exc)}), 400
+
+    birth_year = _normalize_year(data.get('birthYear'))
+    death_year = _normalize_year(data.get('deathYear'))
+
+    if birth_year is None and birth_date:
+        birth_year = int(birth_date[:4])
+    if death_year is None and death_date:
+        death_year = int(death_date[:4])
 
     document = {
-        'name': name,
-        'birthYear': birthYear,
-        'deathYear': deathYear,
-        'area': area,
-        'cemetery': cemetery,
-        'link': link,
-        'bio': bio
+        'name': data.get('name'),
+        'area': data.get('area'),
+        'cemetery': data.get('cemetery'),
+        'link': data.get('link', ''),
+        'bio': data.get('bio', '')
     }
+
+    if birth_year is not None:
+        document['birthYear'] = birth_year
+    if death_year is not None:
+        document['deathYear'] = death_year
+    if birth_date:
+        document['birthDate'] = birth_date
+    if death_date:
+        document['deathDate'] = death_date
+
     people_moderation_collection.insert_one(document)
 
     return jsonify({'success': True})

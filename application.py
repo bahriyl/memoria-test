@@ -198,6 +198,16 @@ try:
 except Exception:
     pass
 
+try:
+    message_collection.create_index([("chatId", ASCENDING), ("createdAt", -1)])
+except Exception:
+    pass
+
+try:
+    chat_collection.create_index([("chatStatus", ASCENDING), ("category", ASCENDING)])
+except Exception:
+    pass
+
 
 def _to_object_id(s):
     try:
@@ -2080,6 +2090,78 @@ def set_chat_category(chat_id):
     return jsonify({
         'chatId': chat_id,
         'category': category
+    }), 200
+
+
+@application.route('/api/chats/history-search', methods=['GET'])
+def history_search_chats():
+    raw_q = request.args.get('q', '')
+    raw_date_from = request.args.get('dateFrom', '')
+    raw_date_to = request.args.get('dateTo', '')
+    raw_category = request.args.get('category', '')
+
+    keyword = raw_q.strip()
+    category = raw_category.strip()
+    if category in ('', 'Категорія'):
+        category = ''
+
+    date_from = None
+    date_to = None
+    if raw_date_from:
+        try:
+            date_from = datetime.strptime(raw_date_from, '%Y-%m-%d')
+        except Exception:
+            abort(400, 'Invalid dateFrom')
+    if raw_date_to:
+        try:
+            date_to = datetime.strptime(raw_date_to, '%Y-%m-%d') + timedelta(days=1)
+        except Exception:
+            abort(400, 'Invalid dateTo')
+
+    chat_filter = {'chatStatus': 'history'}
+    if category:
+        chat_filter['category'] = category
+
+    history_docs = list(chat_collection.find(chat_filter, {'_id': 1}))
+    if not history_docs:
+        return jsonify({'chatIds': []}), 200
+
+    history_ids = [doc['_id'] for doc in history_docs]
+
+    msg_filter = {'chatId': {'$in': history_ids}}
+    if keyword:
+        msg_filter['text'] = {'$regex': re.escape(keyword), '$options': 'i'}
+
+    candidate_chat_ids = set(message_collection.distinct('chatId', msg_filter))
+    if not candidate_chat_ids:
+        return jsonify({'chatIds': []}), 200
+
+    latest_by_chat = {}
+    projection = {'chatId': 1, 'createdAt': 1}
+    for msg in message_collection.find({'chatId': {'$in': list(candidate_chat_ids)}}, projection).sort('createdAt', -1):
+        cid = msg.get('chatId')
+        created_at = msg.get('createdAt')
+        if cid in latest_by_chat:
+            continue
+        if not isinstance(created_at, datetime):
+            continue
+        latest_by_chat[cid] = created_at
+
+    if not latest_by_chat:
+        return jsonify({'chatIds': []}), 200
+
+    filtered = []
+    for cid, last_dt in latest_by_chat.items():
+        if date_from and last_dt < date_from:
+            continue
+        if date_to and last_dt >= date_to:
+            continue
+        filtered.append((cid, last_dt))
+
+    filtered.sort(key=lambda item: item[1], reverse=True)
+
+    return jsonify({
+        'chatIds': [str(cid) for cid, _ in filtered]
     }), 200
 
 

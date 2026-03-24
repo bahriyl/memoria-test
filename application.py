@@ -155,6 +155,11 @@ chat_collection.update_many(
     {'category': {'$exists': False}},
     {'$set': {'category': None}}
 )
+# Legacy backfill: older chats without last admin read marker are unread until opened.
+chat_collection.update_many(
+    {'lastAdminReadAt': {'$exists': False}},
+    {'$set': {'lastAdminReadAt': None}}
+)
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -1854,7 +1859,8 @@ def create_chat():
         'chatStatus': 'open',
         'openedByAdmin': False,
         'openedAt': None,
-        'category': None
+        'category': None,
+        'lastAdminReadAt': None
     })
     chat_id = str(result.inserted_id)
 
@@ -1884,22 +1890,37 @@ def list_chats():
     """List all chat sessions for admin."""
     chats = chat_collection.find().sort('createdAt', -1)
     out = []
+    total_unread = 0
     for c in chats:
         chat_status = str(c.get('chatStatus') or 'open').strip().lower()
         if chat_status not in ('open', 'history'):
             chat_status = 'open'
         opened_by_admin = bool(c.get('openedByAdmin', True))
         status = 'history' if chat_status == 'history' else ('open' if opened_by_admin else 'new')
+        last_admin_read_at = c.get('lastAdminReadAt') if isinstance(c.get('lastAdminReadAt'), datetime) else None
+
+        unread_filter = {'chatId': c['_id'], 'sender': 'user'}
+        if last_admin_read_at is not None:
+            unread_filter['createdAt'] = {'$gt': last_admin_read_at}
+        unread_count = message_collection.count_documents(unread_filter)
+        if status != 'history':
+            total_unread += unread_count
+
         out.append({
             'chatId': str(c['_id']),
             'createdAt': c['createdAt'].isoformat(),
             'chatStatus': chat_status,
             'openedByAdmin': opened_by_admin,
             'openedAt': c['openedAt'].isoformat() if isinstance(c.get('openedAt'), datetime) else None,
+            'lastAdminReadAt': last_admin_read_at.isoformat() if last_admin_read_at else None,
             'status': status,
-            'category': c.get('category') if isinstance(c.get('category'), str) else None
+            'category': c.get('category') if isinstance(c.get('category'), str) else None,
+            'unreadCount': unread_count
         })
-    return jsonify(out)
+    return jsonify({
+        'chats': out,
+        'totalUnread': total_unread
+    })
 
 
 @application.route('/api/chats/<chat_id>/open', methods=['PATCH'])
@@ -1910,15 +1931,20 @@ def mark_chat_open(chat_id):
     except Exception:
         abort(400, 'Invalid chat_id')
 
-    current = chat_collection.find_one({'_id': cid}, {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1})
+    current = chat_collection.find_one(
+        {'_id': cid},
+        {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1, 'lastAdminReadAt': 1}
+    )
     if current and str(current.get('chatStatus') or '').lower() == 'history':
         opened_at = current.get('openedAt')
+        last_admin_read_at = current.get('lastAdminReadAt')
         return jsonify({
             'chatId': chat_id,
             'chatStatus': 'history',
             'status': 'history',
             'openedByAdmin': bool(current.get('openedByAdmin', True)),
             'openedAt': opened_at.isoformat() if isinstance(opened_at, datetime) else None,
+            'lastAdminReadAt': last_admin_read_at.isoformat() if isinstance(last_admin_read_at, datetime) else None,
             'category': current.get('category') if isinstance(current.get('category'), str) else None
         }), 200
 
@@ -1926,8 +1952,14 @@ def mark_chat_open(chat_id):
     chat_collection.update_one(
         {'_id': cid},
         {
-            '$set': {'openedByAdmin': True},
-            '$setOnInsert': {'createdAt': now, 'chatStatus': 'open', 'openedAt': now, 'category': None}
+            '$set': {'openedByAdmin': True, 'lastAdminReadAt': now},
+            '$setOnInsert': {
+                'createdAt': now,
+                'chatStatus': 'open',
+                'openedAt': now,
+                'category': None,
+                'lastAdminReadAt': now
+            }
         },
         upsert=True
     )
@@ -1938,14 +1970,19 @@ def mark_chat_open(chat_id):
         {'$set': {'openedAt': now}}
     )
 
-    updated = chat_collection.find_one({'_id': cid}, {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1})
+    updated = chat_collection.find_one(
+        {'_id': cid},
+        {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1, 'lastAdminReadAt': 1}
+    )
     opened_at = updated.get('openedAt') if updated else None
+    last_admin_read_at = updated.get('lastAdminReadAt') if updated else None
     return jsonify({
         'chatId': chat_id,
         'chatStatus': 'open',
         'status': 'open',
         'openedByAdmin': True,
         'openedAt': opened_at.isoformat() if isinstance(opened_at, datetime) else None,
+        'lastAdminReadAt': last_admin_read_at.isoformat() if isinstance(last_admin_read_at, datetime) else None,
         'category': updated.get('category') if updated and isinstance(updated.get('category'), str) else None
     }), 200
 
@@ -2295,7 +2332,16 @@ def post_message(chat_id):
     # Створюємо чат, якщо його ще не було
     chat_collection.update_one(
         {'_id': cid},
-        {'$setOnInsert': {'createdAt': datetime.utcnow(), 'chatStatus': 'open', 'openedByAdmin': False, 'openedAt': None, 'category': None}},
+        {
+            '$setOnInsert': {
+                'createdAt': datetime.utcnow(),
+                'chatStatus': 'open',
+                'openedByAdmin': False,
+                'openedAt': None,
+                'category': None,
+                'lastAdminReadAt': None
+            }
+        },
         upsert=True
     )
 

@@ -1957,8 +1957,7 @@ def mark_chat_open(chat_id):
                 'createdAt': now,
                 'chatStatus': 'open',
                 'openedAt': now,
-                'category': None,
-                'lastAdminReadAt': now
+                'category': None
             }
         },
         upsert=True

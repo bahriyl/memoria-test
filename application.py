@@ -139,6 +139,11 @@ chat_collection.update_many(
     {'openedByAdmin': {'$exists': False}},
     {'$set': {'openedByAdmin': True, 'openedAt': None}}
 )
+# Legacy backfill: older chats without explicit chat status are considered open.
+chat_collection.update_many(
+    {'chatStatus': {'$exists': False}},
+    {'$set': {'chatStatus': 'open'}}
+)
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -1825,6 +1830,7 @@ def create_chat():
     """Create a new chat session and send initial admin welcome message."""
     result = chat_collection.insert_one({
         'createdAt': datetime.utcnow(),
+        'chatStatus': 'open',
         'openedByAdmin': False,
         'openedAt': None
     })
@@ -1856,13 +1862,18 @@ def list_chats():
     chats = chat_collection.find().sort('createdAt', -1)
     out = []
     for c in chats:
+        chat_status = str(c.get('chatStatus') or 'open').strip().lower()
+        if chat_status not in ('open', 'history'):
+            chat_status = 'open'
         opened_by_admin = bool(c.get('openedByAdmin', True))
+        status = 'history' if chat_status == 'history' else ('open' if opened_by_admin else 'new')
         out.append({
             'chatId': str(c['_id']),
             'createdAt': c['createdAt'].isoformat(),
+            'chatStatus': chat_status,
             'openedByAdmin': opened_by_admin,
             'openedAt': c['openedAt'].isoformat() if isinstance(c.get('openedAt'), datetime) else None,
-            'status': 'open' if opened_by_admin else 'new'
+            'status': status
         })
     return jsonify(out)
 
@@ -1875,12 +1886,23 @@ def mark_chat_open(chat_id):
     except Exception:
         abort(400, 'Invalid chat_id')
 
+    current = chat_collection.find_one({'_id': cid}, {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1})
+    if current and str(current.get('chatStatus') or '').lower() == 'history':
+        opened_at = current.get('openedAt')
+        return jsonify({
+            'chatId': chat_id,
+            'chatStatus': 'history',
+            'status': 'history',
+            'openedByAdmin': bool(current.get('openedByAdmin', True)),
+            'openedAt': opened_at.isoformat() if isinstance(opened_at, datetime) else None
+        }), 200
+
     now = datetime.utcnow()
     chat_collection.update_one(
         {'_id': cid},
         {
             '$set': {'openedByAdmin': True},
-            '$setOnInsert': {'createdAt': now, 'openedAt': now}
+            '$setOnInsert': {'createdAt': now, 'chatStatus': 'open', 'openedAt': now}
         },
         upsert=True
     )
@@ -1891,13 +1913,33 @@ def mark_chat_open(chat_id):
         {'$set': {'openedAt': now}}
     )
 
-    updated = chat_collection.find_one({'_id': cid}, {'openedByAdmin': 1, 'openedAt': 1})
+    updated = chat_collection.find_one({'_id': cid}, {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1})
     opened_at = updated.get('openedAt') if updated else None
     return jsonify({
         'chatId': chat_id,
+        'chatStatus': 'open',
         'status': 'open',
         'openedByAdmin': True,
         'openedAt': opened_at.isoformat() if isinstance(opened_at, datetime) else None
+    }), 200
+
+
+@application.route('/api/chats/<chat_id>/close', methods=['PATCH'])
+def close_chat(chat_id):
+    """Mark chat as history (idempotent)."""
+    try:
+        cid = ObjectId(chat_id)
+    except Exception:
+        abort(400, 'Invalid chat_id')
+
+    result = chat_collection.update_one({'_id': cid}, {'$set': {'chatStatus': 'history'}})
+    if result.matched_count == 0:
+        abort(404, 'Chat not found')
+
+    return jsonify({
+        'chatId': chat_id,
+        'chatStatus': 'history',
+        'status': 'history'
     }), 200
 
 
@@ -2029,7 +2071,7 @@ def post_message(chat_id):
     # Створюємо чат, якщо його ще не було
     chat_collection.update_one(
         {'_id': cid},
-        {'$setOnInsert': {'createdAt': datetime.utcnow(), 'openedByAdmin': False, 'openedAt': None}},
+        {'$setOnInsert': {'createdAt': datetime.utcnow(), 'chatStatus': 'open', 'openedByAdmin': False, 'openedAt': None}},
         upsert=True
     )
 

@@ -28,13 +28,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from badwords import ProfanityFilter
-
 load_dotenv()
-
-
-profanity_filter = ProfanityFilter()
-profanity_filter.init(["ru", "ua"])
 
 
 try:
@@ -714,11 +708,6 @@ def _sanitize_comment_authors(comments):
         author = c.get("author", "")
         if author is not None and not isinstance(author, str):
             abort(400, description="`author` must be a string")
-
-        if author:
-            # Перевірка, чи містить ненормативну лексику
-            if profanity_filter.filter_text(author, match_threshold=0.9):
-                abort(400, description=f"Author contains forbidden words")
 
         text = c.get("text", "")
         if text is not None and not isinstance(text, str):

@@ -50,6 +50,7 @@ application = Flask(__name__)
 CORS(application)
 
 socketio = SocketIO(application, cors_allowed_origins="*")
+ADMINS_ROOM = "admins"
 
 _compress_video_jobs = {}
 _compress_video_lock = threading.Lock()
@@ -1873,6 +1874,7 @@ def create_chat():
         'attachments': admin_msg['attachments'],
         'createdAt': admin_msg['createdAt'].isoformat()
     }, room=chat_id)
+    socketio.emit('adminChatUpdated', {'chatId': chat_id}, room=ADMINS_ROOM)
 
     return jsonify({'chatId': chat_id}), 201
 
@@ -2333,6 +2335,7 @@ def post_message(chat_id):
         'createdAt': msg['createdAt'].isoformat()
     }
     socketio.emit('newMessage', payload, room=chat_id)
+    socketio.emit('adminChatUpdated', {'chatId': chat_id}, room=ADMINS_ROOM)
 
     # Автовідповідь на перше повідомлення користувача
     if sender == 'user' and existing_user_msgs == 0:
@@ -2353,6 +2356,7 @@ def post_message(chat_id):
             'attachments': followup['attachments'],
             'createdAt': followup['createdAt'].isoformat()
         }, room=chat_id)
+        socketio.emit('adminChatUpdated', {'chatId': chat_id}, room=ADMINS_ROOM)
 
     return jsonify({'success': True}), 201
 
@@ -3229,6 +3233,12 @@ def people_login():
 def handle_join(room):
     """Called by client/admin: socket.emit('joinRoom', chatId)"""
     join_room(room)
+
+
+@socketio.on('joinAdmin')
+def handle_join_admin():
+    """Called by admin: socket.emit('joinAdmin')"""
+    join_room(ADMINS_ROOM)
 
 
 if __name__ == '__main__':

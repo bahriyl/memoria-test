@@ -140,6 +140,12 @@ location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 church_days_collection = db['church_days']
 
+# Legacy backfill: older chats without explicit admin-open state are treated as already opened.
+chat_collection.update_many(
+    {'openedByAdmin': {'$exists': False}},
+    {'$set': {'openedByAdmin': True, 'openedAt': None}}
+)
+
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 
@@ -1828,7 +1834,11 @@ def monopay_webhook():
 @application.route('/api/chats', methods=['POST'])
 def create_chat():
     """Create a new chat session and send initial admin welcome message."""
-    result = chat_collection.insert_one({'createdAt': datetime.utcnow()})
+    result = chat_collection.insert_one({
+        'createdAt': datetime.utcnow(),
+        'openedByAdmin': False,
+        'openedAt': None
+    })
     chat_id = str(result.inserted_id)
 
     admin_msg = {
@@ -1855,8 +1865,51 @@ def create_chat():
 def list_chats():
     """List all chat sessions for admin."""
     chats = chat_collection.find().sort('createdAt', -1)
-    out = [{'chatId': str(c['_id']), 'createdAt': c['createdAt'].isoformat()} for c in chats]
+    out = []
+    for c in chats:
+        opened_by_admin = bool(c.get('openedByAdmin', True))
+        out.append({
+            'chatId': str(c['_id']),
+            'createdAt': c['createdAt'].isoformat(),
+            'openedByAdmin': opened_by_admin,
+            'openedAt': c['openedAt'].isoformat() if isinstance(c.get('openedAt'), datetime) else None,
+            'status': 'open' if opened_by_admin else 'new'
+        })
     return jsonify(out)
+
+
+@application.route('/api/chats/<chat_id>/open', methods=['PATCH'])
+def mark_chat_open(chat_id):
+    """Mark chat as opened by admin (idempotent)."""
+    try:
+        cid = ObjectId(chat_id)
+    except Exception:
+        abort(400, 'Invalid chat_id')
+
+    now = datetime.utcnow()
+    chat_collection.update_one(
+        {'_id': cid},
+        {
+            '$set': {'openedByAdmin': True},
+            '$setOnInsert': {'createdAt': now, 'openedAt': now}
+        },
+        upsert=True
+    )
+
+    # Keep openedAt as "first open" timestamp.
+    chat_collection.update_one(
+        {'_id': cid, '$or': [{'openedAt': {'$exists': False}}, {'openedAt': None}]},
+        {'$set': {'openedAt': now}}
+    )
+
+    updated = chat_collection.find_one({'_id': cid}, {'openedByAdmin': 1, 'openedAt': 1})
+    opened_at = updated.get('openedAt') if updated else None
+    return jsonify({
+        'chatId': chat_id,
+        'status': 'open',
+        'openedByAdmin': True,
+        'openedAt': opened_at.isoformat() if isinstance(opened_at, datetime) else None
+    }), 200
 
 
 @application.route('/api/chats/<chat_id>/messages', methods=['GET'])
@@ -1987,7 +2040,7 @@ def post_message(chat_id):
     # Створюємо чат, якщо його ще не було
     chat_collection.update_one(
         {'_id': cid},
-        {'$setOnInsert': {'createdAt': datetime.utcnow()}},
+        {'$setOnInsert': {'createdAt': datetime.utcnow(), 'openedByAdmin': False, 'openedAt': None}},
         upsert=True
     )
 

@@ -133,8 +133,11 @@ ritual_services_collection = db['ritual_services']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 church_days_collection = db['church_days']
+chat_templates_collection = db['chat_templates']
 
 ALLOWED_CHAT_CATEGORIES = {'Реклама', 'Ритуальні послуги', 'Електронна записка'}
+CHAT_TEMPLATE_TITLE_MAX_LEN = 120
+CHAT_TEMPLATE_TEXT_MAX_LEN = 5000
 
 # Legacy backfill: older chats without explicit admin-open state are treated as already opened.
 chat_collection.update_many(
@@ -1952,6 +1955,98 @@ def close_chat(chat_id):
         'chatStatus': 'history',
         'status': 'history'
     }), 200
+
+
+def _normalize_chat_template(doc):
+    if not isinstance(doc, dict):
+        return None
+    return {
+        'id': str(doc.get('_id')),
+        'title': str(doc.get('title') or ''),
+        'text': str(doc.get('text') or ''),
+        'createdAt': doc.get('createdAt').isoformat() if isinstance(doc.get('createdAt'), datetime) else None,
+        'updatedAt': doc.get('updatedAt').isoformat() if isinstance(doc.get('updatedAt'), datetime) else None
+    }
+
+
+def _validate_chat_template_payload(data):
+    if not isinstance(data, dict):
+        abort(400, 'Invalid payload')
+
+    raw_title = data.get('title')
+    raw_text = data.get('text')
+    if not isinstance(raw_title, str) or not isinstance(raw_text, str):
+        abort(400, 'Invalid payload')
+
+    title = raw_title.strip()
+    text = raw_text.strip()
+
+    if not title or not text:
+        abort(400, 'title and text are required')
+    if len(title) > CHAT_TEMPLATE_TITLE_MAX_LEN:
+        abort(400, 'title is too long')
+    if len(text) > CHAT_TEMPLATE_TEXT_MAX_LEN:
+        abort(400, 'text is too long')
+
+    return title, text
+
+
+@application.route('/api/chat-templates', methods=['GET'])
+def list_chat_templates():
+    docs = chat_templates_collection.find().sort('updatedAt', -1)
+    return jsonify([_normalize_chat_template(doc) for doc in docs]), 200
+
+
+@application.route('/api/chat-templates', methods=['POST'])
+def create_chat_template():
+    data = request.get_json(silent=True) or {}
+    title, text = _validate_chat_template_payload(data)
+    now = datetime.utcnow()
+
+    result = chat_templates_collection.insert_one({
+        'title': title,
+        'text': text,
+        'createdAt': now,
+        'updatedAt': now
+    })
+
+    created = chat_templates_collection.find_one({'_id': result.inserted_id})
+    return jsonify(_normalize_chat_template(created)), 201
+
+
+@application.route('/api/chat-templates/<template_id>', methods=['PATCH'])
+def update_chat_template(template_id):
+    try:
+        tid = ObjectId(template_id)
+    except Exception:
+        abort(400, 'Invalid template_id')
+
+    data = request.get_json(silent=True) or {}
+    title, text = _validate_chat_template_payload(data)
+
+    result = chat_templates_collection.update_one(
+        {'_id': tid},
+        {'$set': {'title': title, 'text': text, 'updatedAt': datetime.utcnow()}}
+    )
+    if result.matched_count == 0:
+        abort(404, 'Template not found')
+
+    updated = chat_templates_collection.find_one({'_id': tid})
+    return jsonify(_normalize_chat_template(updated)), 200
+
+
+@application.route('/api/chat-templates/<template_id>', methods=['DELETE'])
+def delete_chat_template(template_id):
+    try:
+        tid = ObjectId(template_id)
+    except Exception:
+        abort(400, 'Invalid template_id')
+
+    result = chat_templates_collection.delete_one({'_id': tid})
+    if result.deleted_count == 0:
+        abort(404, 'Template not found')
+
+    return jsonify({'id': template_id}), 200
 
 
 @application.route('/api/chats/<chat_id>/category', methods=['PATCH'])

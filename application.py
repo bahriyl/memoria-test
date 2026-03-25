@@ -131,6 +131,7 @@ message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
 churches_collection = db['churches']
 ritual_services_collection = db['ritual_services']
+ritual_service_categories_collection = db['ritual_service_categories']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 chat_templates_collection = db['chat_templates']
@@ -215,6 +216,11 @@ except Exception:
 
 try:
     chat_collection.create_index([("chatStatus", ASCENDING), ("attachedPersonId", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    ritual_service_categories_collection.create_index([("nameNormalized", ASCENDING)], unique=True)
 except Exception:
     pass
 
@@ -1734,6 +1740,558 @@ def admin_delete_church(church_id):
     result = churches_collection.delete_one({'_id': oid})
     if result.deleted_count == 0:
         abort(404, description='Church not found')
+
+    return jsonify({'ok': True})
+
+
+ADMIN_RITUAL_SERVICE_STATUSES = {'Активний', 'Не активний'}
+DEFAULT_RITUAL_SERVICE_CATEGORIES = ['Ресторани', 'Ритуальні послуги', 'Юристи']
+ADMIN_RITUAL_SERVICE_ALLOWED_FIELDS = {
+    'name',
+    'category',
+    'status',
+    'logo',
+    'banner',
+    'link',
+    'login',
+    'password',
+    'settlements',
+    'contacts',
+    'payments',
+    'latitude',
+    'longitude',
+    'description',
+    'items',
+}
+
+
+def _normalize_ritual_service_status(value):
+    cleaned = _clean_str(value)
+    if cleaned == 'Неактивний':
+        cleaned = 'Не активний'
+    if cleaned not in ADMIN_RITUAL_SERVICE_STATUSES:
+        return 'Активний'
+    return cleaned
+
+
+def _clean_ritual_contacts_loose(value):
+    if not isinstance(value, list):
+        return []
+
+    contacts = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        address = _clean_str(item.get('address'))
+        phone = _clean_str(item.get('phone'))
+        if address or phone:
+            contacts.append({'address': address, 'phone': phone})
+    return contacts
+
+
+def _validate_ritual_contacts(value, field_name='contacts'):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description=f"`{field_name}` must be an array")
+
+    contacts = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f"`{field_name}[{idx}]` must be an object")
+        address = _clean_str(item.get('address'))
+        phone = _clean_str(item.get('phone'))
+        if address or phone:
+            contacts.append({'address': address, 'phone': phone})
+    return contacts
+
+
+def _coerce_ritual_addresses(value):
+    if isinstance(value, list):
+        return _clean_str_list(value, 'address')
+    as_text = _clean_str(value)
+    return [as_text] if as_text else []
+
+
+def _coerce_ritual_phones(value):
+    if isinstance(value, list):
+        return _clean_str_list(value, 'phone')
+    as_text = _clean_str(value)
+    return [as_text] if as_text else []
+
+
+def _derive_ritual_contacts_from_legacy(ritual_service):
+    addresses = _coerce_ritual_addresses(ritual_service.get('address'))
+    phones = _coerce_ritual_phones(ritual_service.get('phone'))
+    length = max(len(addresses), len(phones))
+    if length == 0:
+        return []
+
+    contacts = []
+    for idx in range(length):
+        address = addresses[idx] if idx < len(addresses) else ''
+        phone = phones[idx] if idx < len(phones) else ''
+        if address or phone:
+            contacts.append({'address': address, 'phone': phone})
+    return contacts
+
+
+def _parse_ritual_period_str(period_text):
+    cleaned = _clean_str(period_text)
+    if not cleaned:
+        return None
+
+    match = re.match(r'^(\d{2}\.\d{2}\.\d{4})\s*-\s*(\d{2}\.\d{2}\.\d{4})\s*\((\d+)\s+днів\)$', cleaned)
+    if not match:
+        return None
+
+    start_text, end_text, days_text = match.group(1), match.group(2), match.group(3)
+    try:
+        datetime.strptime(start_text, '%d.%m.%Y')
+        end_dt = datetime.strptime(end_text, '%d.%m.%Y')
+        days = int(days_text)
+    except Exception:
+        return None
+
+    return {
+        'startDate': start_text,
+        'endDate': end_text,
+        'days': max(0, days),
+        'period': f'{start_text} - {end_text} ({max(0, days)} днів)',
+        'endDateObj': end_dt,
+    }
+
+
+def _clean_ritual_payments(value, field_name='payments'):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description=f"`{field_name}` must be an array")
+
+    payments = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f"`{field_name}[{idx}]` must be an object")
+
+        period = _clean_str(item.get('period'))
+        start_date = _clean_str(item.get('startDate')) or _clean_str(item.get('periodStart'))
+        end_date = _clean_str(item.get('endDate')) or _clean_str(item.get('periodEnd'))
+        raw_pdf_label = _clean_str(item.get('pdfLabel'))
+        pdf_url = _clean_str(item.get('pdfUrl'))
+        days_raw = item.get('days')
+        if days_raw is None or days_raw == '':
+            days_raw = item.get('periodDays')
+        has_any_data = bool(
+            period
+            or start_date
+            or end_date
+            or (days_raw is not None and days_raw != '')
+            or raw_pdf_label
+            or pdf_url
+        )
+        if not has_any_data:
+            continue
+
+        pdf_label = raw_pdf_label or 'pdf про оплату'
+        try:
+            days = int(days_raw) if days_raw is not None and days_raw != '' else None
+        except Exception:
+            abort(400, description=f"`{field_name}[{idx}].days` must be an integer")
+
+        parsed_period = _parse_ritual_period_str(period) if period else None
+        if parsed_period:
+            if not start_date:
+                start_date = parsed_period['startDate']
+            if not end_date:
+                end_date = parsed_period['endDate']
+            if days is None:
+                days = parsed_period['days']
+
+        if start_date:
+            try:
+                datetime.strptime(start_date, '%d.%m.%Y')
+            except Exception:
+                abort(400, description=f"`{field_name}[{idx}].startDate` must be DD.MM.YYYY")
+        if end_date:
+            try:
+                datetime.strptime(end_date, '%d.%m.%Y')
+            except Exception:
+                abort(400, description=f"`{field_name}[{idx}].endDate` must be DD.MM.YYYY")
+
+        if (start_date and not end_date) or (end_date and not start_date):
+            abort(400, description=f"`{field_name}[{idx}]` requires both `startDate` and `endDate`")
+
+        if start_date and end_date and days is None:
+            start_dt = datetime.strptime(start_date, '%d.%m.%Y')
+            end_dt = datetime.strptime(end_date, '%d.%m.%Y')
+            days = max(0, (end_dt.date() - start_dt.date()).days)
+
+        if days is None:
+            days = 0
+        days = max(0, int(days))
+
+        if start_date and end_date:
+            period = f'{start_date} - {end_date} ({days} днів)'
+
+        payments.append({
+            'period': period,
+            'startDate': start_date,
+            'endDate': end_date,
+            'days': days,
+            'pdfLabel': pdf_label,
+            'pdfUrl': pdf_url,
+        })
+
+    return payments
+
+
+def _get_active_ritual_period(payments):
+    best = None
+    best_end = None
+    for item in payments:
+        parsed_period = _parse_ritual_period_str(item.get('period'))
+        start_text = _clean_str(item.get('startDate')) or (parsed_period.get('startDate') if parsed_period else '')
+        end_text = _clean_str(item.get('endDate')) or (parsed_period.get('endDate') if parsed_period else '')
+        if not end_text:
+            continue
+        try:
+            end_dt = datetime.strptime(end_text, '%d.%m.%Y')
+        except Exception:
+            continue
+
+        days = item.get('days')
+        if days is None and parsed_period:
+            days = parsed_period.get('days')
+
+        if best is None or end_dt > best_end:
+            best = {
+                'startDate': start_text,
+                'endDate': end_text,
+                'days': days,
+            }
+            best_end = end_dt
+
+    if best is None or best_end is None:
+        return {
+            'periodStart': '',
+            'periodEnd': '',
+            'periodDays': 0,
+            'daysLeft': 0,
+        }
+
+    start_text = _clean_str(best.get('startDate'))
+    end_text = _clean_str(best.get('endDate'))
+    days = best.get('days')
+    try:
+        days = int(days)
+    except Exception:
+        days = 0
+
+    today = datetime.utcnow().date()
+    days_left = max(0, (best_end.date() - today).days)
+
+    return {
+        'periodStart': start_text,
+        'periodEnd': end_text,
+        'periodDays': max(0, days),
+        'daysLeft': days_left,
+    }
+
+
+def _normalize_admin_ritual_service(ritual_service):
+    contacts = _clean_ritual_contacts_loose(ritual_service.get('contacts'))
+    if not contacts:
+        contacts = _derive_ritual_contacts_from_legacy(ritual_service)
+
+    settlements = _clean_str_list(ritual_service.get('settlements'), 'settlements') if isinstance(ritual_service.get('settlements'), list) else []
+    payments = _clean_ritual_payments(ritual_service.get('payments'))
+    active_period = _get_active_ritual_period(payments)
+
+    addresses = [entry.get('address', '') for entry in contacts if _clean_str(entry.get('address'))]
+    subtitle = addresses[0] if addresses else (settlements[0] if settlements else '')
+
+    status = _normalize_ritual_service_status(ritual_service.get('status'))
+    category = _clean_str(ritual_service.get('category'))
+
+    created_at = ritual_service.get('createdAt')
+    updated_at = ritual_service.get('updatedAt')
+
+    return {
+        'id': str(ritual_service.get('_id')),
+        'name': _clean_str(ritual_service.get('name')),
+        'subtitle': subtitle,
+        'category': category,
+        'status': status,
+        'avatarUrl': _clean_str(ritual_service.get('logo')),
+        'logo': _clean_str(ritual_service.get('logo')),
+        'banner': _clean_str(ritual_service.get('banner')),
+        'link': _clean_str(ritual_service.get('link')),
+        'login': _clean_str(ritual_service.get('login')),
+        'password': _clean_str(ritual_service.get('password')),
+        'settlements': settlements,
+        'contacts': contacts,
+        'payments': payments,
+        'addresses': _coerce_ritual_addresses(ritual_service.get('address')),
+        'phones': _coerce_ritual_phones(ritual_service.get('phone')),
+        'periodStart': active_period['periodStart'],
+        'periodEnd': active_period['periodEnd'],
+        'periodDays': active_period['periodDays'],
+        'daysLeft': active_period['daysLeft'],
+        'latitude': ritual_service.get('latitude'),
+        'longitude': ritual_service.get('longitude'),
+        'description': ritual_service.get('description'),
+        'items': ritual_service.get('items'),
+        'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
+        'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
+    }
+
+
+def _build_admin_ritual_service_payload(data, partial=False):
+    if not isinstance(data, dict):
+        abort(400, description='Body must be a JSON object')
+
+    unknown = set(data.keys()) - ADMIN_RITUAL_SERVICE_ALLOWED_FIELDS
+    if unknown:
+        unknown_list = ', '.join(sorted(unknown))
+        abort(400, description=f'Unsupported fields: {unknown_list}')
+
+    payload = {}
+
+    if not partial:
+        name = _clean_str(data.get('name'))
+        if not name:
+            abort(400, description='`name` is required')
+
+    if 'name' in data:
+        name = _clean_str(data.get('name'))
+        if not name:
+            abort(400, description='`name` is required')
+        payload['name'] = name
+
+    if 'category' in data:
+        payload['category'] = _clean_str(data.get('category'))
+
+    if 'status' in data:
+        payload['status'] = _normalize_ritual_service_status(data.get('status'))
+
+    if 'logo' in data:
+        payload['logo'] = _clean_str(data.get('logo'))
+    if 'banner' in data:
+        payload['banner'] = _clean_str(data.get('banner'))
+    if 'link' in data:
+        payload['link'] = _clean_str(data.get('link'))
+    if 'login' in data:
+        payload['login'] = _clean_str(data.get('login'))
+    if 'password' in data:
+        payload['password'] = _clean_str(data.get('password'))
+
+    if 'settlements' in data:
+        payload['settlements'] = _clean_str_list(data.get('settlements'), 'settlements')
+
+    if 'contacts' in data:
+        payload['contacts'] = _validate_ritual_contacts(data.get('contacts'), 'contacts')
+
+    if 'payments' in data:
+        payload['payments'] = _clean_ritual_payments(data.get('payments'), 'payments')
+
+    if 'latitude' in data:
+        payload['latitude'] = data.get('latitude')
+    if 'longitude' in data:
+        payload['longitude'] = data.get('longitude')
+    if 'description' in data:
+        payload['description'] = data.get('description')
+    if 'items' in data:
+        payload['items'] = data.get('items')
+
+    if 'contacts' in payload:
+        addresses = [entry.get('address', '') for entry in payload['contacts'] if _clean_str(entry.get('address'))]
+        phones = [entry.get('phone', '') for entry in payload['contacts'] if _clean_str(entry.get('phone'))]
+        payload['address'] = addresses
+        payload['phone'] = phones
+
+    if not partial:
+        payload.setdefault('category', DEFAULT_RITUAL_SERVICE_CATEGORIES[1])
+        payload.setdefault('status', 'Активний')
+        payload.setdefault('settlements', [])
+        payload.setdefault('contacts', [])
+        payload.setdefault('payments', [])
+        payload.setdefault('logo', '')
+        payload.setdefault('banner', '')
+        payload.setdefault('link', '')
+        payload.setdefault('login', '')
+        payload.setdefault('password', '')
+        payload.setdefault('description', '')
+        payload.setdefault('items', [])
+        payload.setdefault('latitude', None)
+        payload.setdefault('longitude', None)
+        if 'address' not in payload:
+            payload['address'] = []
+        if 'phone' not in payload:
+            payload['phone'] = []
+
+    return payload
+
+
+def _ensure_default_ritual_service_categories():
+    now = datetime.utcnow()
+    for order, name in enumerate(DEFAULT_RITUAL_SERVICE_CATEGORIES):
+        normalized = _clean_str(name).lower()
+        if not normalized:
+            continue
+        ritual_service_categories_collection.update_one(
+            {'nameNormalized': normalized},
+            {
+                '$setOnInsert': {
+                    'name': _clean_str(name),
+                    'nameNormalized': normalized,
+                    'isDefault': True,
+                    'order': order,
+                    'createdAt': now,
+                    'updatedAt': now,
+                }
+            },
+            upsert=True
+        )
+
+
+def _normalize_ritual_service_category(doc):
+    return {
+        'id': str(doc.get('_id')),
+        'name': _clean_str(doc.get('name')),
+        'isDefault': bool(doc.get('isDefault')),
+        'createdAt': doc.get('createdAt').isoformat() if isinstance(doc.get('createdAt'), datetime) else None,
+        'updatedAt': doc.get('updatedAt').isoformat() if isinstance(doc.get('updatedAt'), datetime) else None,
+    }
+
+
+@application.route('/api/admin/ritual-services/categories', methods=['GET'])
+def admin_list_ritual_service_categories():
+    _ensure_default_ritual_service_categories()
+    docs = list(
+        ritual_service_categories_collection.find({}, {'name': 1, 'isDefault': 1, 'createdAt': 1, 'updatedAt': 1, 'order': 1})
+    )
+
+    def _sort_key(item):
+        normalized_name = _clean_str(item.get('name')).lower()
+        if normalized_name in [_clean_str(v).lower() for v in DEFAULT_RITUAL_SERVICE_CATEGORIES]:
+            return (0, DEFAULT_RITUAL_SERVICE_CATEGORIES.index(next(v for v in DEFAULT_RITUAL_SERVICE_CATEGORIES if _clean_str(v).lower() == normalized_name)))
+        created_at = item.get('createdAt')
+        created_ts = created_at.timestamp() if isinstance(created_at, datetime) else 0
+        return (1, created_ts, normalized_name)
+
+    docs.sort(key=_sort_key)
+    categories = [_normalize_ritual_service_category(doc) for doc in docs if _clean_str(doc.get('name'))]
+
+    return jsonify({
+        'total': len(categories),
+        'categories': categories,
+    })
+
+
+@application.route('/api/admin/ritual-services/categories', methods=['POST'])
+def admin_create_ritual_service_category():
+    _ensure_default_ritual_service_categories()
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Body must be a JSON object')
+
+    raw_name = _clean_str(data.get('name'))
+    if not raw_name:
+        abort(400, description='`name` is required')
+
+    normalized = raw_name.lower()
+    now = datetime.utcnow()
+    result = ritual_service_categories_collection.update_one(
+        {'nameNormalized': normalized},
+        {
+            '$setOnInsert': {
+                'name': raw_name,
+                'nameNormalized': normalized,
+                'isDefault': False,
+                'order': 9999,
+                'createdAt': now,
+                'updatedAt': now,
+            }
+        },
+        upsert=True
+    )
+
+    created = ritual_service_categories_collection.find_one({'nameNormalized': normalized})
+    status_code = 201 if result.upserted_id else 200
+    return jsonify(_normalize_ritual_service_category(created)), status_code
+
+
+@application.route('/api/admin/ritual-services', methods=['GET'])
+def admin_list_ritual_services():
+    search = _clean_str(request.args.get('search', ''))
+    query_filter = {}
+
+    if search:
+        regex = {'$regex': re.escape(search), '$options': 'i'}
+        query_filter = {
+            '$or': [
+                {'name': regex},
+                {'category': regex},
+                {'address': regex},
+                {'settlements': regex},
+                {'contacts.address': regex},
+                {'contacts.phone': regex},
+                {'login': regex},
+            ]
+        }
+
+    cursor = ritual_services_collection.find(query_filter).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
+    services = [_normalize_admin_ritual_service(item) for item in cursor]
+    return jsonify({
+        'total': len(services),
+        'services': services,
+    })
+
+
+@application.route('/api/admin/ritual-services', methods=['POST'])
+def admin_create_ritual_service():
+    data = request.get_json(silent=True) or {}
+    payload = _build_admin_ritual_service_payload(data, partial=False)
+    now = datetime.utcnow()
+    payload['createdAt'] = now
+    payload['updatedAt'] = now
+
+    inserted = ritual_services_collection.insert_one(payload)
+    created = ritual_services_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify(_normalize_admin_ritual_service(created)), 201
+
+
+@application.route('/api/admin/ritual-services/<string:service_id>', methods=['PATCH'])
+def admin_update_ritual_service(service_id):
+    try:
+        oid = ObjectId(service_id)
+    except Exception:
+        abort(400, description='Invalid ritual service id')
+
+    data = request.get_json(silent=True) or {}
+    update_fields = _build_admin_ritual_service_payload(data, partial=True)
+    if not update_fields:
+        abort(400, description='Nothing to update')
+
+    update_fields['updatedAt'] = datetime.utcnow()
+    result = ritual_services_collection.update_one({'_id': oid}, {'$set': update_fields})
+    if result.matched_count == 0:
+        abort(404, description='Ritual service not found')
+
+    ritual_service = ritual_services_collection.find_one({'_id': oid})
+    return jsonify(_normalize_admin_ritual_service(ritual_service))
+
+
+@application.route('/api/admin/ritual-services/<string:service_id>', methods=['DELETE'])
+def admin_delete_ritual_service(service_id):
+    try:
+        oid = ObjectId(service_id)
+    except Exception:
+        abort(400, description='Invalid ritual service id')
+
+    result = ritual_services_collection.delete_one({'_id': oid})
+    if result.deleted_count == 0:
+        abort(404, description='Ritual service not found')
 
     return jsonify({'ok': True})
 

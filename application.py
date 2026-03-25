@@ -1392,9 +1392,9 @@ def _normalize_admin_church(church):
     contacts = _clean_contacts_list_loose(church.get('contacts'))
     first_contact = contacts[0] if contacts else {}
 
-    contact_person = _clean_str(church.get('contactPerson')) or _clean_str(first_contact.get('person')) or _clean_str(church.get('description'))
+    contact_person = _clean_str(church.get('contactPerson')) or _clean_str(first_contact.get('person'))
     if not contact_person:
-        contact_person = 'Контактна особа: отець...'
+        contact_person = '-'
 
     phone = _clean_str(church.get('phone')) or _clean_str(first_contact.get('phone'))
     if not phone:
@@ -1562,6 +1562,41 @@ def admin_create_church():
     inserted = churches_collection.insert_one(payload)
     created = churches_collection.find_one({'_id': inserted.inserted_id})
     return jsonify(_normalize_admin_church(created)), 201
+
+
+@application.route('/api/admin/churches/<string:church_id>', methods=['PATCH'])
+def admin_update_church(church_id):
+    try:
+        oid = ObjectId(church_id)
+    except Exception:
+        abort(400, description='Invalid church id')
+
+    data = request.get_json(silent=True) or {}
+    update_fields = _build_admin_church_payload(data, partial=True)
+    if not update_fields:
+        abort(400, description='Nothing to update')
+
+    update_fields['updatedAt'] = datetime.utcnow()
+    result = churches_collection.update_one({'_id': oid}, {'$set': update_fields})
+    if result.matched_count == 0:
+        abort(404, description='Church not found')
+
+    church = churches_collection.find_one({'_id': oid})
+    return jsonify(_normalize_admin_church(church))
+
+
+@application.route('/api/admin/churches/<string:church_id>', methods=['DELETE'])
+def admin_delete_church(church_id):
+    try:
+        oid = ObjectId(church_id)
+    except Exception:
+        abort(400, description='Invalid church id')
+
+    result = churches_collection.delete_one({'_id': oid})
+    if result.deleted_count == 0:
+        abort(404, description='Church not found')
+
+    return jsonify({'ok': True})
 
 
 @application.route('/api/churches_page', methods=['GET'])

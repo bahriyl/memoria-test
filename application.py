@@ -133,7 +133,6 @@ churches_collection = db['churches']
 ritual_services_collection = db['ritual_services']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
-church_days_collection = db['church_days']
 chat_templates_collection = db['chat_templates']
 
 ALLOWED_CHAT_CATEGORIES = {'Реклама', 'Ритуальні послуги', 'Електронна записка'}
@@ -196,11 +195,6 @@ GEONAMES_LANG = "uk"
 
 try:
     liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
-except Exception:
-    pass
-
-try:
-    church_days_collection.create_index([("name", ASCENDING)], unique=True)
 except Exception:
     pass
 
@@ -1327,12 +1321,25 @@ def admin_delete_cemetery(cemetery_id):
 
 
 ADMIN_CHURCH_STATUSES = {'Активний', 'Неактивний'}
+DAY_ID_TO_WEEKDAY = {
+    'sun': 0,
+    'mon': 1,
+    'tue': 2,
+    'wed': 3,
+    'thu': 4,
+    'fri': 5,
+    'sat': 6,
+}
+WEEKDAY_TO_DAY_ID = {value: key for key, value in DAY_ID_TO_WEEKDAY.items()}
+WEEKDAY_TO_LITURGY_KEY = {2: 'Вт', 5: 'Пт', 6: 'Сб'}
+LITURGY_KEY_TO_WEEKDAY = {value: key for key, value in WEEKDAY_TO_LITURGY_KEY.items()}
 ADMIN_CHURCH_ALLOWED_FIELDS = {
     'name',
     'address',
     'locality',
     'workingDays',
     'liturgyEndTimes',
+    'churchDays',
     'cemeteries',
     'status',
     'contacts',
@@ -1388,6 +1395,112 @@ def _clean_liturgy_end_times(value):
     }
 
 
+def _day_ids_to_weekdays(value):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        day_id = _clean_str(item).lower()
+        if day_id in DAY_ID_TO_WEEKDAY:
+            out.append(DAY_ID_TO_WEEKDAY[day_id])
+    return sorted(set(out))
+
+
+def _weekdays_to_day_ids(value):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        try:
+            weekday = _normalize_weekday(item)
+        except Exception:
+            continue
+        day_id = WEEKDAY_TO_DAY_ID.get(weekday)
+        if day_id:
+            out.append(day_id)
+    return sorted(set(out), key=lambda day_id: DAY_ID_TO_WEEKDAY.get(day_id, 99))
+
+
+def _legacy_liturgy_from_church_days(church_days):
+    if not isinstance(church_days, dict):
+        return {'Вт': '', 'Пт': '', 'Сб': ''}
+    by_weekday = church_days.get('liturgyByWeekday')
+    if not isinstance(by_weekday, dict):
+        by_weekday = {}
+    return {
+        'Вт': _clean_str(by_weekday.get('2')),
+        'Пт': _clean_str(by_weekday.get('5')),
+        'Сб': _clean_str(by_weekday.get('6')),
+    }
+
+
+def _church_days_from_legacy(working_days, liturgy_end_times):
+    active_weekdays = _day_ids_to_weekdays(working_days)
+    legacy_times = _clean_liturgy_end_times(liturgy_end_times)
+    liturgy_by_weekday = {}
+    for legacy_key, weekday in LITURGY_KEY_TO_WEEKDAY.items():
+        value = _clean_str(legacy_times.get(legacy_key))
+        if value:
+            liturgy_by_weekday[str(weekday)] = value
+
+    if active_weekdays:
+        liturgy_by_weekday = {
+            key: value for key, value in liturgy_by_weekday.items() if int(key) in active_weekdays
+        }
+
+    return {
+        'activeWeekdays': active_weekdays,
+        'liturgyByWeekday': liturgy_by_weekday,
+    }
+
+
+def _clean_church_days(value, field_name='churchDays'):
+    if value is None:
+        return {'activeWeekdays': [], 'liturgyByWeekday': {}}
+    if not isinstance(value, dict):
+        abort(400, description=f"`{field_name}` must be an object")
+
+    raw_active = value.get('activeWeekdays')
+    if raw_active is None:
+        active_weekdays = []
+    elif isinstance(raw_active, list):
+        active_weekdays = []
+        for idx, item in enumerate(raw_active):
+            try:
+                active_weekdays.append(_normalize_weekday(item))
+            except Exception:
+                abort(400, description=f"`{field_name}.activeWeekdays[{idx}]` must be an integer 0..6")
+        active_weekdays = sorted(set(active_weekdays))
+    else:
+        abort(400, description=f"`{field_name}.activeWeekdays` must be an array")
+
+    raw_liturgy = value.get('liturgyByWeekday')
+    if raw_liturgy is None:
+        liturgy_by_weekday = {}
+    elif isinstance(raw_liturgy, dict):
+        liturgy_by_weekday = {}
+        for key, raw_time in raw_liturgy.items():
+            try:
+                weekday = _normalize_weekday(key)
+            except Exception:
+                abort(400, description=f"`{field_name}.liturgyByWeekday` keys must be integers 0..6")
+            time_value = _clean_str(raw_time)
+            if time_value:
+                liturgy_by_weekday[str(weekday)] = time_value
+    else:
+        abort(400, description=f"`{field_name}.liturgyByWeekday` must be an object")
+
+    if active_weekdays:
+        liturgy_by_weekday = {
+            key: value for key, value in liturgy_by_weekday.items() if int(key) in active_weekdays
+        }
+
+    return {
+        'activeWeekdays': active_weekdays,
+        'liturgyByWeekday': liturgy_by_weekday,
+    }
+
+
 def _normalize_admin_church(church):
     contacts = _clean_contacts_list_loose(church.get('contacts'))
     first_contact = contacts[0] if contacts else {}
@@ -1407,6 +1520,16 @@ def _normalize_admin_church(church):
     working_days = _clean_str_list(church.get('workingDays'), 'workingDays') if isinstance(church.get('workingDays'), list) else []
     cemeteries = _clean_str_list(church.get('cemeteries'), 'cemeteries') if isinstance(church.get('cemeteries'), list) else []
     liturgy_end_times = _clean_liturgy_end_times(church.get('liturgyEndTimes'))
+    church_days = _clean_church_days(church.get('churchDays'))
+
+    if not church_days['activeWeekdays'] and working_days:
+        church_days['activeWeekdays'] = _day_ids_to_weekdays(working_days)
+    if not church_days['liturgyByWeekday'] and any(liturgy_end_times.values()):
+        church_days['liturgyByWeekday'] = _church_days_from_legacy(working_days, liturgy_end_times).get('liturgyByWeekday', {})
+    if not working_days and church_days['activeWeekdays']:
+        working_days = _weekdays_to_day_ids(church_days['activeWeekdays'])
+    if not any(liturgy_end_times.values()) and church_days['liturgyByWeekday']:
+        liturgy_end_times = _legacy_liturgy_from_church_days(church_days)
 
     created_at = church.get('createdAt')
     updated_at = church.get('updatedAt')
@@ -1421,6 +1544,7 @@ def _normalize_admin_church(church):
         'status': status,
         'workingDays': working_days,
         'liturgyEndTimes': liturgy_end_times,
+        'churchDays': church_days,
         'cemeteries': cemeteries,
         'contacts': contacts,
         'infoNotes': _clean_str(church.get('infoNotes')),
@@ -1466,6 +1590,9 @@ def _build_admin_church_payload(data, partial=False):
     if 'liturgyEndTimes' in data:
         payload['liturgyEndTimes'] = _clean_liturgy_end_times(data.get('liturgyEndTimes'))
 
+    if 'churchDays' in data:
+        payload['churchDays'] = _clean_church_days(data.get('churchDays'))
+
     if 'cemeteries' in data:
         payload['cemeteries'] = _clean_str_list(data.get('cemeteries'), 'cemeteries')
 
@@ -1508,10 +1635,22 @@ def _build_admin_church_payload(data, partial=False):
     if 'infoNotes' in payload:
         payload['description'] = payload['infoNotes']
 
+    if 'churchDays' in payload:
+        if 'workingDays' not in payload:
+            payload['workingDays'] = _weekdays_to_day_ids(payload['churchDays'].get('activeWeekdays', []))
+        if 'liturgyEndTimes' not in payload:
+            payload['liturgyEndTimes'] = _legacy_liturgy_from_church_days(payload['churchDays'])
+    elif 'workingDays' in payload or 'liturgyEndTimes' in payload:
+        payload['churchDays'] = _church_days_from_legacy(
+            payload.get('workingDays', []),
+            payload.get('liturgyEndTimes', {'Вт': '', 'Пт': '', 'Сб': ''})
+        )
+
     if not partial:
         payload.setdefault('locality', '')
         payload.setdefault('workingDays', [])
         payload.setdefault('liturgyEndTimes', {'Вт': '', 'Пт': '', 'Сб': ''})
+        payload.setdefault('churchDays', _church_days_from_legacy(payload.get('workingDays', []), payload.get('liturgyEndTimes', {'Вт': '', 'Пт': '', 'Сб': ''})))
         payload.setdefault('cemeteries', [])
         payload.setdefault('status', 'Активний')
         payload.setdefault('contacts', [])
@@ -3281,31 +3420,40 @@ def get_church_active_days():
         # No church selected on frontend
         return jsonify({"churchName": None, "activeWeekdays": []})
 
-    doc = church_days_collection.find_one({"name": name})
-    if not doc:
+    church = churches_collection.find_one(
+        {"name": name},
+        {"name": 1, "workingDays": 1, "churchDays": 1}
+    )
+    if not church:
         # Known church with no config yet → empty schedule
         return jsonify({"churchName": name, "activeWeekdays": []})
 
-    raw_days = doc.get("activeWeekdays") or []
     cleaned = []
-    for d in raw_days:
-        try:
-            cleaned.append(_normalize_weekday(d))
-        except Exception:
-            # ignore malformed stored values instead of failing the request
-            continue
-    # Deduplicate & sort
+    church_days_raw = church.get("churchDays")
+    if isinstance(church_days_raw, dict):
+        raw_days = church_days_raw.get("activeWeekdays")
+        if isinstance(raw_days, list):
+            for d in raw_days:
+                try:
+                    cleaned.append(_normalize_weekday(d))
+                except Exception:
+                    # ignore malformed stored values instead of failing the request
+                    continue
+
+    if not cleaned and isinstance(church.get("workingDays"), list):
+        cleaned = _day_ids_to_weekdays(church.get("workingDays"))
+
     cleaned = sorted(set(cleaned))
-    return jsonify({"churchName": doc.get("name"), "activeWeekdays": cleaned})
+    return jsonify({"churchName": church.get("name"), "activeWeekdays": cleaned})
 
 
 @application.route("/api/liturgy/church-active-days", methods=["PUT"])
 def set_church_active_days():
     """
-    Upsert active weekdays configuration for a church.
+    Update active weekdays configuration for an existing church.
     Expected JSON:
       {
-        "churchName": "Собор Св. Юра",          # required, non-empty
+        "churchName": "Собор Св. Юра",          # required, existing church name
         "activeWeekdays": [0, 1, 2, 3, 4]      # required, array of ints (0=Sun..6=Sat)
       }
     """
@@ -3324,10 +3472,41 @@ def set_church_active_days():
 
     cleaned = sorted(set(cleaned))
 
-    church_days_collection.update_one(
+    church = churches_collection.find_one(
         {"name": name},
-        {"$set": {"name": name, "activeWeekdays": cleaned}},
-        upsert=True,
+        {"churchDays": 1}
+    )
+    if not church:
+        abort(404, description="Church not found")
+
+    existing_liturgy = {}
+    church_days_raw = church.get("churchDays")
+    if isinstance(church_days_raw, dict) and isinstance(church_days_raw.get("liturgyByWeekday"), dict):
+        for key, raw_time in church_days_raw.get("liturgyByWeekday").items():
+            try:
+                weekday = _normalize_weekday(key)
+            except Exception:
+                continue
+            cleaned_time = _clean_str(raw_time)
+            if cleaned_time:
+                existing_liturgy[str(weekday)] = cleaned_time
+
+    existing_liturgy = {
+        key: value for key, value in existing_liturgy.items() if int(key) in cleaned
+    }
+    church_days = {
+        "activeWeekdays": cleaned,
+        "liturgyByWeekday": existing_liturgy,
+    }
+
+    churches_collection.update_one(
+        {"name": name},
+        {"$set": {
+            "churchDays": church_days,
+            "workingDays": _weekdays_to_day_ids(cleaned),
+            "liturgyEndTimes": _legacy_liturgy_from_church_days(church_days),
+            "updatedAt": datetime.utcnow(),
+        }},
     )
 
     return jsonify({"churchName": name, "activeWeekdays": cleaned})

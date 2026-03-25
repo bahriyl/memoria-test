@@ -160,6 +160,11 @@ chat_collection.update_many(
     {'lastAdminReadAt': {'$exists': False}},
     {'$set': {'lastAdminReadAt': None}}
 )
+# Legacy backfill: older chats without attached profile are treated as not attached.
+chat_collection.update_many(
+    {'attachedPersonId': {'$exists': False}},
+    {'$set': {'attachedPersonId': None}}
+)
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
@@ -211,6 +216,11 @@ except Exception:
 
 try:
     chat_collection.create_index([("chatStatus", ASCENDING), ("category", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    chat_collection.create_index([("chatStatus", ASCENDING), ("attachedPersonId", ASCENDING)])
 except Exception:
     pass
 
@@ -1022,6 +1032,7 @@ def get_cemetery_page(cemetery_id):
 
 
 ADMIN_CEMETERY_STATUSES = {'Активний', 'Неактивний'}
+ADMIN_CEMETERY_ADDED_LABELS = {'Memoria', 'Сторінки', 'Виробники', 'Таблички'}
 ADMIN_CEMETERY_ADDED_TONES = {'green', 'gold'}
 ADMIN_CEMETERY_ALLOWED_FIELDS = {
     'name',
@@ -1083,6 +1094,8 @@ def _normalize_admin_cemetery(cemetery):
     address_line = _clean_str(cemetery.get('addressLine') or cemetery.get('locality') or cemetery.get('address'))
 
     added_label = _clean_str(cemetery.get('addedLabel')) or 'Memoria'
+    if added_label not in ADMIN_CEMETERY_ADDED_LABELS:
+        added_label = 'Memoria'
     added_tone = _clean_str(cemetery.get('addedTone'))
     if added_tone not in ADMIN_CEMETERY_ADDED_TONES:
         added_tone = _derive_added_tone(added_label)
@@ -1159,7 +1172,10 @@ def _build_admin_cemetery_payload(data, partial=False):
         payload['addressLine'] = address_line
 
     if 'addedLabel' in data:
-        payload['addedLabel'] = _clean_str(data.get('addedLabel')) or 'Memoria'
+        added_label = _clean_str(data.get('addedLabel')) or 'Memoria'
+        if added_label not in ADMIN_CEMETERY_ADDED_LABELS:
+            abort(400, description="`addedLabel` must be one of: Memoria, Сторінки, Виробники, Таблички")
+        payload['addedLabel'] = added_label
 
     if 'addedTone' in data:
         tone = _clean_str(data.get('addedTone'))
@@ -2171,7 +2187,8 @@ def create_chat():
         'openedByAdmin': False,
         'openedAt': None,
         'category': None,
-        'lastAdminReadAt': None
+        'lastAdminReadAt': None,
+        'attachedPersonId': None
     })
     chat_id = str(result.inserted_id)
 
@@ -2196,10 +2213,45 @@ def create_chat():
     return jsonify({'chatId': chat_id}), 201
 
 
+def _normalize_attached_person(person):
+    if not isinstance(person, dict):
+        return None
+    return {
+        'id': str(person.get('_id')),
+        'name': str(person.get('name') or ''),
+        'birthYear': person.get('birthYear'),
+        'deathYear': person.get('deathYear'),
+        'avatarUrl': person.get('avatarUrl')
+    }
+
+
 @application.route('/api/chats', methods=['GET'])
 def list_chats():
     """List all chat sessions for admin."""
-    chats = chat_collection.find().sort('createdAt', -1)
+    chats = list(chat_collection.find().sort('createdAt', -1))
+    attached_person_ids = []
+    for chat_doc in chats:
+        raw_person_id = chat_doc.get('attachedPersonId')
+        if not isinstance(raw_person_id, str):
+            continue
+        normalized_person_id = raw_person_id.strip()
+        if not normalized_person_id:
+            continue
+        attached_person_ids.append(normalized_person_id)
+
+    person_ids_to_load = []
+    for person_id in sorted(set(attached_person_ids)):
+        try:
+            person_ids_to_load.append(ObjectId(person_id))
+        except Exception:
+            continue
+
+    people_by_id = {}
+    if person_ids_to_load:
+        projection = {'name': 1, 'birthYear': 1, 'deathYear': 1, 'avatarUrl': 1}
+        for person in people_collection.find({'_id': {'$in': person_ids_to_load}}, projection):
+            people_by_id[str(person.get('_id'))] = _normalize_attached_person(person)
+
     out = []
     total_unread = 0
     for c in chats:
@@ -2209,6 +2261,9 @@ def list_chats():
         opened_by_admin = bool(c.get('openedByAdmin', True))
         status = 'history' if chat_status == 'history' else ('open' if opened_by_admin else 'new')
         last_admin_read_at = c.get('lastAdminReadAt') if isinstance(c.get('lastAdminReadAt'), datetime) else None
+        attached_person_id = c.get('attachedPersonId') if isinstance(c.get('attachedPersonId'), str) else None
+        if attached_person_id:
+            attached_person_id = attached_person_id.strip() or None
 
         unread_filter = {'chatId': c['_id'], 'sender': 'user'}
         if last_admin_read_at is not None:
@@ -2226,6 +2281,8 @@ def list_chats():
             'lastAdminReadAt': last_admin_read_at.isoformat() if last_admin_read_at else None,
             'status': status,
             'category': c.get('category') if isinstance(c.get('category'), str) else None,
+            'attachedPersonId': attached_person_id,
+            'attachedPerson': people_by_id.get(attached_person_id) if attached_person_id else None,
             'unreadCount': unread_count
         })
     return jsonify({
@@ -2244,11 +2301,23 @@ def mark_chat_open(chat_id):
 
     current = chat_collection.find_one(
         {'_id': cid},
-        {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1, 'lastAdminReadAt': 1}
+        {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1, 'lastAdminReadAt': 1, 'attachedPersonId': 1}
     )
     if current and str(current.get('chatStatus') or '').lower() == 'history':
         opened_at = current.get('openedAt')
         last_admin_read_at = current.get('lastAdminReadAt')
+        attached_person_id = current.get('attachedPersonId') if isinstance(current.get('attachedPersonId'), str) else None
+        attached_person_id = attached_person_id.strip() if attached_person_id else None
+        attached_person = None
+        if attached_person_id:
+            try:
+                person_doc = people_collection.find_one(
+                    {'_id': ObjectId(attached_person_id)},
+                    {'name': 1, 'birthYear': 1, 'deathYear': 1, 'avatarUrl': 1}
+                )
+                attached_person = _normalize_attached_person(person_doc)
+            except Exception:
+                attached_person = None
         return jsonify({
             'chatId': chat_id,
             'chatStatus': 'history',
@@ -2256,7 +2325,9 @@ def mark_chat_open(chat_id):
             'openedByAdmin': bool(current.get('openedByAdmin', True)),
             'openedAt': opened_at.isoformat() if isinstance(opened_at, datetime) else None,
             'lastAdminReadAt': last_admin_read_at.isoformat() if isinstance(last_admin_read_at, datetime) else None,
-            'category': current.get('category') if isinstance(current.get('category'), str) else None
+            'category': current.get('category') if isinstance(current.get('category'), str) else None,
+            'attachedPersonId': attached_person_id,
+            'attachedPerson': attached_person
         }), 200
 
     now = datetime.utcnow()
@@ -2268,7 +2339,8 @@ def mark_chat_open(chat_id):
                 'createdAt': now,
                 'chatStatus': 'open',
                 'openedAt': now,
-                'category': None
+                'category': None,
+                'attachedPersonId': None
             }
         },
         upsert=True
@@ -2282,10 +2354,22 @@ def mark_chat_open(chat_id):
 
     updated = chat_collection.find_one(
         {'_id': cid},
-        {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1, 'lastAdminReadAt': 1}
+        {'chatStatus': 1, 'openedByAdmin': 1, 'openedAt': 1, 'category': 1, 'lastAdminReadAt': 1, 'attachedPersonId': 1}
     )
     opened_at = updated.get('openedAt') if updated else None
     last_admin_read_at = updated.get('lastAdminReadAt') if updated else None
+    attached_person_id = updated.get('attachedPersonId') if updated and isinstance(updated.get('attachedPersonId'), str) else None
+    attached_person_id = attached_person_id.strip() if attached_person_id else None
+    attached_person = None
+    if attached_person_id:
+        try:
+            person_doc = people_collection.find_one(
+                {'_id': ObjectId(attached_person_id)},
+                {'name': 1, 'birthYear': 1, 'deathYear': 1, 'avatarUrl': 1}
+            )
+            attached_person = _normalize_attached_person(person_doc)
+        except Exception:
+            attached_person = None
     return jsonify({
         'chatId': chat_id,
         'chatStatus': 'open',
@@ -2293,7 +2377,9 @@ def mark_chat_open(chat_id):
         'openedByAdmin': True,
         'openedAt': opened_at.isoformat() if isinstance(opened_at, datetime) else None,
         'lastAdminReadAt': last_admin_read_at.isoformat() if isinstance(last_admin_read_at, datetime) else None,
-        'category': updated.get('category') if updated and isinstance(updated.get('category'), str) else None
+        'category': updated.get('category') if updated and isinstance(updated.get('category'), str) else None,
+        'attachedPersonId': attached_person_id,
+        'attachedPerson': attached_person
     }), 200
 
 
@@ -2442,17 +2528,69 @@ def set_chat_category(chat_id):
     }), 200
 
 
+@application.route('/api/chats/<chat_id>/profile', methods=['PATCH'])
+def set_chat_profile(chat_id):
+    """Attach or clear a profile for chat (idempotent)."""
+    try:
+        cid = ObjectId(chat_id)
+    except Exception:
+        abort(400, 'Invalid chat_id')
+
+    data = request.get_json(silent=True) or {}
+    raw_person_id = data.get('personId')
+    attached_person_id = None
+    attached_person = None
+
+    if raw_person_id is None:
+        attached_person_id = None
+    elif isinstance(raw_person_id, str):
+        cleaned = raw_person_id.strip()
+        if not cleaned:
+            attached_person_id = None
+        else:
+            try:
+                person_oid = ObjectId(cleaned)
+            except Exception:
+                abort(400, 'Invalid personId')
+            person_doc = people_collection.find_one(
+                {'_id': person_oid},
+                {'name': 1, 'birthYear': 1, 'deathYear': 1, 'avatarUrl': 1}
+            )
+            if not person_doc:
+                abort(404, 'Person not found')
+            attached_person_id = str(person_oid)
+            attached_person = _normalize_attached_person(person_doc)
+    else:
+        abort(400, 'Invalid personId')
+
+    result = chat_collection.update_one({'_id': cid}, {'$set': {'attachedPersonId': attached_person_id}})
+    if result.matched_count == 0:
+        abort(404, 'Chat not found')
+
+    socketio.emit('adminChatUpdated', {'chatId': chat_id}, room=ADMINS_ROOM)
+
+    return jsonify({
+        'chatId': chat_id,
+        'attachedPersonId': attached_person_id,
+        'attachedPerson': attached_person
+    }), 200
+
+
 @application.route('/api/chats/history-search', methods=['GET'])
 def history_search_chats():
     raw_q = request.args.get('q', '')
     raw_date_from = request.args.get('dateFrom', '')
     raw_date_to = request.args.get('dateTo', '')
     raw_category = request.args.get('category', '')
+    raw_person_id = request.args.get('personId', '')
 
     keyword = raw_q.strip()
     category = raw_category.strip()
     if category in ('', 'Категорія'):
         category = ''
+    person_id = raw_person_id.strip()
+    if person_id in ('', 'null', 'None'):
+        person_id = ''
 
     date_from = None
     date_to = None
@@ -2470,6 +2608,8 @@ def history_search_chats():
     chat_filter = {'chatStatus': 'history'}
     if category:
         chat_filter['category'] = category
+    if person_id:
+        chat_filter['attachedPersonId'] = person_id
 
     history_docs = list(chat_collection.find(chat_filter, {'_id': 1}))
     if not history_docs:
@@ -2649,7 +2789,8 @@ def post_message(chat_id):
                 'openedByAdmin': False,
                 'openedAt': None,
                 'category': None,
-                'lastAdminReadAt': None
+                'lastAdminReadAt': None,
+                'attachedPersonId': None
             }
         },
         upsert=True

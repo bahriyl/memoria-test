@@ -1326,26 +1326,242 @@ def admin_delete_cemetery(cemetery_id):
     return jsonify({'ok': True})
 
 
+ADMIN_CHURCH_STATUSES = {'Активний', 'Неактивний'}
+ADMIN_CHURCH_ALLOWED_FIELDS = {
+    'name',
+    'address',
+    'locality',
+    'workingDays',
+    'liturgyEndTimes',
+    'cemeteries',
+    'status',
+    'contacts',
+    'contactPerson',
+    'phone',
+    'infoNotes',
+    'iban',
+    'taxCode',
+    'recipientName',
+    'botCode',
+}
+
+
+def _clean_contacts_list_loose(value):
+    if not isinstance(value, list):
+        return []
+
+    contacts = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        person = _clean_str(item.get('person'))
+        phone = _clean_str(item.get('phone'))
+        if person or phone:
+            contacts.append({'person': person, 'phone': phone})
+    return contacts
+
+
+def _validate_contacts_list(value, field_name):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description=f"`{field_name}` must be an array")
+
+    contacts = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f"`{field_name}[{idx}]` must be an object")
+        person = _clean_str(item.get('person'))
+        phone = _clean_str(item.get('phone'))
+        if person or phone:
+            contacts.append({'person': person, 'phone': phone})
+    return contacts
+
+
+def _clean_liturgy_end_times(value):
+    if not isinstance(value, dict):
+        return {'Вт': '', 'Пт': '', 'Сб': ''}
+    return {
+        'Вт': _clean_str(value.get('Вт')),
+        'Пт': _clean_str(value.get('Пт')),
+        'Сб': _clean_str(value.get('Сб')),
+    }
+
+
+def _normalize_admin_church(church):
+    contacts = _clean_contacts_list_loose(church.get('contacts'))
+    first_contact = contacts[0] if contacts else {}
+
+    contact_person = _clean_str(church.get('contactPerson')) or _clean_str(first_contact.get('person')) or _clean_str(church.get('description'))
+    if not contact_person:
+        contact_person = 'Контактна особа: отець...'
+
+    phone = _clean_str(church.get('phone')) or _clean_str(first_contact.get('phone'))
+    if not phone:
+        phone = '+380-(00)-000-0000'
+
+    status = _clean_str(church.get('status'))
+    if status not in ADMIN_CHURCH_STATUSES:
+        status = 'Активний'
+
+    working_days = _clean_str_list(church.get('workingDays'), 'workingDays') if isinstance(church.get('workingDays'), list) else []
+    cemeteries = _clean_str_list(church.get('cemeteries'), 'cemeteries') if isinstance(church.get('cemeteries'), list) else []
+    liturgy_end_times = _clean_liturgy_end_times(church.get('liturgyEndTimes'))
+
+    created_at = church.get('createdAt')
+    updated_at = church.get('updatedAt')
+
+    return {
+        'id': str(church.get('_id')),
+        'name': _clean_str(church.get('name')),
+        'address': _clean_str(church.get('address')),
+        'locality': _clean_str(church.get('locality')),
+        'contactPerson': contact_person,
+        'phone': phone,
+        'status': status,
+        'workingDays': working_days,
+        'liturgyEndTimes': liturgy_end_times,
+        'cemeteries': cemeteries,
+        'contacts': contacts,
+        'infoNotes': _clean_str(church.get('infoNotes')),
+        'iban': _clean_str(church.get('iban')),
+        'taxCode': _clean_str(church.get('taxCode')),
+        'recipientName': _clean_str(church.get('recipientName')),
+        'botCode': _clean_str(church.get('botCode')),
+        'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
+        'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
+    }
+
+
+def _build_admin_church_payload(data, partial=False):
+    if not isinstance(data, dict):
+        abort(400, description='Body must be a JSON object')
+
+    unknown = set(data.keys()) - ADMIN_CHURCH_ALLOWED_FIELDS
+    if unknown:
+        unknown_list = ', '.join(sorted(unknown))
+        abort(400, description=f'Unsupported fields: {unknown_list}')
+
+    payload = {}
+
+    def _validate_required_text(key, required):
+        if key not in data:
+            if required:
+                abort(400, description=f"`{key}` is required")
+            return
+        cleaned = _clean_str(data.get(key))
+        if not cleaned:
+            abort(400, description=f"`{key}` is required")
+        payload[key] = cleaned
+
+    _validate_required_text('name', required=not partial)
+    _validate_required_text('address', required=not partial)
+
+    if 'locality' in data:
+        payload['locality'] = _clean_str(data.get('locality'))
+
+    if 'workingDays' in data:
+        payload['workingDays'] = _clean_str_list(data.get('workingDays'), 'workingDays')
+
+    if 'liturgyEndTimes' in data:
+        payload['liturgyEndTimes'] = _clean_liturgy_end_times(data.get('liturgyEndTimes'))
+
+    if 'cemeteries' in data:
+        payload['cemeteries'] = _clean_str_list(data.get('cemeteries'), 'cemeteries')
+
+    if 'status' in data:
+        status = _clean_str(data.get('status'))
+        if status not in ADMIN_CHURCH_STATUSES:
+            abort(400, description="`status` must be one of: Активний, Неактивний")
+        payload['status'] = status
+
+    if 'contacts' in data:
+        payload['contacts'] = _validate_contacts_list(data.get('contacts'), 'contacts')
+
+    if 'contactPerson' in data:
+        payload['contactPerson'] = _clean_str(data.get('contactPerson'))
+
+    if 'phone' in data:
+        payload['phone'] = _clean_str(data.get('phone'))
+
+    if 'infoNotes' in data:
+        payload['infoNotes'] = _clean_str(data.get('infoNotes'))
+
+    if 'iban' in data:
+        payload['iban'] = _clean_str(data.get('iban'))
+
+    if 'taxCode' in data:
+        payload['taxCode'] = _clean_str(data.get('taxCode'))
+
+    if 'recipientName' in data:
+        payload['recipientName'] = _clean_str(data.get('recipientName'))
+
+    if 'botCode' in data:
+        payload['botCode'] = _clean_str(data.get('botCode'))
+
+    if 'contacts' in payload and payload['contacts']:
+        if not payload.get('contactPerson'):
+            payload['contactPerson'] = payload['contacts'][0].get('person', '')
+        if not payload.get('phone'):
+            payload['phone'] = payload['contacts'][0].get('phone', '')
+
+    if 'infoNotes' in payload:
+        payload['description'] = payload['infoNotes']
+
+    if not partial:
+        payload.setdefault('locality', '')
+        payload.setdefault('workingDays', [])
+        payload.setdefault('liturgyEndTimes', {'Вт': '', 'Пт': '', 'Сб': ''})
+        payload.setdefault('cemeteries', [])
+        payload.setdefault('status', 'Активний')
+        payload.setdefault('contacts', [])
+        payload.setdefault('contactPerson', '')
+        payload.setdefault('phone', '')
+        payload.setdefault('infoNotes', '')
+        payload.setdefault('iban', '')
+        payload.setdefault('taxCode', '')
+        payload.setdefault('recipientName', '')
+        payload.setdefault('botCode', '')
+        payload.setdefault('description', payload.get('infoNotes', ''))
+
+    return payload
+
+
 @application.route('/api/admin/churches', methods=['GET'])
 def admin_list_churches():
     search = _clean_str(request.args.get('search', ''))
     query_filter = {}
     if search:
-        query_filter = {'name': {'$regex': re.escape(search), '$options': 'i'}}
+        regex = {'$regex': re.escape(search), '$options': 'i'}
+        query_filter = {
+            '$or': [
+                {'name': regex},
+                {'address': regex},
+                {'contactPerson': regex},
+                {'phone': regex},
+            ]
+        }
 
     churches_cursor = churches_collection.find(query_filter).sort([('name', 1), ('_id', 1)]).limit(50)
-    churches_list = []
-    for church in churches_cursor:
-        churches_list.append({
-            'id': str(church.get('_id')),
-            'name': _clean_str(church.get('name')),
-            'address': _clean_str(church.get('address')),
-        })
+    churches_list = [_normalize_admin_church(church) for church in churches_cursor]
 
     return jsonify({
         'total': len(churches_list),
         'churches': churches_list
     })
+
+
+@application.route('/api/admin/churches', methods=['POST'])
+def admin_create_church():
+    data = request.get_json(silent=True) or {}
+    payload = _build_admin_church_payload(data, partial=False)
+    now = datetime.utcnow()
+    payload['createdAt'] = now
+    payload['updatedAt'] = now
+
+    inserted = churches_collection.insert_one(payload)
+    created = churches_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify(_normalize_admin_church(created)), 201
 
 
 @application.route('/api/churches_page', methods=['GET'])

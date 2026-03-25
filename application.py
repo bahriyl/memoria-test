@@ -1021,6 +1021,317 @@ def get_cemetery_page(cemetery_id):
     })
 
 
+ADMIN_CEMETERY_STATUSES = {'Активний', 'Неактивний'}
+ADMIN_CEMETERY_ADDED_TONES = {'green', 'gold'}
+ADMIN_CEMETERY_ALLOWED_FIELDS = {
+    'name',
+    'locality',
+    'addressLine',
+    'addedLabel',
+    'addedTone',
+    'churchesList',
+    'fillPercent',
+    'status',
+    'phoneContacts',
+    'contactPersons',
+    'description',
+    'notes',
+    'pageImage',
+}
+
+
+def _clean_str(value):
+    if value is None:
+        return ''
+    return str(value).strip()
+
+
+def _clean_str_list(value, field_name):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description=f"`{field_name}` must be an array")
+
+    items = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, str):
+            abort(400, description=f"`{field_name}[{idx}]` must be a string")
+        cleaned = item.strip()
+        if cleaned:
+            items.append(cleaned)
+    return items
+
+
+def _parse_fill_percent(value):
+    if value is None or value == '':
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        abort(400, description="`fillPercent` must be an integer in range 0..100")
+    if parsed < 0 or parsed > 100:
+        abort(400, description="`fillPercent` must be an integer in range 0..100")
+    return parsed
+
+
+def _derive_added_tone(added_label):
+    return 'green' if _clean_str(added_label).lower() == 'memoria' else 'gold'
+
+
+def _normalize_admin_cemetery(cemetery):
+    locality = _clean_str(cemetery.get('locality') or cemetery.get('addressLine') or cemetery.get('address'))
+    address_line = _clean_str(cemetery.get('addressLine') or cemetery.get('locality') or cemetery.get('address'))
+
+    added_label = _clean_str(cemetery.get('addedLabel')) or 'Memoria'
+    added_tone = _clean_str(cemetery.get('addedTone'))
+    if added_tone not in ADMIN_CEMETERY_ADDED_TONES:
+        added_tone = _derive_added_tone(added_label)
+
+    status = _clean_str(cemetery.get('status'))
+    if status not in ADMIN_CEMETERY_STATUSES:
+        status = 'Активний'
+
+    churches_list = _clean_str_list(cemetery.get('churchesList'), 'churchesList')
+    fill_percent = _parse_fill_percent(cemetery.get('fillPercent'))
+
+    phone_contacts = _clean_str_list(cemetery.get('phoneContacts'), 'phoneContacts')
+    legacy_phone = _clean_str(cemetery.get('phone'))
+    if not phone_contacts and legacy_phone:
+        phone_contacts = [legacy_phone]
+
+    contact_persons = _clean_str_list(cemetery.get('contactPersons'), 'contactPersons')
+    description = _clean_str(cemetery.get('description'))
+    notes = _clean_str(cemetery.get('notes'))
+    page_image = _clean_str(cemetery.get('pageImage') or cemetery.get('image'))
+
+    created_at = cemetery.get('createdAt')
+    updated_at = cemetery.get('updatedAt')
+
+    return {
+        'id': str(cemetery.get('_id')),
+        'name': _clean_str(cemetery.get('name')),
+        'locality': locality,
+        'addressLine': address_line,
+        'addedLabel': added_label,
+        'addedTone': added_tone,
+        'churches': len(churches_list),
+        'churchesList': churches_list,
+        'fillPercent': fill_percent,
+        'status': status,
+        'phoneContacts': phone_contacts,
+        'contactPersons': contact_persons,
+        'description': description,
+        'notes': notes,
+        'pageImage': page_image,
+        'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
+        'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
+    }
+
+
+def _build_admin_cemetery_payload(data, partial=False):
+    if not isinstance(data, dict):
+        abort(400, description="Body must be a JSON object")
+
+    unknown = set(data.keys()) - ADMIN_CEMETERY_ALLOWED_FIELDS
+    if unknown:
+        unknown_list = ', '.join(sorted(unknown))
+        abort(400, description=f"Unsupported fields: {unknown_list}")
+
+    payload = {}
+
+    def _validate_required_text(key, required):
+        if key not in data:
+            if required:
+                abort(400, description=f"`{key}` is required")
+            return
+        cleaned = _clean_str(data.get(key))
+        if not cleaned:
+            abort(400, description=f"`{key}` is required")
+        payload[key] = cleaned
+
+    _validate_required_text('name', required=not partial)
+    _validate_required_text('locality', required=not partial)
+
+    if 'addressLine' in data:
+        address_line = _clean_str(data.get('addressLine'))
+        if not address_line and not partial:
+            abort(400, description="`addressLine` cannot be empty")
+        payload['addressLine'] = address_line
+
+    if 'addedLabel' in data:
+        payload['addedLabel'] = _clean_str(data.get('addedLabel')) or 'Memoria'
+
+    if 'addedTone' in data:
+        tone = _clean_str(data.get('addedTone'))
+        if tone not in ADMIN_CEMETERY_ADDED_TONES:
+            abort(400, description="`addedTone` must be one of: green, gold")
+        payload['addedTone'] = tone
+
+    if 'churchesList' in data:
+        payload['churchesList'] = _clean_str_list(data.get('churchesList'), 'churchesList')
+
+    if 'fillPercent' in data:
+        payload['fillPercent'] = _parse_fill_percent(data.get('fillPercent'))
+
+    if 'status' in data:
+        status = _clean_str(data.get('status'))
+        if status not in ADMIN_CEMETERY_STATUSES:
+            abort(400, description="`status` must be one of: Активний, Неактивний")
+        payload['status'] = status
+
+    if 'phoneContacts' in data:
+        payload['phoneContacts'] = _clean_str_list(data.get('phoneContacts'), 'phoneContacts')
+
+    if 'contactPersons' in data:
+        payload['contactPersons'] = _clean_str_list(data.get('contactPersons'), 'contactPersons')
+
+    if 'description' in data:
+        payload['description'] = _clean_str(data.get('description'))
+
+    if 'notes' in data:
+        payload['notes'] = _clean_str(data.get('notes'))
+
+    if 'pageImage' in data:
+        payload['pageImage'] = _clean_str(data.get('pageImage'))
+
+    if 'locality' in payload and 'addressLine' not in payload:
+        payload['addressLine'] = payload['locality']
+    if 'addressLine' in payload and 'locality' not in payload:
+        payload['locality'] = payload['addressLine']
+
+    if not partial:
+        payload.setdefault('addedLabel', 'Memoria')
+        payload.setdefault('addedTone', _derive_added_tone(payload.get('addedLabel')))
+        payload.setdefault('churchesList', [])
+        payload.setdefault('fillPercent', 0)
+        payload.setdefault('status', 'Активний')
+        payload.setdefault('phoneContacts', [])
+        payload.setdefault('contactPersons', [])
+        payload.setdefault('description', '')
+        payload.setdefault('notes', '')
+        payload.setdefault('pageImage', '')
+        payload.setdefault('addressLine', payload.get('locality', ''))
+        payload.setdefault('locality', payload.get('addressLine', ''))
+
+    if 'pageImage' in payload:
+        payload['image'] = payload['pageImage']
+    if 'addressLine' in payload:
+        payload['address'] = payload['addressLine']
+    if 'phoneContacts' in payload:
+        payload['phone'] = payload['phoneContacts'][0] if payload['phoneContacts'] else ''
+
+    return payload
+
+
+@application.route('/api/admin/cemeteries', methods=['GET'])
+def admin_list_cemeteries():
+    search = _clean_str(request.args.get('search', ''))
+    query_filter = {}
+
+    if search:
+        regex = {'$regex': re.escape(search), '$options': 'i'}
+        query_filter = {
+            '$or': [
+                {'name': regex},
+                {'locality': regex},
+                {'addressLine': regex},
+                {'address': regex},
+            ]
+        }
+
+    cursor = cemeteries_collection.find(query_filter).sort([('createdAt', -1), ('_id', -1)])
+    cemeteries_list = [_normalize_admin_cemetery(cemetery) for cemetery in cursor]
+
+    return jsonify({
+        'total': len(cemeteries_list),
+        'cemeteries': cemeteries_list
+    })
+
+
+@application.route('/api/admin/cemeteries', methods=['POST'])
+def admin_create_cemetery():
+    data = request.get_json(silent=True) or {}
+    payload = _build_admin_cemetery_payload(data, partial=False)
+    now = datetime.utcnow()
+    payload['createdAt'] = now
+    payload['updatedAt'] = now
+
+    inserted = cemeteries_collection.insert_one(payload)
+    created = cemeteries_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify(_normalize_admin_cemetery(created)), 201
+
+
+@application.route('/api/admin/cemeteries/<string:cemetery_id>', methods=['GET'])
+def admin_get_cemetery(cemetery_id):
+    try:
+        oid = ObjectId(cemetery_id)
+    except Exception:
+        abort(400, description='Invalid cemetery id')
+
+    cemetery = cemeteries_collection.find_one({'_id': oid})
+    if not cemetery:
+        abort(404, description='Cemetery not found')
+
+    return jsonify(_normalize_admin_cemetery(cemetery))
+
+
+@application.route('/api/admin/cemeteries/<string:cemetery_id>', methods=['PATCH'])
+def admin_update_cemetery(cemetery_id):
+    try:
+        oid = ObjectId(cemetery_id)
+    except Exception:
+        abort(400, description='Invalid cemetery id')
+
+    data = request.get_json(silent=True) or {}
+    update_fields = _build_admin_cemetery_payload(data, partial=True)
+    if not update_fields:
+        abort(400, description='Nothing to update')
+
+    update_fields['updatedAt'] = datetime.utcnow()
+    result = cemeteries_collection.update_one({'_id': oid}, {'$set': update_fields})
+    if result.matched_count == 0:
+        abort(404, description='Cemetery not found')
+
+    cemetery = cemeteries_collection.find_one({'_id': oid})
+    return jsonify(_normalize_admin_cemetery(cemetery))
+
+
+@application.route('/api/admin/cemeteries/<string:cemetery_id>', methods=['DELETE'])
+def admin_delete_cemetery(cemetery_id):
+    try:
+        oid = ObjectId(cemetery_id)
+    except Exception:
+        abort(400, description='Invalid cemetery id')
+
+    result = cemeteries_collection.delete_one({'_id': oid})
+    if result.deleted_count == 0:
+        abort(404, description='Cemetery not found')
+
+    return jsonify({'ok': True})
+
+
+@application.route('/api/admin/churches', methods=['GET'])
+def admin_list_churches():
+    search = _clean_str(request.args.get('search', ''))
+    query_filter = {}
+    if search:
+        query_filter = {'name': {'$regex': re.escape(search), '$options': 'i'}}
+
+    churches_cursor = churches_collection.find(query_filter).sort([('name', 1), ('_id', 1)]).limit(50)
+    churches_list = []
+    for church in churches_cursor:
+        churches_list.append({
+            'id': str(church.get('_id')),
+            'name': _clean_str(church.get('name')),
+            'address': _clean_str(church.get('address')),
+        })
+
+    return jsonify({
+        'total': len(churches_list),
+        'churches': churches_list
+    })
+
+
 @application.route('/api/churches_page', methods=['GET'])
 def churches_page():
     search_query = request.args.get('search', '').strip()

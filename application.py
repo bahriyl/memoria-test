@@ -16,6 +16,10 @@ import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 import jwt
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 from flask import Flask, request, jsonify, abort, make_response, send_file, after_this_request
 from flask_cors import CORS
@@ -223,6 +227,7 @@ GEONAMES_USER = os.environ.get("GEONAMES_USER", "memoria")
 GEONAMES_LANG = "uk"
 LOCATION_READ_MODE = os.environ.get("LOCATION_READ_MODE", "hybrid").strip().lower() or "hybrid"
 LOCATION_WRITE_MODE = os.environ.get("LOCATION_WRITE_MODE", "dual").strip().lower() or "dual"
+LOCATION_ADMIN_STRICT_GEONAMES = os.environ.get("LOCATION_ADMIN_STRICT_GEONAMES", "0").strip().lower() or "0"
 
 
 def _location_read_mode():
@@ -252,8 +257,36 @@ def _location_write_is_canonical():
 def _location_write_is_dual():
     return _location_write_mode() == "dual"
 
+
+def _location_admin_strict_geonames_enabled():
+    return LOCATION_ADMIN_STRICT_GEONAMES in {"1", "true", "yes", "on"}
+
+
+def _location_has_geonames_area_and_geo(location):
+    normalized = normalize_location_core(location if isinstance(location, dict) else {})
+    area = normalized.get("area") if isinstance(normalized.get("area"), dict) else {}
+    geo = loc_parse_geo_point(normalized.get("geo"))
+    area_id = loc_clean_str(area.get("id"))
+    area_source = loc_clean_str(area.get("source")).lower()
+    return bool(area_id and area_source == "geonames" and geo)
+
+
+def _validate_admin_strict_location(field_name, location):
+    if not _location_has_geonames_area_and_geo(location):
+        abort(400, description=f"`{field_name}` must come from GeoNames suggestions (`area.id` + coordinates required)")
+
 try:
     liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    liturgies_collection.create_index([("paymentStatus", ASCENDING), ("churchName", ASCENDING), ("serviceDate", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    liturgies_collection.create_index([("paymentStatus", ASCENDING), ("createdAt", ASCENDING)])
 except Exception:
     pass
 
@@ -1412,8 +1445,12 @@ def _build_admin_cemetery_payload(data, partial=False):
         payload[key] = cleaned
 
     _validate_required_text('name', required=not partial)
-    if not partial and 'location' not in data:
-        _validate_required_text('locality', required=True)
+    if not partial:
+        if _location_admin_strict_geonames_enabled():
+            if 'location' not in data:
+                abort(400, description="`location` is required and must come from GeoNames suggestions")
+        elif 'location' not in data:
+            _validate_required_text('locality', required=True)
 
     location_payload = None
     if 'location' in data:
@@ -1421,7 +1458,9 @@ def _build_admin_cemetery_payload(data, partial=False):
         if raw_location is not None and not isinstance(raw_location, dict):
             abort(400, description="`location` must be an object")
         location_payload = normalize_location_core(raw_location or {})
-        if _location_write_is_canonical() or _location_write_is_dual():
+        if _location_admin_strict_geonames_enabled():
+            _validate_admin_strict_location('location', location_payload)
+        if _location_write_is_canonical() or _location_write_is_dual() or _location_admin_strict_geonames_enabled():
             payload['location'] = location_payload
 
     if 'addressLine' in data:
@@ -1492,7 +1531,7 @@ def _build_admin_cemetery_payload(data, partial=False):
             'area': {'display': legacy_locality or ''},
             'addressLine': legacy_address_line or '',
         })
-        if _location_write_is_canonical() or _location_write_is_dual():
+        if _location_write_is_canonical() or _location_write_is_dual() or _location_admin_strict_geonames_enabled():
             payload['location'] = location_payload
 
     if location_payload and (_location_write_is_legacy() or _location_write_is_dual()):
@@ -1894,8 +1933,12 @@ def _build_admin_church_payload(data, partial=False):
         payload[key] = cleaned
 
     _validate_required_text('name', required=not partial)
-    if not partial and 'location' not in data:
-        _validate_required_text('address', required=True)
+    if not partial:
+        if _location_admin_strict_geonames_enabled():
+            if 'location' not in data:
+                abort(400, description="`location` is required and must come from GeoNames suggestions")
+        elif 'location' not in data:
+            _validate_required_text('address', required=True)
 
     location_payload = None
     if 'location' in data:
@@ -1903,6 +1946,8 @@ def _build_admin_church_payload(data, partial=False):
         if raw_location is not None and not isinstance(raw_location, dict):
             abort(400, description="`location` must be an object")
         location_payload = normalize_location_core(raw_location or {})
+        if _location_admin_strict_geonames_enabled():
+            _validate_admin_strict_location('location', location_payload)
         if _location_write_is_canonical() or _location_write_is_dual():
             payload['location'] = location_payload
 
@@ -2100,6 +2145,717 @@ def admin_delete_church(church_id):
         abort(404, description='Church not found')
 
     return jsonify({'ok': True})
+
+
+ADMIN_NOTES_SUCCESS_PAYMENT_STATUSES = {'success', 'paid', 'completed'}
+ADMIN_NOTES_STATUS_QUEUED = 'На черзі'
+ADMIN_NOTES_STATUS_DONE = 'Відбулася'
+DEFAULT_ADMIN_NOTES_TIMEZONE = 'Europe/Kyiv'
+ADMIN_NOTES_WEEKDAY_LABELS = ['Нд', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб']
+ADMIN_NOTES_SUCCESS_QUERY_VALUES = sorted(
+    {status_variant for status in ADMIN_NOTES_SUCCESS_PAYMENT_STATUSES for status_variant in {
+        status,
+        status.upper(),
+        status.capitalize(),
+    }}
+)
+
+
+def _admin_notes_resolve_timezone(raw_timezone, fallback_reasons):
+    timezone_name = _clean_str(raw_timezone) or DEFAULT_ADMIN_NOTES_TIMEZONE
+    alias_map = {
+        'Europe/Kiev': 'Europe/Kyiv',
+    }
+    timezone_name = alias_map.get(timezone_name, timezone_name)
+
+    if ZoneInfo is None:
+        fallback_reasons.add('Таймзона ZoneInfo недоступна, використано UTC.')
+        return timezone.utc, 'UTC'
+
+    try:
+        return ZoneInfo(timezone_name), timezone_name
+    except Exception:
+        fallback_reasons.add(f'Некоректна таймзона "{timezone_name}", використано {DEFAULT_ADMIN_NOTES_TIMEZONE}.')
+        return ZoneInfo(DEFAULT_ADMIN_NOTES_TIMEZONE), DEFAULT_ADMIN_NOTES_TIMEZONE
+
+
+def _admin_notes_parse_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        normalized = cleaned.replace('Z', '+00:00')
+        try:
+            return datetime.fromisoformat(normalized)
+        except Exception:
+            return None
+    return None
+
+
+def _admin_notes_to_local_datetime(value, tzinfo):
+    dt_value = _admin_notes_parse_datetime(value)
+    if not dt_value:
+        return None
+    if dt_value.tzinfo is None:
+        return dt_value.replace(tzinfo=tzinfo)
+    try:
+        return dt_value.astimezone(tzinfo)
+    except Exception:
+        return dt_value.replace(tzinfo=tzinfo)
+
+
+def _admin_notes_format_ua_date(dt_value):
+    if not isinstance(dt_value, datetime):
+        return ''
+    return dt_value.strftime('%d.%m.%Y')
+
+
+def _admin_notes_parse_ua_date(value):
+    cleaned = _clean_str(value)
+    if not cleaned:
+        return None
+    match = re.match(r'^(\d{2})\.(\d{2})\.(\d{4})$', cleaned)
+    if not match:
+        return None
+    day = int(match.group(1))
+    month = int(match.group(2))
+    year = int(match.group(3))
+    try:
+        return datetime(year, month, day).date()
+    except Exception:
+        return None
+
+
+def _admin_notes_normalize_payment_status(value):
+    return _clean_str(value).lower()
+
+
+def _admin_notes_is_success_payment(value):
+    return _admin_notes_normalize_payment_status(value) in ADMIN_NOTES_SUCCESS_PAYMENT_STATUSES
+
+
+def _admin_notes_parse_hhmm(value):
+    cleaned = _clean_str(value)
+    if not cleaned:
+        return None
+    match = re.match(r'^(\d{1,2})[:.](\d{2})$', cleaned)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return hour, minute
+
+
+def _admin_notes_weekday_from_value(value):
+    try:
+        weekday = int(str(value).strip())
+    except Exception:
+        return None
+    if weekday < 0 or weekday > 6:
+        return None
+    return weekday
+
+
+def _admin_notes_end_times_by_weekday(church_doc):
+    out = {}
+    if not isinstance(church_doc, dict):
+        return out
+
+    church_days = church_doc.get('churchDays')
+    if isinstance(church_days, dict):
+        liturgy_by_weekday = church_days.get('liturgyByWeekday')
+        if isinstance(liturgy_by_weekday, dict):
+            for weekday_raw, time_raw in liturgy_by_weekday.items():
+                weekday = _admin_notes_weekday_from_value(weekday_raw)
+                parsed_time = _admin_notes_parse_hhmm(time_raw)
+                if weekday is None or not parsed_time:
+                    continue
+                out[weekday] = parsed_time
+
+    legacy_times = church_doc.get('liturgyEndTimes')
+    if isinstance(legacy_times, dict):
+        for legacy_key, weekday in LITURGY_KEY_TO_WEEKDAY.items():
+            if weekday in out:
+                continue
+            parsed_time = _admin_notes_parse_hhmm(legacy_times.get(legacy_key))
+            if parsed_time:
+                out[weekday] = parsed_time
+
+    return out
+
+
+def _admin_notes_resolve_status(service_local_dt, church_doc, now_local_dt, fallback_reasons):
+    if not isinstance(service_local_dt, datetime):
+        fallback_reasons.add('Для частини записок відсутня дата служби, статус встановлено "На черзі".')
+        return ADMIN_NOTES_STATUS_QUEUED
+
+    service_date = service_local_dt.date()
+    today = now_local_dt.date()
+    if service_date < today:
+        return ADMIN_NOTES_STATUS_DONE
+    if service_date > today:
+        return ADMIN_NOTES_STATUS_QUEUED
+
+    if not isinstance(church_doc, dict):
+        fallback_reasons.add('Для частини записок не знайдено церкву, статус залишено "На черзі".')
+        return ADMIN_NOTES_STATUS_QUEUED
+
+    sunday_first_weekday = (service_date.weekday() + 1) % 7
+    end_time_by_weekday = _admin_notes_end_times_by_weekday(church_doc)
+    end_time = end_time_by_weekday.get(sunday_first_weekday)
+    if not end_time:
+        fallback_reasons.add('Для частини церков не налаштовано час завершення літургії, статус залишено "На черзі".')
+        return ADMIN_NOTES_STATUS_QUEUED
+
+    now_minutes = now_local_dt.hour * 60 + now_local_dt.minute
+    end_minutes = end_time[0] * 60 + end_time[1]
+    return ADMIN_NOTES_STATUS_DONE if now_minutes >= end_minutes else ADMIN_NOTES_STATUS_QUEUED
+
+
+def _admin_notes_church_display(church_doc):
+    name = _clean_str(church_doc.get('name'))
+    location = church_doc.get('location')
+    location_display = ''
+    if isinstance(location, dict):
+        location_display = _clean_str(location.get('display'))
+    address = _clean_str(church_doc.get('address') or church_doc.get('locality') or location_display)
+    return {
+        'id': str(church_doc.get('_id')),
+        'name': name,
+        'address': address,
+    }
+
+
+def _admin_notes_build_church_maps():
+    projection = {
+        'name': 1,
+        'address': 1,
+        'locality': 1,
+        'location': 1,
+        'churchDays': 1,
+        'liturgyEndTimes': 1,
+    }
+    church_docs = list(churches_collection.find({}, projection).sort([('name', 1), ('_id', 1)]))
+
+    by_id = {}
+    by_name = {}
+    rows = []
+    rows_by_id = {}
+    for church_doc in church_docs:
+        church_id = str(church_doc.get('_id'))
+        church_display = _admin_notes_church_display(church_doc)
+        rows.append({
+            'id': church_display['id'],
+            'name': church_display['name'],
+            'address': church_display['address'],
+            'queued': 0,
+            'placedToday': 0,
+            'sentToday': 0,
+        })
+        rows_by_id[church_id] = rows[-1]
+        by_id[church_id] = church_doc
+
+        normalized_name = _clean_str(church_display['name']).casefold()
+        if normalized_name and normalized_name not in by_name:
+            by_name[normalized_name] = church_doc
+
+    return church_docs, by_id, by_name, rows, rows_by_id
+
+
+def _admin_notes_resolve_church_for_liturgy(liturgy_doc, church_by_id, church_by_name):
+    raw_church_id = _clean_str(liturgy_doc.get('churchId'))
+    if raw_church_id and raw_church_id in church_by_id:
+        return church_by_id[raw_church_id]
+
+    raw_church_name = _clean_str(liturgy_doc.get('churchName'))
+    if raw_church_name:
+        return church_by_name.get(raw_church_name.casefold())
+
+    return None
+
+
+def _admin_notes_format_donation(value):
+    if value is None or value == '':
+        return '-'
+
+    if isinstance(value, bool):
+        return '-'
+
+    if isinstance(value, (int, float)):
+        amount = int(value) if float(value).is_integer() else round(float(value), 2)
+        return f'{amount} грн'
+
+    cleaned = _clean_str(value)
+    if not cleaned:
+        return '-'
+    if 'грн' in cleaned.lower():
+        return cleaned
+    return f'{cleaned} грн'
+
+
+def _admin_notes_extract_person_oid(liturgy_doc):
+    person_value = liturgy_doc.get('person')
+    if isinstance(person_value, ObjectId):
+        return person_value
+
+    if isinstance(person_value, str):
+        cleaned_person = person_value.strip()
+        if cleaned_person:
+            try:
+                return ObjectId(cleaned_person)
+            except Exception:
+                return None
+
+    person_id_value = liturgy_doc.get('personId')
+    if isinstance(person_id_value, str):
+        cleaned_person_id = person_id_value.strip()
+        if cleaned_person_id:
+            try:
+                return ObjectId(cleaned_person_id)
+            except Exception:
+                return None
+
+    return None
+
+
+def _admin_notes_build_lifespan(person_doc):
+    if not isinstance(person_doc, dict):
+        return ''
+    birth_year = _clean_str(person_doc.get('birthYear'))
+    death_year = _clean_str(person_doc.get('deathYear'))
+    if birth_year and death_year:
+        return f'{birth_year}-{death_year}'
+    if birth_year:
+        return f'{birth_year}-'
+    if death_year:
+        return f'-{death_year}'
+    return ''
+
+
+def _admin_notes_matches_search(search_query, values):
+    if not search_query:
+        return True
+    haystack = ' '.join(_clean_str(value).casefold() for value in values)
+    return search_query in haystack
+
+
+@application.route('/api/admin/notes/overview', methods=['GET'])
+def admin_notes_overview():
+    search = _clean_str(request.args.get('search')).casefold()
+    fallback_reasons = set()
+    timezone_value = _clean_str(request.args.get('timezone'))
+    tzinfo, resolved_timezone = _admin_notes_resolve_timezone(timezone_value, fallback_reasons)
+    now_local = datetime.now(tzinfo)
+    today = now_local.date()
+
+    _, church_by_id, church_by_name, church_rows, church_rows_by_id = _admin_notes_build_church_maps()
+
+    projection = {
+        '_id': 1,
+        'churchId': 1,
+        'churchName': 1,
+        'serviceDate': 1,
+        'createdAt': 1,
+        'paymentStatus': 1,
+    }
+    liturgy_cursor = liturgies_collection.find(
+        {'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}},
+        projection,
+    )
+
+    kpi = {
+        'queued': 0,
+        'placedToday': 0,
+        'sentToday': 0,
+    }
+
+    for liturgy_doc in liturgy_cursor:
+        if not _admin_notes_is_success_payment(liturgy_doc.get('paymentStatus')):
+            continue
+
+        church_doc = _admin_notes_resolve_church_for_liturgy(liturgy_doc, church_by_id, church_by_name)
+        church_row = None
+        if church_doc:
+            church_row = church_rows_by_id.get(str(church_doc.get('_id')))
+
+        service_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('serviceDate'), tzinfo)
+        created_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('createdAt'), tzinfo)
+        status = _admin_notes_resolve_status(service_local_dt, church_doc, now_local, fallback_reasons)
+
+        if status == ADMIN_NOTES_STATUS_QUEUED:
+            kpi['queued'] += 1
+            if church_row:
+                church_row['queued'] += 1
+
+        if isinstance(service_local_dt, datetime) and service_local_dt.date() == today:
+            kpi['placedToday'] += 1
+            if church_row:
+                church_row['placedToday'] += 1
+
+        if isinstance(created_local_dt, datetime) and created_local_dt.date() == today:
+            kpi['sentToday'] += 1
+            if church_row:
+                church_row['sentToday'] += 1
+
+    if search:
+        filtered_church_rows = [
+            row for row in church_rows
+            if _admin_notes_matches_search(search, [row.get('name'), row.get('address')])
+        ]
+    else:
+        filtered_church_rows = church_rows
+
+    return jsonify({
+        'kpi': kpi,
+        'churches': filtered_church_rows,
+        'meta': {
+            'timezone': resolved_timezone,
+            'isFallback': bool(fallback_reasons),
+            'fallbackReason': sorted(fallback_reasons),
+        },
+    })
+
+
+@application.route('/api/admin/notes/graph', methods=['GET'])
+def admin_notes_graph():
+    period = _clean_str(request.args.get('period')).lower() or 'month'
+    if period not in {'day', 'week', 'month'}:
+        abort(400, description='`period` must be one of: day, week, month')
+
+    search = _clean_str(request.args.get('search')).casefold()
+    fallback_reasons = set()
+    timezone_value = _clean_str(request.args.get('timezone'))
+    tzinfo, resolved_timezone = _admin_notes_resolve_timezone(timezone_value, fallback_reasons)
+    now_local = datetime.now(tzinfo)
+
+    _, church_by_id, church_by_name, _, _ = _admin_notes_build_church_maps()
+
+    points = []
+    if period == 'day':
+        labels = [f'{hour:02d}:00' for hour in range(0, 24, 3)]
+        counts = [0 for _ in labels]
+        today = now_local.date()
+
+        projection = {
+            'churchId': 1,
+            'churchName': 1,
+            'personName': 1,
+            'phone': 1,
+            'createdAt': 1,
+            'serviceDate': 1,
+            'paymentStatus': 1,
+        }
+        liturgy_cursor = liturgies_collection.find({'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}}, projection)
+        for liturgy_doc in liturgy_cursor:
+            if not _admin_notes_is_success_payment(liturgy_doc.get('paymentStatus')):
+                continue
+
+            church_doc = _admin_notes_resolve_church_for_liturgy(liturgy_doc, church_by_id, church_by_name)
+            church_address = _admin_notes_church_display(church_doc).get('address') if church_doc else ''
+            if not _admin_notes_matches_search(search, [
+                liturgy_doc.get('churchName'),
+                liturgy_doc.get('personName'),
+                liturgy_doc.get('phone'),
+                church_address,
+            ]):
+                continue
+
+            event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('createdAt'), tzinfo)
+            if not event_local_dt:
+                event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('serviceDate'), tzinfo)
+                if event_local_dt:
+                    fallback_reasons.add('Для частини точок графіка відсутній createdAt, використано serviceDate.')
+            if not event_local_dt or event_local_dt.date() != today:
+                continue
+
+            bucket = min(event_local_dt.hour // 3, len(counts) - 1)
+            counts[bucket] += 1
+
+        points = [{'label': labels[index], 'value': counts[index]} for index in range(len(labels))]
+
+    elif period == 'week':
+        day_list = [now_local.date() - timedelta(days=delta) for delta in range(6, -1, -1)]
+        index_by_day = {day: index for index, day in enumerate(day_list)}
+        labels = [ADMIN_NOTES_WEEKDAY_LABELS[(day.weekday() + 1) % 7] for day in day_list]
+        counts = [0 for _ in day_list]
+
+        projection = {
+            'churchId': 1,
+            'churchName': 1,
+            'personName': 1,
+            'phone': 1,
+            'createdAt': 1,
+            'serviceDate': 1,
+            'paymentStatus': 1,
+        }
+        liturgy_cursor = liturgies_collection.find({'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}}, projection)
+        for liturgy_doc in liturgy_cursor:
+            if not _admin_notes_is_success_payment(liturgy_doc.get('paymentStatus')):
+                continue
+
+            church_doc = _admin_notes_resolve_church_for_liturgy(liturgy_doc, church_by_id, church_by_name)
+            church_address = _admin_notes_church_display(church_doc).get('address') if church_doc else ''
+            if not _admin_notes_matches_search(search, [
+                liturgy_doc.get('churchName'),
+                liturgy_doc.get('personName'),
+                liturgy_doc.get('phone'),
+                church_address,
+            ]):
+                continue
+
+            event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('createdAt'), tzinfo)
+            if not event_local_dt:
+                event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('serviceDate'), tzinfo)
+                if event_local_dt:
+                    fallback_reasons.add('Для частини точок графіка відсутній createdAt, використано serviceDate.')
+            if not event_local_dt:
+                continue
+
+            event_day = event_local_dt.date()
+            if event_day not in index_by_day:
+                continue
+            counts[index_by_day[event_day]] += 1
+
+        points = [{'label': labels[index], 'value': counts[index]} for index in range(len(labels))]
+
+    else:
+        day_list = [now_local.date() - timedelta(days=delta) for delta in range(29, -1, -1)]
+        index_by_day = {day: index for index, day in enumerate(day_list)}
+        labels = [day.strftime('%d.%m') for day in day_list]
+        counts = [0 for _ in day_list]
+
+        projection = {
+            'churchId': 1,
+            'churchName': 1,
+            'personName': 1,
+            'phone': 1,
+            'createdAt': 1,
+            'serviceDate': 1,
+            'paymentStatus': 1,
+        }
+        liturgy_cursor = liturgies_collection.find({'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}}, projection)
+        for liturgy_doc in liturgy_cursor:
+            if not _admin_notes_is_success_payment(liturgy_doc.get('paymentStatus')):
+                continue
+
+            church_doc = _admin_notes_resolve_church_for_liturgy(liturgy_doc, church_by_id, church_by_name)
+            church_address = _admin_notes_church_display(church_doc).get('address') if church_doc else ''
+            if not _admin_notes_matches_search(search, [
+                liturgy_doc.get('churchName'),
+                liturgy_doc.get('personName'),
+                liturgy_doc.get('phone'),
+                church_address,
+            ]):
+                continue
+
+            event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('createdAt'), tzinfo)
+            if not event_local_dt:
+                event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('serviceDate'), tzinfo)
+                if event_local_dt:
+                    fallback_reasons.add('Для частини точок графіка відсутній createdAt, використано serviceDate.')
+            if not event_local_dt:
+                continue
+
+            event_day = event_local_dt.date()
+            if event_day not in index_by_day:
+                continue
+            counts[index_by_day[event_day]] += 1
+
+        points = [{'label': labels[index], 'value': counts[index]} for index in range(len(labels))]
+
+    return jsonify({
+        'period': period,
+        'points': points,
+        'meta': {
+            'timezone': resolved_timezone,
+            'isFallback': bool(fallback_reasons),
+            'fallbackReason': sorted(fallback_reasons),
+        },
+    })
+
+
+@application.route('/api/admin/notes/church-details', methods=['GET'])
+def admin_notes_church_details():
+    raw_church_id = _clean_str(request.args.get('churchId'))
+    if not raw_church_id:
+        abort(400, description='`churchId` is required')
+
+    try:
+        church_oid = ObjectId(raw_church_id)
+    except Exception:
+        abort(400, description='Invalid `churchId`')
+
+    search = _clean_str(request.args.get('search')).casefold()
+    date_from_raw = _clean_str(request.args.get('dateFrom'))
+    date_to_raw = _clean_str(request.args.get('dateTo'))
+    offset_raw = _clean_str(request.args.get('offset'))
+    limit_raw = _clean_str(request.args.get('limit'))
+
+    date_from = _admin_notes_parse_ua_date(date_from_raw) if date_from_raw else None
+    date_to = _admin_notes_parse_ua_date(date_to_raw) if date_to_raw else None
+    if date_from_raw and date_from is None:
+        abort(400, description='`dateFrom` must be in format DD.MM.YYYY')
+    if date_to_raw and date_to is None:
+        abort(400, description='`dateTo` must be in format DD.MM.YYYY')
+    if date_from and date_to and date_from > date_to:
+        abort(400, description='`dateFrom` must be less or equal to `dateTo`')
+
+    try:
+        offset = int(offset_raw) if offset_raw else 0
+    except Exception:
+        abort(400, description='`offset` must be an integer')
+    try:
+        limit = int(limit_raw) if limit_raw else 200
+    except Exception:
+        abort(400, description='`limit` must be an integer')
+
+    if offset < 0:
+        abort(400, description='`offset` must be >= 0')
+    if limit <= 0:
+        abort(400, description='`limit` must be > 0')
+    if limit > 500:
+        limit = 500
+
+    fallback_reasons = set()
+    timezone_value = _clean_str(request.args.get('timezone'))
+    tzinfo, resolved_timezone = _admin_notes_resolve_timezone(timezone_value, fallback_reasons)
+    now_local = datetime.now(tzinfo)
+
+    church_projection = {
+        'name': 1,
+        'address': 1,
+        'locality': 1,
+        'location': 1,
+        'churchDays': 1,
+        'liturgyEndTimes': 1,
+    }
+    church_doc = churches_collection.find_one({'_id': church_oid}, church_projection)
+    if not church_doc:
+        abort(404, description='Church not found')
+
+    church_display = _admin_notes_church_display(church_doc)
+    church_name = church_display.get('name')
+    if not church_name:
+        fallback_reasons.add('Для обраної церкви відсутня назва, результати можуть бути неповними.')
+
+    match_by_name = {'$regex': f'^{re.escape(church_name)}$', '$options': 'i'} if church_name else None
+    liturgy_query = {
+        'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES},
+    }
+    if match_by_name:
+        liturgy_query['$or'] = [
+            {'churchName': match_by_name},
+            {'churchId': raw_church_id},
+        ]
+    else:
+        liturgy_query['churchId'] = raw_church_id
+
+    projection = {
+        '_id': 1,
+        'person': 1,
+        'personId': 1,
+        'personName': 1,
+        'price': 1,
+        'phone': 1,
+        'serviceDate': 1,
+        'createdAt': 1,
+        'paymentStatus': 1,
+        'churchName': 1,
+        'churchId': 1,
+    }
+    liturgy_docs = list(
+        liturgies_collection.find(liturgy_query, projection).sort([('serviceDate', ASCENDING), ('createdAt', ASCENDING), ('_id', ASCENDING)])
+    )
+
+    person_oids = []
+    seen_person_ids = set()
+    for liturgy_doc in liturgy_docs:
+        person_oid = _admin_notes_extract_person_oid(liturgy_doc)
+        if not person_oid:
+            continue
+        person_oid_key = str(person_oid)
+        if person_oid_key in seen_person_ids:
+            continue
+        seen_person_ids.add(person_oid_key)
+        person_oids.append(person_oid)
+
+    people_by_id = {}
+    if person_oids:
+        for person_doc in people_collection.find(
+            {'_id': {'$in': person_oids}},
+            {'name': 1, 'birthYear': 1, 'deathYear': 1, 'avatarUrl': 1}
+        ):
+            people_by_id[str(person_doc.get('_id'))] = person_doc
+
+    rows = []
+    for liturgy_doc in liturgy_docs:
+        if not _admin_notes_is_success_payment(liturgy_doc.get('paymentStatus')):
+            continue
+
+        service_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('serviceDate'), tzinfo)
+        created_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('createdAt'), tzinfo)
+
+        service_day = service_local_dt.date() if isinstance(service_local_dt, datetime) else None
+        if date_from and service_day and service_day < date_from:
+            continue
+        if date_to and service_day and service_day > date_to:
+            continue
+        if (date_from or date_to) and service_day is None:
+            fallback_reasons.add('Для частини записок неможливо застосувати фільтр періоду через відсутню дату служби.')
+
+        person_oid = _admin_notes_extract_person_oid(liturgy_doc)
+        person_doc = people_by_id.get(str(person_oid)) if person_oid else None
+        if person_oid and not person_doc:
+            fallback_reasons.add('Для частини записок відсутній профіль особи, використано дані літургії.')
+
+        person_name = _clean_str(person_doc.get('name')) if isinstance(person_doc, dict) else ''
+        if not person_name:
+            person_name = _clean_str(liturgy_doc.get('personName')) or 'Невідома особа'
+
+        donation_label = _admin_notes_format_donation(liturgy_doc.get('price'))
+        phone = _clean_str(liturgy_doc.get('phone'))
+        status_label = _admin_notes_resolve_status(service_local_dt, church_doc, now_local, fallback_reasons)
+        note_date_label = _admin_notes_format_ua_date(service_local_dt)
+        created_date_label = _admin_notes_format_ua_date(created_local_dt)
+
+        if not _admin_notes_matches_search(search, [person_name, phone, donation_label]):
+            continue
+
+        rows.append({
+            'id': str(liturgy_doc.get('_id')),
+            'person': person_name,
+            'lifespan': _admin_notes_build_lifespan(person_doc),
+            'donation': donation_label,
+            'phone': phone,
+            'noteDate': note_date_label,
+            'createdAt': created_date_label,
+            'status': status_label,
+            'avatarUrl': _clean_str(person_doc.get('avatarUrl')) if isinstance(person_doc, dict) else '',
+        })
+
+    total_rows = len(rows)
+    paged_rows = rows[offset: offset + limit]
+
+    return jsonify({
+        'church': {
+            'id': church_display.get('id'),
+            'name': church_display.get('name'),
+            'address': church_display.get('address'),
+        },
+        'rows': paged_rows,
+        'total': total_rows,
+        'offset': offset,
+        'limit': limit,
+        'meta': {
+            'timezone': resolved_timezone,
+            'isFallback': bool(fallback_reasons),
+            'fallbackReason': sorted(fallback_reasons),
+        },
+    })
 
 
 ADMIN_RITUAL_SERVICE_STATUSES = {'Активний', 'Не активний'}
@@ -2428,6 +3184,8 @@ def _build_admin_ritual_service_payload(data, partial=False):
         name = _clean_str(data.get('name'))
         if not name:
             abort(400, description='`name` is required')
+        if _location_admin_strict_geonames_enabled() and 'hqLocation' not in data:
+            abort(400, description="`hqLocation` is required and must come from GeoNames suggestions")
 
     if 'name' in data:
         name = _clean_str(data.get('name'))
@@ -2469,7 +3227,9 @@ def _build_admin_ritual_service_payload(data, partial=False):
         if data.get('hqLocation') is not None and not isinstance(data.get('hqLocation'), dict):
             abort(400, description='`hqLocation` must be an object')
         hq_location = normalize_location_core(data.get('hqLocation') or {})
-        if _location_write_is_canonical() or _location_write_is_dual():
+        if _location_admin_strict_geonames_enabled():
+            _validate_admin_strict_location('hqLocation', hq_location)
+        if _location_write_is_canonical() or _location_write_is_dual() or _location_admin_strict_geonames_enabled():
             payload['hqLocation'] = hq_location
         if _location_write_is_legacy() or _location_write_is_dual():
             legacy = ritual_location_to_legacy(hq_location, current_doc={'address': payload.get('address', [])})

@@ -9,6 +9,7 @@ from location_mapper import normalize_cemetery_location
 from location_schema import clean_str, normalize_area_ref, normalize_location_core, parse_float, parse_geo_point
 
 _SETTLEMENT_TYPES = {"city", "town", "village", "hamlet", "municipality"}
+_DEFAULT_GEOCODING_USER_AGENT = "memoria-geocoder/1.0 (+https://memoria.com.ua)"
 
 _QUERY_CACHE = {}
 _QUERY_CACHE_LOCK = threading.Lock()
@@ -198,16 +199,31 @@ def _http_get_json(url, params=None, headers=None, timeout=5, retries=1):
     return None
 
 
+def _resolve_user_agent(user_agent):
+    return clean_str(user_agent) or _DEFAULT_GEOCODING_USER_AGENT
+
+
 def _photon_request(base_url, params, user_agent="", timeout=5, retries=1):
     base = clean_str(base_url).rstrip("/")
     if not base:
         return None
-    headers = {}
-    ua = clean_str(user_agent)
-    if ua:
-        headers["User-Agent"] = ua
+    headers = {"User-Agent": _resolve_user_agent(user_agent)}
     url = f"{base}/api"
-    return _http_get_json(url, params=params, headers=headers, timeout=timeout, retries=retries)
+    query = dict(params or {})
+    payload = _http_get_json(url, params=query, headers=headers, timeout=timeout, retries=retries)
+
+    # Public Photon rejects unsupported `lang` values (e.g. `uk`) with an error payload.
+    # Retry once without language to preserve availability.
+    if query.get("lang") and (
+        payload is None or (isinstance(payload, dict) and isinstance(payload.get("lang"), list))
+    ):
+        fallback_query = dict(query)
+        fallback_query.pop("lang", None)
+        fallback_payload = _http_get_json(url, params=fallback_query, headers=headers, timeout=timeout, retries=retries)
+        if fallback_payload is not None:
+            return fallback_payload
+
+    return payload
 
 
 def _nominatim_request(base_url, path, params, user_agent="", language="", timeout=5, retries=1):
@@ -215,10 +231,7 @@ def _nominatim_request(base_url, path, params, user_agent="", language="", timeo
     if not base:
         return None
 
-    headers = {}
-    ua = clean_str(user_agent)
-    if ua:
-        headers["User-Agent"] = ua
+    headers = {"User-Agent": _resolve_user_agent(user_agent)}
 
     query = dict(params or {})
     query.setdefault("format", "jsonv2")

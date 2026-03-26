@@ -56,6 +56,7 @@ from location_service import (
     cemetery_option_from_doc,
     filter_docs_by_radius,
     normalize_location_input,
+    reverse_geocode_location,
     search_location_addresses,
     search_location_areas,
 )
@@ -224,11 +225,16 @@ ALLOWED_UPDATE_FIELDS = {
     "burial",
 }
 
-GEONAMES_USER = os.environ.get("GEONAMES_USER", "memoria")
-GEONAMES_LANG = "uk"
-LOCATION_PROVIDER = os.environ.get("LOCATION_PROVIDER", "locationiq").strip().lower() or "locationiq"
-LOCATIONIQ_API_KEY = os.environ.get("LOCATIONIQ_API_KEY", "").strip()
-LOCATIONIQ_REGION = os.environ.get("LOCATIONIQ_REGION", "eu1").strip().lower() or "eu1"
+PHOTON_BASE_URL = os.environ.get("PHOTON_BASE_URL", "https://photon.komoot.io").strip()
+NOMINATIM_BASE_URL = os.environ.get("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org").strip()
+GEOCODING_USER_AGENT = os.environ.get(
+    "GEOCODING_USER_AGENT",
+    "memoria-geocoder/1.0 (+https://memoria.com.ua)",
+).strip()
+try:
+    GEOCODING_TIMEOUT_MS = max(int(os.environ.get("GEOCODING_TIMEOUT_MS", "5000").strip() or "5000"), 1000)
+except Exception:
+    GEOCODING_TIMEOUT_MS = 5000
 LOCATION_COUNTRY_CODES = os.environ.get("LOCATION_COUNTRY_CODES", "UA").strip() or "UA"
 LOCATION_ACCEPT_LANGUAGE = os.environ.get("LOCATION_ACCEPT_LANGUAGE", "uk").strip() or "uk"
 LOCATION_READ_MODE = os.environ.get("LOCATION_READ_MODE", "hybrid").strip().lower() or "hybrid"
@@ -276,7 +282,17 @@ def _location_has_provider_area_and_geo(location):
     geo = loc_parse_geo_point(normalized.get("geo"))
     area_id = loc_clean_str(area.get("id"))
     area_source = loc_clean_str(area.get("source")).lower()
-    return bool(area_id and area_source in {"geonames", "locationiq"} and geo)
+    return bool(area_id and area_source in {"photon", "nominatim"} and geo)
+
+
+def _location_has_address_place_and_street_house(location):
+    normalized = normalize_location_core(location if isinstance(location, dict) else {})
+    address = normalized.get("address") if isinstance(normalized.get("address"), dict) else {}
+    address_display = loc_clean_str(address.get("display"))
+    place_id = loc_clean_str(address.get("placeId"))
+    road = loc_clean_str(address.get("road"))
+    house_number = loc_clean_str(address.get("houseNumber") or address.get("house_number"))
+    return bool(address_display and place_id and road and house_number)
 
 
 def _location_has_geonames_area_and_geo(location):
@@ -287,6 +303,8 @@ def _location_has_geonames_area_and_geo(location):
 def _validate_admin_strict_location(field_name, location):
     if not _location_has_provider_area_and_geo(location):
         abort(400, description=f"`{field_name}` must come from provider suggestions (`area.id` + coordinates required)")
+    if not _location_has_address_place_and_street_house(location):
+        abort(400, description=f"`{field_name}.address` must include suggestion-backed `placeId`, `road`, and `house_number`")
 
 try:
     liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
@@ -3542,13 +3560,12 @@ def locations():
     return jsonify(
         search_location_areas(
             search,
-            provider=LOCATION_PROVIDER,
-            locationiq_api_key=LOCATIONIQ_API_KEY,
-            locationiq_region=LOCATIONIQ_REGION,
-            locationiq_language=LOCATION_ACCEPT_LANGUAGE,
+            photon_base_url=PHOTON_BASE_URL,
+            nominatim_base_url=NOMINATIM_BASE_URL,
+            user_agent=GEOCODING_USER_AGENT,
+            language=LOCATION_ACCEPT_LANGUAGE,
             country_codes=LOCATION_COUNTRY_CODES,
-            geonames_user=GEONAMES_USER,
-            geonames_lang=GEONAMES_LANG,
+            timeout_ms=GEOCODING_TIMEOUT_MS,
             max_rows=10,
         )
     )
@@ -3624,13 +3641,12 @@ def location_areas():
         return jsonify({"total": 0, "items": []})
     items = search_location_areas(
         search,
-        provider=LOCATION_PROVIDER,
-        locationiq_api_key=LOCATIONIQ_API_KEY,
-        locationiq_region=LOCATIONIQ_REGION,
-        locationiq_language=LOCATION_ACCEPT_LANGUAGE,
+        photon_base_url=PHOTON_BASE_URL,
+        nominatim_base_url=NOMINATIM_BASE_URL,
+        user_agent=GEOCODING_USER_AGENT,
+        language=LOCATION_ACCEPT_LANGUAGE,
         country_codes=LOCATION_COUNTRY_CODES,
-        geonames_user=GEONAMES_USER,
-        geonames_lang=GEONAMES_LANG,
+        timeout_ms=GEOCODING_TIMEOUT_MS,
         max_rows=10,
     )
     return jsonify({"total": len(items), "items": items})
@@ -3639,18 +3655,21 @@ def location_areas():
 @application.route('/api/location/addresses', methods=['GET'])
 def location_addresses():
     search = request.args.get('search', '').strip()
+    area_id = request.args.get('areaId', '').strip()
+    city = request.args.get('city', '').strip()
     if not search:
         return jsonify({"total": 0, "items": []})
     items = search_location_addresses(
         search,
-        provider=LOCATION_PROVIDER,
-        locationiq_api_key=LOCATIONIQ_API_KEY,
-        locationiq_region=LOCATIONIQ_REGION,
-        locationiq_language=LOCATION_ACCEPT_LANGUAGE,
+        photon_base_url=PHOTON_BASE_URL,
+        nominatim_base_url=NOMINATIM_BASE_URL,
+        user_agent=GEOCODING_USER_AGENT,
+        language=LOCATION_ACCEPT_LANGUAGE,
         country_codes=LOCATION_COUNTRY_CODES,
-        geonames_user=GEONAMES_USER,
-        geonames_lang=GEONAMES_LANG,
+        timeout_ms=GEOCODING_TIMEOUT_MS,
         max_rows=20,
+        area_id=area_id,
+        city=city,
     )
     return jsonify({"total": len(items), "items": items})
 
@@ -3667,7 +3686,34 @@ def location_cemeteries():
 @application.route('/api/location/normalize', methods=['POST'])
 def location_normalize():
     payload = request.get_json(silent=True) or {}
-    location = normalize_location_input(payload)
+    location = normalize_location_input(
+        payload,
+        photon_base_url=PHOTON_BASE_URL,
+        nominatim_base_url=NOMINATIM_BASE_URL,
+        user_agent=GEOCODING_USER_AGENT,
+        language=LOCATION_ACCEPT_LANGUAGE,
+        country_codes=LOCATION_COUNTRY_CODES,
+        timeout_ms=GEOCODING_TIMEOUT_MS,
+    )
+    return jsonify({"location": location})
+
+
+@application.route('/api/location/reverse', methods=['GET'])
+def location_reverse():
+    lat = request.args.get('lat')
+    lng = request.args.get('lng')
+    location = reverse_geocode_location(
+        lat=lat,
+        lng=lng,
+        photon_base_url=PHOTON_BASE_URL,
+        nominatim_base_url=NOMINATIM_BASE_URL,
+        user_agent=GEOCODING_USER_AGENT,
+        language=LOCATION_ACCEPT_LANGUAGE,
+        country_codes=LOCATION_COUNTRY_CODES,
+        timeout_ms=GEOCODING_TIMEOUT_MS,
+    )
+    if not location:
+        return jsonify({"location": normalize_location_core({})})
     return jsonify({"location": location})
 
 

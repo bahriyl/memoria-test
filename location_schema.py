@@ -110,7 +110,7 @@ def normalize_area_ref(raw):
         if re.match(r"^\d+$", area_id):
             inferred_source = "geonames"
         elif re.match(r"^(node|way|relation):\d+$", area_id, flags=re.IGNORECASE):
-            inferred_source = "locationiq"
+            inferred_source = "photon"
     source = clean_str(raw.get("source") or inferred_source) or "manual"
 
     if not any([area_id, city, region, display]):
@@ -146,6 +146,12 @@ def normalize_address_ref(raw):
     display = clean_str(raw.get("display") or raw_text)
     place_id = clean_str(raw.get("placeId") or raw.get("id")) or None
     provider = clean_str(raw.get("provider") or "manual") or "manual"
+    road = clean_str(raw.get("road") or raw.get("street") or raw.get("pedestrian"))
+    house_number = clean_str(raw.get("houseNumber") or raw.get("house_number") or raw.get("housenumber"))
+    city = clean_str(raw.get("city") or raw.get("town") or raw.get("village") or raw.get("municipality"))
+    region = clean_str(raw.get("region") or raw.get("state") or raw.get("county"))
+    postcode = clean_str(raw.get("postcode"))
+    country_code = clean_str(raw.get("countryCode") or raw.get("country_code") or raw.get("country"))
 
     if not raw_text and not display:
         return None
@@ -155,6 +161,13 @@ def normalize_address_ref(raw):
         "display": display or raw_text,
         "placeId": place_id,
         "provider": provider,
+        "road": road,
+        "houseNumber": house_number,
+        "house_number": house_number,
+        "city": city,
+        "region": region,
+        "postcode": postcode,
+        "countryCode": country_code,
     }
 
 

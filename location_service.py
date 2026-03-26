@@ -37,9 +37,26 @@ def _to_osm_ref(osm_type, osm_id):
     item_id = clean_str(osm_id)
     if not item_type or not item_id:
         return ""
+
+    # Photon/Nominatim can return short types (N/W/R).
+    short_map = {"n": "node", "w": "way", "r": "relation"}
+    if item_type in short_map:
+        item_type = short_map[item_type]
+
     if item_type not in {"node", "way", "relation"}:
         return ""
     return f"{item_type}:{item_id}"
+
+
+def _parse_osm_ref(value):
+    raw = clean_str(value)
+    match = re.match(r"^(node|way|relation):(\d+)$", raw, flags=re.IGNORECASE)
+    if not match:
+        return None, None, ""
+    item_type = match.group(1).lower()
+    item_id = match.group(2)
+    nominatim_type = {"node": "N", "way": "W", "relation": "R"}.get(item_type, "")
+    return item_type, item_id, nominatim_type
 
 
 def _infer_area_source(area_id):
@@ -49,7 +66,7 @@ def _infer_area_source(area_id):
     if re.match(r"^\d+$", value):
         return "geonames"
     if re.match(r"^(node|way|relation):\d+$", value, flags=re.IGNORECASE):
-        return "locationiq"
+        return "photon"
     return "manual"
 
 
@@ -94,11 +111,31 @@ def _extract_country_code(address, default_country="UA"):
     return default_clean.upper() if default_clean else "UA"
 
 
+def _extract_road(address):
+    if not isinstance(address, dict):
+        return ""
+    for key in ("road", "street", "pedestrian", "residential", "footway", "path"):
+        value = clean_str(address.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _extract_house_number(address):
+    if not isinstance(address, dict):
+        return ""
+    for key in ("house_number", "houseNumber", "housenumber"):
+        value = clean_str(address.get(key))
+        if value:
+            return value
+    return ""
+
+
 def _display_country_name(country_code):
     return "Україна" if clean_str(country_code).upper() == "UA" else clean_str(country_code).upper()
 
 
-def _build_area_ref(city, region, country_code, area_id, source="locationiq"):
+def _build_area_ref(city, region, country_code, area_id, source="photon"):
     return normalize_area_ref({
         "id": area_id,
         "source": source,
@@ -119,15 +156,15 @@ def _build_area_ref(city, region, country_code, area_id, source="locationiq"):
     })
 
 
-def _to_country_codes_param(country_codes):
+def _to_country_codes(country_codes):
     if isinstance(country_codes, str):
-        values = [part.strip().lower() for part in country_codes.split(",") if part.strip()]
+        values = [part.strip().upper() for part in country_codes.split(",") if part.strip()]
     elif isinstance(country_codes, (list, tuple, set)):
-        values = [clean_str(part).lower() for part in country_codes if clean_str(part)]
+        values = [clean_str(part).upper() for part in country_codes if clean_str(part)]
     else:
         values = []
     if not values:
-        return "ua"
+        return ["UA"]
     seen = set()
     unique = []
     for value in values:
@@ -135,24 +172,16 @@ def _to_country_codes_param(country_codes):
             continue
         seen.add(value)
         unique.append(value)
-    return ",".join(unique)
+    return unique
 
 
-def _locationiq_base(region):
-    region_clean = clean_str(region).lower()
-    if region_clean in {"eu", "eu1"}:
-        return "https://eu1.locationiq.com/v1"
-    if region_clean in {"us", "us1"}:
-        return "https://us1.locationiq.com/v1"
-    return "https://api.locationiq.com/v1"
-
-
-def _http_get_json(url, params, timeout=5, retries=1):
-    params = params if isinstance(params, dict) else {}
+def _http_get_json(url, params=None, headers=None, timeout=5, retries=1):
+    query = params if isinstance(params, dict) else {}
+    req_headers = headers if isinstance(headers, dict) else {}
     last_error = None
     for attempt in range(max(int(retries), 0) + 1):
         try:
-            response = requests.get(url, params=params, timeout=timeout)
+            response = requests.get(url, params=query, headers=req_headers, timeout=timeout)
             if response.status_code in {429, 500, 502, 503, 504} and attempt < retries:
                 time.sleep(0.2 * (attempt + 1))
                 continue
@@ -169,207 +198,122 @@ def _http_get_json(url, params, timeout=5, retries=1):
     return None
 
 
-def _locationiq_request(path, params, api_key, region="eu1", timeout=5, retries=1):
-    token = clean_str(api_key)
-    if not token:
+def _photon_request(base_url, params, user_agent="", timeout=5, retries=1):
+    base = clean_str(base_url).rstrip("/")
+    if not base:
         return None
+    headers = {}
+    ua = clean_str(user_agent)
+    if ua:
+        headers["User-Agent"] = ua
+    url = f"{base}/api"
+    return _http_get_json(url, params=params, headers=headers, timeout=timeout, retries=retries)
+
+
+def _nominatim_request(base_url, path, params, user_agent="", language="", timeout=5, retries=1):
+    base = clean_str(base_url).rstrip("/")
+    if not base:
+        return None
+
+    headers = {}
+    ua = clean_str(user_agent)
+    if ua:
+        headers["User-Agent"] = ua
+
     query = dict(params or {})
-    query["key"] = token
-    url = f"{_locationiq_base(region).rstrip('/')}/{clean_str(path).lstrip('/')}"
-    return _http_get_json(url, query, timeout=timeout, retries=retries)
+    query.setdefault("format", "jsonv2")
+    if clean_str(language):
+        query.setdefault("accept-language", clean_str(language))
+
+    url = f"{base}/{clean_str(path).lstrip('/')}"
+    return _http_get_json(url, params=query, headers=headers, timeout=timeout, retries=retries)
 
 
-def _locationiq_geo(item):
-    if not isinstance(item, dict):
-        return None
-    return parse_geo_point({
-        "lat": item.get("lat"),
-        "lng": item.get("lon") if item.get("lon") is not None else item.get("lng"),
-    })
-
-
-def _is_settlement_item(item):
-    if not isinstance(item, dict):
+def _is_country_allowed(country_code, allowed_codes):
+    code = clean_str(country_code).upper()
+    if not code:
         return False
-    item_type = clean_str(item.get("type")).lower()
-    item_class = clean_str(item.get("class")).lower()
-    if item_type in _SETTLEMENT_TYPES:
-        return True
-    if item_class == "place" and item_type in {"city", "town", "village", "hamlet", "municipality", "county"}:
-        return True
-    return False
+    return code in set(_to_country_codes(allowed_codes))
 
 
-def _build_area_from_item(item, fallback_city="", fallback_region="", fallback_country="UA"):
-    if not isinstance(item, dict):
+def _build_display(*parts):
+    return ", ".join([clean_str(part) for part in parts if clean_str(part)])
+
+
+def _feature_geo(feature):
+    if not isinstance(feature, dict):
         return None
-    address = item.get("address") if isinstance(item.get("address"), dict) else {}
-    city = clean_str(fallback_city) or _extract_city(address)
-    region = clean_str(fallback_region) or _extract_region(address)
-    country_code = clean_str(fallback_country) or _extract_country_code(address, fallback_country)
-    area_id = _to_osm_ref(item.get("osm_type"), item.get("osm_id"))
+
+    geometry = feature.get("geometry") if isinstance(feature.get("geometry"), dict) else {}
+    coords = geometry.get("coordinates") if isinstance(geometry.get("coordinates"), list) else []
+    if len(coords) == 2:
+        return parse_geo_point({"lng": coords[0], "lat": coords[1]})
+
+    props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+    return parse_geo_point({"lat": props.get("lat"), "lng": props.get("lon")})
+
+
+def _extract_photon_address_parts(feature):
+    props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+
+    road = clean_str(props.get("street") or props.get("name"))
+    house_number = clean_str(props.get("housenumber"))
+    city = clean_str(props.get("city") or props.get("town") or props.get("village") or props.get("locality"))
+    region = clean_str(props.get("state") or props.get("county"))
+    postcode = clean_str(props.get("postcode"))
+    country_code = clean_str(props.get("countrycode") or "UA").upper()
+
+    return {
+        "road": road,
+        "house_number": house_number,
+        "houseNumber": house_number,
+        "city": city,
+        "region": region,
+        "postcode": postcode,
+        "countryCode": country_code,
+    }
+
+
+def _is_settlement_feature(feature):
+    props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+    osm_key = clean_str(props.get("osm_key")).lower()
+    osm_value = clean_str(props.get("osm_value")).lower()
+    if osm_key == "place" and osm_value in _SETTLEMENT_TYPES:
+        return True
+    return osm_value in _SETTLEMENT_TYPES
+
+
+def _photon_area_suggestion_from_feature(feature, country_codes):
+    if not isinstance(feature, dict):
+        return None
+    if not _is_settlement_feature(feature):
+        return None
+
+    props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+    country_code = clean_str(props.get("countrycode") or "UA").upper()
+    if not _is_country_allowed(country_code, country_codes):
+        return None
+
+    area_id = _to_osm_ref(props.get("osm_type"), props.get("osm_id"))
     if not area_id:
         return None
-    return _build_area_ref(city, region, country_code, area_id, source="locationiq")
 
-
-def _pick_settlement_candidate(candidates, city, country_code):
-    target_city = clean_str(city).lower()
-    target_country = clean_str(country_code).lower()
-    best = None
-    best_score = -1
-    for item in candidates if isinstance(candidates, list) else []:
-        if not isinstance(item, dict):
-            continue
-        area_id = _to_osm_ref(item.get("osm_type"), item.get("osm_id"))
-        if not area_id:
-            continue
-        address = item.get("address") if isinstance(item.get("address"), dict) else {}
-        item_city = _extract_city(address)
-        item_country = _extract_country_code(address, "").lower()
-        score = 0
-        if _is_settlement_item(item):
-            score += 2
-        if target_city and clean_str(item_city).lower() == target_city:
-            score += 3
-        if target_country and item_country == target_country:
-            score += 1
-        if score > best_score:
-            best = item
-            best_score = score
-    return best
-
-
-def _search_settlement_by_city(city, region_name, country_code, api_key, region, language):
-    city_clean = clean_str(city)
-    if not city_clean:
+    city = clean_str(props.get("name") or props.get("city") or props.get("town") or props.get("village"))
+    region = clean_str(props.get("state") or props.get("county"))
+    area = _build_area_ref(city, region, country_code, area_id, source="photon")
+    geo = _feature_geo(feature)
+    if not area or not geo:
         return None
 
-    cache_key = f"city::{city_clean.lower()}::{clean_str(region_name).lower()}::{clean_str(country_code).lower()}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    q_parts = [city_clean]
-    if clean_str(region_name):
-        q_parts.append(clean_str(region_name))
-    if clean_str(country_code):
-        q_parts.append(clean_str(country_code).upper())
-
-    params = {
-        "q": ", ".join(q_parts),
-        "format": "json",
-        "addressdetails": 1,
-        "normalizeaddress": 1,
-        "limit": 6,
-        "countrycodes": _to_country_codes_param(country_code or "UA"),
+    display = clean_str(area.get("display") or _build_display(city, region, _display_country_name(country_code)))
+    return {
+        "id": clean_str(area.get("id")),
+        "display": display,
+        "lat": geo.get("coordinates", [None, None])[1],
+        "lng": geo.get("coordinates", [None, None])[0],
+        "area": area,
+        "source": "photon",
     }
-    if clean_str(language):
-        params["accept-language"] = clean_str(language)
-
-    data = _locationiq_request("search", params, api_key=api_key, region=region, timeout=5, retries=1)
-    candidate = _pick_settlement_candidate(data, city_clean, country_code)
-    area = None
-    if candidate:
-        address = candidate.get("address") if isinstance(candidate.get("address"), dict) else {}
-        area = _build_area_ref(
-            _extract_city(address) or city_clean,
-            _extract_region(address) or clean_str(region_name),
-            _extract_country_code(address, country_code or "UA"),
-            _to_osm_ref(candidate.get("osm_type"), candidate.get("osm_id")),
-            source="locationiq",
-        )
-
-    _cache_set(cache_key, area, ttl_seconds=3600)
-    return area
-
-
-def _reverse_settlement_by_geo(lat, lng, api_key, region, language, country_code):
-    geo_key = f"reverse::{round(float(lat), 4)}::{round(float(lng), 4)}"
-    cached = _cache_get(geo_key)
-    if cached is not None:
-        return cached
-
-    params = {
-        "lat": lat,
-        "lon": lng,
-        "format": "json",
-        "addressdetails": 1,
-        "normalizeaddress": 1,
-        "zoom": 10,
-    }
-    if clean_str(language):
-        params["accept-language"] = clean_str(language)
-
-    data = _locationiq_request("reverse", params, api_key=api_key, region=region, timeout=5, retries=1)
-    area = None
-    if isinstance(data, dict):
-        address = data.get("address") if isinstance(data.get("address"), dict) else {}
-        area_id = _to_osm_ref(data.get("osm_type"), data.get("osm_id"))
-        if area_id and _is_settlement_item(data):
-            area = _build_area_ref(
-                _extract_city(address),
-                _extract_region(address),
-                _extract_country_code(address, country_code),
-                area_id,
-                source="locationiq",
-            )
-        if not area:
-            city = _extract_city(address)
-            if city:
-                area = _search_settlement_by_city(
-                    city,
-                    _extract_region(address),
-                    _extract_country_code(address, country_code),
-                    api_key=api_key,
-                    region=region,
-                    language=language,
-                )
-
-    _cache_set(geo_key, area, ttl_seconds=900)
-    return area
-
-
-def _resolve_settlement_area(item, api_key, region, language, country_codes):
-    if not isinstance(item, dict):
-        return None
-    address = item.get("address") if isinstance(item.get("address"), dict) else {}
-    country_code = _extract_country_code(address, clean_str(country_codes).split(",")[0] if clean_str(country_codes) else "UA")
-
-    if _is_settlement_item(item):
-        area = _build_area_from_item(item, fallback_country=country_code)
-        if area:
-            return area
-
-    city = _extract_city(address)
-    region_name = _extract_region(address)
-    if city:
-        by_city = _search_settlement_by_city(
-            city,
-            region_name,
-            country_code,
-            api_key=api_key,
-            region=region,
-            language=language,
-        )
-        if by_city:
-            return by_city
-
-    geo = _locationiq_geo(item)
-    if geo and isinstance(geo.get("coordinates"), list) and len(geo.get("coordinates")) == 2:
-        lng, lat = geo["coordinates"]
-        by_reverse = _reverse_settlement_by_geo(
-            lat,
-            lng,
-            api_key=api_key,
-            region=region,
-            language=language,
-            country_code=country_code,
-        )
-        if by_reverse:
-            return by_reverse
-
-    return None
 
 
 def _dedupe_by_key(items, key_fn):
@@ -386,158 +330,324 @@ def _dedupe_by_key(items, key_fn):
     return out
 
 
-def geonames_search_areas(search, geonames_user, geonames_lang="uk", country="UA", max_rows=10):
-    search = clean_str(search)
-    if not search:
+def _lookup_nominatim_by_place(place_id, nominatim_base_url, user_agent, language, timeout_seconds, retries):
+    _, item_id, nominatim_type = _parse_osm_ref(place_id)
+    if not item_id or not nominatim_type:
+        return None
+
+    cache_key = f"nominatim:lookup:{nominatim_type}{item_id}:{clean_str(language).lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = _nominatim_request(
+        nominatim_base_url,
+        "lookup",
+        {
+            "osm_ids": f"{nominatim_type}{item_id}",
+            "addressdetails": 1,
+            "namedetails": 1,
+            "extratags": 1,
+            "limit": 1,
+        },
+        user_agent=user_agent,
+        language=language,
+        timeout=timeout_seconds,
+        retries=retries,
+    )
+
+    item = payload[0] if isinstance(payload, list) and payload else None
+    _cache_set(cache_key, item, ttl_seconds=3600)
+    return item
+
+
+def _nominatim_reverse(lat, lng, nominatim_base_url, user_agent, language, timeout_seconds, retries, zoom=18):
+    cache_key = f"nominatim:reverse:{round(float(lat), 5)}:{round(float(lng), 5)}:{int(zoom)}:{clean_str(language).lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = _nominatim_request(
+        nominatim_base_url,
+        "reverse",
+        {
+            "lat": lat,
+            "lon": lng,
+            "addressdetails": 1,
+            "zoom": int(zoom),
+        },
+        user_agent=user_agent,
+        language=language,
+        timeout=timeout_seconds,
+        retries=retries,
+    )
+
+    item = payload if isinstance(payload, dict) else None
+    _cache_set(cache_key, item, ttl_seconds=600)
+    return item
+
+
+def _nominatim_search(query, nominatim_base_url, user_agent, language, country_codes, timeout_seconds, retries, limit=1):
+    query_clean = clean_str(query)
+    if not query_clean:
         return []
 
-    try:
-        url = (
-            "https://secure.geonames.org/searchJSON?"
-            f"name_startsWith={requests.utils.quote(search)}"
-            f"&country={country}"
-            "&featureClass=P"
-            f"&maxRows={int(max_rows)}"
-            f"&lang={geonames_lang}"
-            f"&username={geonames_user}"
-        )
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        geonames = data.get("geonames") or []
-    except Exception:
+    cache_key = f"nominatim:search:{query_clean.lower()}:{clean_str(language).lower()}:{','.join(_to_country_codes(country_codes))}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = _nominatim_request(
+        nominatim_base_url,
+        "search",
+        {
+            "q": query_clean,
+            "addressdetails": 1,
+            "limit": max(int(limit), 1),
+            "countrycodes": ",".join(code.lower() for code in _to_country_codes(country_codes)),
+        },
+        user_agent=user_agent,
+        language=language,
+        timeout=timeout_seconds,
+        retries=retries,
+    )
+
+    items = payload if isinstance(payload, list) else []
+    _cache_set(cache_key, items, ttl_seconds=900)
+    return items
+
+
+def _extract_address_parts_from_nominatim(item):
+    address = item.get("address") if isinstance(item, dict) and isinstance(item.get("address"), dict) else {}
+    road = _extract_road(address)
+    house_number = _extract_house_number(address)
+    city = _extract_city(address)
+    region = _extract_region(address)
+    postcode = clean_str(address.get("postcode"))
+    country_code = _extract_country_code(address, "UA")
+    return {
+        "road": road,
+        "house_number": house_number,
+        "houseNumber": house_number,
+        "city": city,
+        "region": region,
+        "postcode": postcode,
+        "countryCode": country_code,
+    }
+
+
+def _location_from_nominatim_item(item, area_seed=None):
+    if not isinstance(item, dict):
+        return normalize_location_core({})
+
+    geo = parse_geo_point({"lat": item.get("lat"), "lng": item.get("lon")})
+    address_parts = _extract_address_parts_from_nominatim(item)
+    address_display = clean_str(item.get("display_name")) or _build_display(
+        address_parts.get("house_number"),
+        address_parts.get("road"),
+        address_parts.get("city"),
+        address_parts.get("region"),
+        _display_country_name(address_parts.get("countryCode")),
+    )
+
+    place_id = _to_osm_ref(item.get("osm_type"), item.get("osm_id")) or clean_str(item.get("place_id"))
+    area = normalize_area_ref(area_seed if isinstance(area_seed, dict) else {}) if area_seed else None
+
+    if not area:
+        if _is_settlement_feature({"properties": {"osm_key": item.get("class"), "osm_value": item.get("type")}}):
+            area = _build_area_ref(
+                address_parts.get("city"),
+                address_parts.get("region"),
+                address_parts.get("countryCode"),
+                _to_osm_ref(item.get("osm_type"), item.get("osm_id")),
+                source="nominatim",
+            )
+
+    return normalize_location_core({
+        "area": area,
+        "address": {
+            "raw": address_display,
+            "display": address_display,
+            "placeId": place_id or None,
+            "provider": "nominatim",
+            "road": clean_str(address_parts.get("road")),
+            "houseNumber": clean_str(address_parts.get("house_number")),
+            "house_number": clean_str(address_parts.get("house_number")),
+            "city": clean_str(address_parts.get("city")),
+            "region": clean_str(address_parts.get("region")),
+            "postcode": clean_str(address_parts.get("postcode")),
+            "countryCode": clean_str(address_parts.get("countryCode")),
+        },
+        "geo": geo,
+        "display": address_display,
+        "quality": "full" if area and geo else "address_only",
+    })
+
+
+def _resolve_area_from_geo(lat, lng, photon_base_url, nominatim_base_url, user_agent, language, country_codes, timeout_seconds, retries):
+    reverse_settlement = _nominatim_reverse(
+        lat,
+        lng,
+        nominatim_base_url=nominatim_base_url,
+        user_agent=user_agent,
+        language=language,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+        zoom=10,
+    )
+    if not isinstance(reverse_settlement, dict):
+        return None
+
+    address = reverse_settlement.get("address") if isinstance(reverse_settlement.get("address"), dict) else {}
+    city = _extract_city(address)
+    region = _extract_region(address)
+    country_code = _extract_country_code(address, _to_country_codes(country_codes)[0])
+
+    area_id = _to_osm_ref(reverse_settlement.get("osm_type"), reverse_settlement.get("osm_id"))
+    if area_id:
+        return _build_area_ref(city, region, country_code, area_id, source="nominatim")
+
+    # Fallback: query Photon by resolved city name.
+    if not city:
+        return None
+
+    areas = search_location_areas(
+        city,
+        photon_base_url=photon_base_url,
+        nominatim_base_url=nominatim_base_url,
+        user_agent=user_agent,
+        language=language,
+        country_codes=country_codes,
+        max_rows=5,
+        timeout_ms=int(timeout_seconds * 1000),
+        retries=retries,
+    )
+    if not areas:
+        return None
+    return normalize_area_ref((areas[0] or {}).get("area") if isinstance(areas[0], dict) else {})
+
+
+def search_area_suggestions(search, photon_base_url, user_agent="", language="uk", country_codes="UA", max_rows=10, timeout_seconds=5, retries=1):
+    search_clean = clean_str(search)
+    if not search_clean:
         return []
 
-    seen = set()
+    cache_key = f"photon:areas:{search_clean.lower()}:{clean_str(language).lower()}:{','.join(_to_country_codes(country_codes))}:{int(max_rows)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = _photon_request(
+        photon_base_url,
+        {
+            "q": search_clean,
+            "limit": max(int(max_rows), 1),
+            "lang": clean_str(language) or "uk",
+        },
+        user_agent=user_agent,
+        timeout=timeout_seconds,
+        retries=retries,
+    )
+    features = payload.get("features") if isinstance(payload, dict) and isinstance(payload.get("features"), list) else []
+
     out = []
-    for place in geonames:
-        geoname_id = clean_str(place.get("geonameId"))
-        if not geoname_id or geoname_id in seen:
+    for feature in features:
+        item = _photon_area_suggestion_from_feature(feature, country_codes=country_codes)
+        if not item:
             continue
-        seen.add(geoname_id)
+        out.append(item)
 
-        area = normalize_area_ref({
-            "id": geoname_id,
-            "city": clean_str(place.get("name")),
-            "region": clean_str(place.get("adminName1")),
-            "countryCode": clean_str(place.get("countryCode")) or country,
-            "display": ", ".join(
-                [
-                    part
-                    for part in [
-                        clean_str(place.get("name")),
-                        clean_str(place.get("adminName1")),
-                        clean_str(place.get("countryName")),
-                    ]
-                    if part
-                ]
-            ),
-            "source": "geonames",
-        })
-        geo = parse_geo_point({"lat": place.get("lat"), "lng": place.get("lng")})
-
-        out.append({
-            "id": geoname_id,
-            "display": (area or {}).get("display") or "",
-            "lat": (geo or {}).get("coordinates", [None, None])[1] if geo else None,
-            "lng": (geo or {}).get("coordinates", [None, None])[0] if geo else None,
-            "area": area,
-            "source": "geonames",
-        })
+    out = _dedupe_by_key(out, lambda x: x.get("id") or x.get("display"))
+    out = out[: max(int(max_rows), 1)]
+    _cache_set(cache_key, out, ttl_seconds=300)
     return out
 
 
-def locationiq_search_areas(search, api_key, region="eu1", language="uk", country_codes="UA", max_rows=10):
-    search = clean_str(search)
-    if not search or not clean_str(api_key):
+def search_address_suggestions(
+    search,
+    photon_base_url,
+    user_agent="",
+    language="uk",
+    country_codes="UA",
+    max_rows=10,
+    area_id="",
+    city="",
+    timeout_seconds=5,
+    retries=1,
+):
+    search_clean = clean_str(search)
+    area_id_clean = clean_str(area_id)
+    city_clean = clean_str(city)
+    if not search_clean:
         return []
 
-    params = {
-        "q": search,
-        "limit": max(int(max_rows), 1),
-        "countrycodes": _to_country_codes_param(country_codes),
-        "normalizecity": 1,
-        "layers": "city",
-    }
-    if clean_str(language):
-        params["accept-language"] = clean_str(language)
+    cache_key = f"photon:addresses:{search_clean.lower()}:{area_id_clean.lower()}:{city_clean.lower()}:{clean_str(language).lower()}:{','.join(_to_country_codes(country_codes))}:{int(max_rows)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-    items = _locationiq_request("autocomplete", params, api_key=api_key, region=region, timeout=5, retries=1)
-    if not isinstance(items, list):
-        items = []
+    query = search_clean
+    if city_clean:
+        query = f"{search_clean}, {city_clean}"
+
+    payload = _photon_request(
+        photon_base_url,
+        {
+            "q": query,
+            "limit": max(int(max_rows), 1),
+            "lang": clean_str(language) or "uk",
+        },
+        user_agent=user_agent,
+        timeout=timeout_seconds,
+        retries=retries,
+    )
+    features = payload.get("features") if isinstance(payload, dict) and isinstance(payload.get("features"), list) else []
 
     out = []
-    for item in items:
-        area = _build_area_from_item(item, fallback_country=clean_str(country_codes).split(",")[0] or "UA")
-        geo = _locationiq_geo(item)
-        if not area or not area.get("id") or not geo:
+    allowed = set(_to_country_codes(country_codes))
+
+    for feature in features:
+        if not isinstance(feature, dict):
             continue
-        out.append({
-            "id": clean_str(area.get("id")),
-            "display": clean_str(area.get("display")),
-            "lat": geo.get("coordinates", [None, None])[1],
-            "lng": geo.get("coordinates", [None, None])[0],
-            "area": area,
-            "source": "locationiq",
-        })
 
-    out = _dedupe_by_key(out, lambda x: x.get("id") or x.get("display"))
-    return out[: max(int(max_rows), 1)]
+        props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+        country_code = clean_str(props.get("countrycode") or "UA").upper()
+        if country_code and allowed and country_code not in allowed:
+            continue
 
-
-def locationiq_search_addresses(search, api_key, region="eu1", language="uk", country_codes="UA", max_rows=10):
-    search = clean_str(search)
-    if not search or not clean_str(api_key):
-        return []
-
-    params = {
-        "q": search,
-        "limit": max(int(max_rows), 1),
-        "countrycodes": _to_country_codes_param(country_codes),
-        "normalizecity": 1,
-        "layers": "road,neighbourhood,suburb,city,county,state,postcode",
-    }
-    if clean_str(language):
-        params["accept-language"] = clean_str(language)
-
-    items = _locationiq_request("autocomplete", params, api_key=api_key, region=region, timeout=5, retries=1)
-    if not isinstance(items, list):
-        items = []
-
-    out = []
-    for item in items:
-        geo = _locationiq_geo(item)
+        geo = _feature_geo(feature)
         if not geo:
             continue
 
-        area = _resolve_settlement_area(
-            item,
-            api_key=api_key,
-            region=region,
-            language=language,
-            country_codes=country_codes,
-        )
-        if not area or not area.get("id"):
+        address_parts = _extract_photon_address_parts(feature)
+        road = clean_str(address_parts.get("road"))
+        house_number = clean_str(address_parts.get("house_number"))
+
+        area = None
+        if area_id_clean:
+            area = _build_area_ref(
+                city_clean or clean_str(address_parts.get("city")),
+                clean_str(address_parts.get("region")),
+                country_code,
+                area_id_clean,
+                source="photon",
+            )
+        elif _is_settlement_feature(feature):
+            area = _photon_area_suggestion_from_feature(feature, country_codes=country_codes)
+            area = normalize_area_ref((area or {}).get("area") if isinstance(area, dict) else {})
+
+        if not area or not clean_str(area.get("id")):
             continue
 
-        selected_ref = _to_osm_ref(item.get("osm_type"), item.get("osm_id")) or clean_str(item.get("place_id"))
-        address_display = clean_str(item.get("display_address") or item.get("display_name"))
-        if not address_display:
-            address = item.get("address") if isinstance(item.get("address"), dict) else {}
-            address_display = ", ".join(
-                [
-                    part
-                    for part in [
-                        clean_str(address.get("house_number")),
-                        clean_str(address.get("road")),
-                        clean_str(address.get("city") or address.get("town") or address.get("village")),
-                        clean_str(address.get("state")),
-                        _display_country_name(_extract_country_code(address, "UA")),
-                    ]
-                    if part
-                ]
-            )
-        display = address_display or clean_str(item.get("display_name")) or clean_str(area.get("display"))
+        place_ref = _to_osm_ref(props.get("osm_type"), props.get("osm_id"))
+        display = _build_display(
+            _build_display(house_number, road).strip(),
+            clean_str(address_parts.get("city")) or clean_str(area.get("city")),
+            clean_str(address_parts.get("region")) or clean_str(area.get("region")),
+            _display_country_name(country_code),
+        ) or clean_str(props.get("name")) or clean_str(area.get("display"))
+
+        has_street_and_house = bool(road and house_number)
 
         out.append({
             "id": clean_str(area.get("id")),
@@ -546,143 +656,226 @@ def locationiq_search_addresses(search, api_key, region="eu1", language="uk", co
             "lng": geo.get("coordinates", [None, None])[0],
             "area": area,
             "address": {
-                "raw": address_display or display,
-                "display": address_display or display,
-                "placeId": selected_ref or None,
-                "provider": "locationiq",
+                "raw": display,
+                "display": display,
+                "placeId": place_ref or None,
+                "provider": "photon",
+                "road": road,
+                "houseNumber": house_number,
+                "house_number": house_number,
+                "city": clean_str(address_parts.get("city")),
+                "region": clean_str(address_parts.get("region")),
+                "postcode": clean_str(address_parts.get("postcode")),
+                "countryCode": country_code,
             },
-            "placeId": selected_ref or None,
-            "provider": "locationiq",
-            "source": "locationiq",
+            "addressParts": address_parts,
+            "placeId": place_ref or None,
+            "provider": "photon",
+            "source": "photon",
+            "hasStreetAndHouse": has_street_and_house,
         })
 
     out = _dedupe_by_key(out, lambda x: (x.get("placeId") or "", x.get("display") or "", x.get("id") or ""))
-    return out[: max(int(max_rows), 1)]
+    out = out[: max(int(max_rows), 1)]
+    _cache_set(cache_key, out, ttl_seconds=180)
+    return out
 
 
 def search_location_areas(
     search,
-    provider="locationiq",
-    locationiq_api_key="",
-    locationiq_region="eu1",
-    locationiq_language="uk",
+    provider="photon",
+    photon_base_url="",
+    nominatim_base_url="",
+    user_agent="",
+    language="uk",
     country_codes="UA",
-    geonames_user="",
-    geonames_lang="uk",
     max_rows=10,
+    timeout_ms=5000,
+    retries=1,
+    **_,
 ):
-    provider_name = clean_str(provider).lower() or "locationiq"
-
-    if provider_name == "locationiq" and clean_str(locationiq_api_key):
-        items = locationiq_search_areas(
-            search,
-            api_key=locationiq_api_key,
-            region=locationiq_region,
-            language=locationiq_language,
-            country_codes=country_codes,
-            max_rows=max_rows,
-        )
-        if items:
-            return items
-
-    return geonames_search_areas(
+    del provider, nominatim_base_url
+    timeout_seconds = max(parse_float(timeout_ms) or 5000, 1000) / 1000.0
+    return search_area_suggestions(
         search,
-        geonames_user=geonames_user,
-        geonames_lang=geonames_lang,
-        country=clean_str(country_codes).split(",")[0].upper() or "UA",
+        photon_base_url=photon_base_url,
+        user_agent=user_agent,
+        language=language,
+        country_codes=country_codes,
         max_rows=max_rows,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
     )
 
 
 def search_location_addresses(
     search,
-    provider="locationiq",
-    locationiq_api_key="",
-    locationiq_region="eu1",
-    locationiq_language="uk",
+    provider="photon",
+    photon_base_url="",
+    nominatim_base_url="",
+    user_agent="",
+    language="uk",
     country_codes="UA",
-    geonames_user="",
-    geonames_lang="uk",
     max_rows=10,
+    area_id="",
+    city="",
+    timeout_ms=5000,
+    retries=1,
+    **_,
 ):
-    provider_name = clean_str(provider).lower() or "locationiq"
+    del provider, nominatim_base_url
+    timeout_seconds = max(parse_float(timeout_ms) or 5000, 1000) / 1000.0
+    return search_address_suggestions(
+        search,
+        photon_base_url=photon_base_url,
+        user_agent=user_agent,
+        language=language,
+        country_codes=country_codes,
+        max_rows=max_rows,
+        area_id=area_id,
+        city=city,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+    )
 
-    if provider_name == "locationiq" and clean_str(locationiq_api_key):
-        items = locationiq_search_addresses(
-            search,
-            api_key=locationiq_api_key,
-            region=locationiq_region,
-            language=locationiq_language,
+
+def normalize_location_input(
+    payload,
+    photon_base_url="",
+    nominatim_base_url="",
+    user_agent="",
+    language="uk",
+    country_codes="UA",
+    timeout_ms=5000,
+    retries=1,
+    **_,
+):
+    payload = payload if isinstance(payload, dict) else {}
+    seed = normalize_location_core(payload)
+
+    timeout_seconds = max(parse_float(timeout_ms) or 5000, 1000) / 1000.0
+    place_id = clean_str(payload.get("placeId") or ((seed.get("address") or {}).get("placeId") if isinstance(seed.get("address"), dict) else ""))
+
+    area_seed = normalize_area_ref(payload.get("area") if isinstance(payload.get("area"), dict) else {})
+    if not area_seed:
+        area_seed = normalize_area_ref((seed.get("area") or {}) if isinstance(seed.get("area"), dict) else {})
+
+    if place_id and clean_str(nominatim_base_url):
+        item = _lookup_nominatim_by_place(
+            place_id,
+            nominatim_base_url=nominatim_base_url,
+            user_agent=user_agent,
+            language=language,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+        )
+        if isinstance(item, dict):
+            location = _location_from_nominatim_item(item, area_seed=area_seed)
+            if not (location.get("area") or {}).get("id") and area_seed:
+                location["area"] = area_seed
+                location = normalize_location_core(location)
+            if area_seed and clean_str((area_seed or {}).get("id")):
+                location["area"] = normalize_area_ref({**(location.get("area") or {}), **area_seed})
+                location = normalize_location_core(location)
+            return location
+
+    geo_seed = parse_geo_point(seed.get("geo"))
+    if geo_seed and clean_str(nominatim_base_url):
+        lng, lat = geo_seed.get("coordinates")
+        reverse = _nominatim_reverse(
+            lat,
+            lng,
+            nominatim_base_url=nominatim_base_url,
+            user_agent=user_agent,
+            language=language,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+            zoom=18,
+        )
+        if isinstance(reverse, dict):
+            area = area_seed
+            if not area or not clean_str((area or {}).get("id")):
+                area = _resolve_area_from_geo(
+                    lat,
+                    lng,
+                    photon_base_url=photon_base_url,
+                    nominatim_base_url=nominatim_base_url,
+                    user_agent=user_agent,
+                    language=language,
+                    country_codes=country_codes,
+                    timeout_seconds=timeout_seconds,
+                    retries=retries,
+                )
+            location = _location_from_nominatim_item(reverse, area_seed=area)
+            if location and not location.get("geo"):
+                location["geo"] = geo_seed
+                location = normalize_location_core(location)
+            return location
+
+    address_display = clean_str((seed.get("address") or {}).get("display") if isinstance(seed.get("address"), dict) else "")
+    if address_display and clean_str(nominatim_base_url):
+        items = _nominatim_search(
+            address_display,
+            nominatim_base_url=nominatim_base_url,
+            user_agent=user_agent,
+            language=language,
             country_codes=country_codes,
-            max_rows=max_rows,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+            limit=1,
         )
         if items:
-            return items
+            location = _location_from_nominatim_item(items[0], area_seed=area_seed)
+            if area_seed and clean_str((area_seed or {}).get("id")):
+                location["area"] = normalize_area_ref({**(location.get("area") or {}), **area_seed})
+                location = normalize_location_core(location)
+            return location
 
-    # Compatibility fallback when LocationIQ is unavailable.
-    areas = geonames_search_areas(
-        search,
-        geonames_user=geonames_user,
-        geonames_lang=geonames_lang,
-        country=clean_str(country_codes).split(",")[0].upper() or "UA",
-        max_rows=max_rows,
+    return seed
+
+
+def reverse_geocode_location(
+    lat,
+    lng,
+    photon_base_url="",
+    nominatim_base_url="",
+    user_agent="",
+    language="uk",
+    country_codes="UA",
+    timeout_ms=5000,
+    retries=1,
+):
+    lat_val = parse_float(lat)
+    lng_val = parse_float(lng)
+    if lat_val is None or lng_val is None:
+        return None
+
+    timeout_seconds = max(parse_float(timeout_ms) or 5000, 1000) / 1000.0
+    reverse = _nominatim_reverse(
+        lat_val,
+        lng_val,
+        nominatim_base_url=nominatim_base_url,
+        user_agent=user_agent,
+        language=language,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+        zoom=18,
     )
-    out = []
-    for item in areas:
-        display = clean_str(item.get("display"))
-        area = normalize_area_ref(item.get("area") if isinstance(item.get("area"), dict) else {})
-        out.append({
-            "id": clean_str(item.get("id")),
-            "display": display,
-            "lat": item.get("lat"),
-            "lng": item.get("lng"),
-            "area": area,
-            "address": {
-                "raw": display,
-                "display": display,
-                "placeId": clean_str(item.get("id")) or None,
-                "provider": "geonames",
-            },
-            "placeId": clean_str(item.get("id")) or None,
-            "provider": "geonames",
-            "source": "geonames",
-        })
-    return out
+    if not isinstance(reverse, dict):
+        return None
 
-
-def normalize_location_input(payload):
-    payload = payload if isinstance(payload, dict) else {}
-
-    area_id = payload.get("areaId")
-    area_payload = payload.get("area") if isinstance(payload.get("area"), dict) else {
-        "id": area_id,
-        "display": payload.get("areaDisplay") or payload.get("areaText") or payload.get("area"),
-        "city": payload.get("city"),
-        "region": payload.get("region"),
-        "source": payload.get("areaSource") or _infer_area_source(area_id),
-    }
-
-    address_payload = payload.get("address") if isinstance(payload.get("address"), dict) else {
-        "raw": payload.get("addressRaw") or payload.get("address") or payload.get("addressLine"),
-        "display": payload.get("addressDisplay") or payload.get("address") or payload.get("addressLine"),
-        "placeId": payload.get("placeId"),
-        "provider": payload.get("provider") or "manual",
-    }
-
-    geo_payload = payload.get("geo")
-    if geo_payload is None:
-        geo_payload = {
-            "lat": payload.get("lat") if payload.get("lat") is not None else payload.get("latitude"),
-            "lng": payload.get("lng") if payload.get("lng") is not None else payload.get("longitude"),
-        }
-
-    return normalize_location_core({
-        "area": normalize_area_ref(area_payload),
-        "address": address_payload,
-        "geo": geo_payload,
-        "display": payload.get("display"),
-        "quality": payload.get("quality"),
-    })
+    area = _resolve_area_from_geo(
+        lat_val,
+        lng_val,
+        photon_base_url=photon_base_url,
+        nominatim_base_url=nominatim_base_url,
+        user_agent=user_agent,
+        language=language,
+        country_codes=country_codes,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+    )
+    return _location_from_nominatim_item(reverse, area_seed=area)
 
 
 def haversine_km(lat1, lng1, lat2, lng2):

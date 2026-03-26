@@ -105,7 +105,13 @@ def normalize_area_ref(raw):
     if not display:
         parts = [part for part in [city, region, "Україна" if country_code == "UA" else country_code] if part]
         display = ", ".join(parts)
-    source = clean_str(raw.get("source") or ("geonames" if area_id else "manual")) or "manual"
+    inferred_source = "manual"
+    if area_id:
+        if re.match(r"^\d+$", area_id):
+            inferred_source = "geonames"
+        elif re.match(r"^(node|way|relation):\d+$", area_id, flags=re.IGNORECASE):
+            inferred_source = "locationiq"
+    source = clean_str(raw.get("source") or inferred_source) or "manual"
 
     if not any([area_id, city, region, display]):
         return None
@@ -235,7 +241,7 @@ def normalize_location_core(raw):
             "display": raw.get("area"),
             "city": raw.get("city"),
             "region": raw.get("region"),
-            "source": raw.get("source") or ("geonames" if raw.get("areaId") else "manual"),
+            "source": raw.get("source") or raw.get("areaSource"),
         })
     if not address:
         address = normalize_address_ref(raw.get("addressLine") or raw.get("addressText") or raw.get("addressRaw"))

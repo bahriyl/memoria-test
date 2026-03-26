@@ -55,8 +55,9 @@ from location_schema import (
 from location_service import (
     cemetery_option_from_doc,
     filter_docs_by_radius,
-    geonames_search_areas,
     normalize_location_input,
+    search_location_addresses,
+    search_location_areas,
 )
 
 load_dotenv()
@@ -225,8 +226,14 @@ ALLOWED_UPDATE_FIELDS = {
 
 GEONAMES_USER = os.environ.get("GEONAMES_USER", "memoria")
 GEONAMES_LANG = "uk"
+LOCATION_PROVIDER = os.environ.get("LOCATION_PROVIDER", "locationiq").strip().lower() or "locationiq"
+LOCATIONIQ_API_KEY = os.environ.get("LOCATIONIQ_API_KEY", "").strip()
+LOCATIONIQ_REGION = os.environ.get("LOCATIONIQ_REGION", "eu1").strip().lower() or "eu1"
+LOCATION_COUNTRY_CODES = os.environ.get("LOCATION_COUNTRY_CODES", "UA").strip() or "UA"
+LOCATION_ACCEPT_LANGUAGE = os.environ.get("LOCATION_ACCEPT_LANGUAGE", "uk").strip() or "uk"
 LOCATION_READ_MODE = os.environ.get("LOCATION_READ_MODE", "hybrid").strip().lower() or "hybrid"
 LOCATION_WRITE_MODE = os.environ.get("LOCATION_WRITE_MODE", "dual").strip().lower() or "dual"
+LOCATION_ADMIN_STRICT_LOCATION = os.environ.get("LOCATION_ADMIN_STRICT_LOCATION", "").strip().lower()
 LOCATION_ADMIN_STRICT_GEONAMES = os.environ.get("LOCATION_ADMIN_STRICT_GEONAMES", "0").strip().lower() or "0"
 
 
@@ -259,21 +266,27 @@ def _location_write_is_dual():
 
 
 def _location_admin_strict_geonames_enabled():
-    return LOCATION_ADMIN_STRICT_GEONAMES in {"1", "true", "yes", "on"}
+    value = LOCATION_ADMIN_STRICT_LOCATION or LOCATION_ADMIN_STRICT_GEONAMES
+    return value in {"1", "true", "yes", "on"}
 
 
-def _location_has_geonames_area_and_geo(location):
+def _location_has_provider_area_and_geo(location):
     normalized = normalize_location_core(location if isinstance(location, dict) else {})
     area = normalized.get("area") if isinstance(normalized.get("area"), dict) else {}
     geo = loc_parse_geo_point(normalized.get("geo"))
     area_id = loc_clean_str(area.get("id"))
     area_source = loc_clean_str(area.get("source")).lower()
-    return bool(area_id and area_source == "geonames" and geo)
+    return bool(area_id and area_source in {"geonames", "locationiq"} and geo)
+
+
+def _location_has_geonames_area_and_geo(location):
+    # Compatibility alias used by legacy call sites.
+    return _location_has_provider_area_and_geo(location)
 
 
 def _validate_admin_strict_location(field_name, location):
-    if not _location_has_geonames_area_and_geo(location):
-        abort(400, description=f"`{field_name}` must come from GeoNames suggestions (`area.id` + coordinates required)")
+    if not _location_has_provider_area_and_geo(location):
+        abort(400, description=f"`{field_name}` must come from provider suggestions (`area.id` + coordinates required)")
 
 try:
     liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
@@ -1448,7 +1461,7 @@ def _build_admin_cemetery_payload(data, partial=False):
     if not partial:
         if _location_admin_strict_geonames_enabled():
             if 'location' not in data:
-                abort(400, description="`location` is required and must come from GeoNames suggestions")
+                abort(400, description="`location` is required and must come from provider suggestions")
         elif 'location' not in data:
             _validate_required_text('locality', required=True)
 
@@ -1936,7 +1949,7 @@ def _build_admin_church_payload(data, partial=False):
     if not partial:
         if _location_admin_strict_geonames_enabled():
             if 'location' not in data:
-                abort(400, description="`location` is required and must come from GeoNames suggestions")
+                abort(400, description="`location` is required and must come from provider suggestions")
         elif 'location' not in data:
             _validate_required_text('address', required=True)
 
@@ -3185,7 +3198,7 @@ def _build_admin_ritual_service_payload(data, partial=False):
         if not name:
             abort(400, description='`name` is required')
         if _location_admin_strict_geonames_enabled() and 'hqLocation' not in data:
-            abort(400, description="`hqLocation` is required and must come from GeoNames suggestions")
+            abort(400, description="`hqLocation` is required and must come from provider suggestions")
 
     if 'name' in data:
         name = _clean_str(data.get('name'))
@@ -3526,7 +3539,19 @@ def locations():
     search = request.args.get('search', '').strip()
     if not search:
         return jsonify([])
-    return jsonify(geonames_search_areas(search, GEONAMES_USER, GEONAMES_LANG))
+    return jsonify(
+        search_location_areas(
+            search,
+            provider=LOCATION_PROVIDER,
+            locationiq_api_key=LOCATIONIQ_API_KEY,
+            locationiq_region=LOCATIONIQ_REGION,
+            locationiq_language=LOCATION_ACCEPT_LANGUAGE,
+            country_codes=LOCATION_COUNTRY_CODES,
+            geonames_user=GEONAMES_USER,
+            geonames_lang=GEONAMES_LANG,
+            max_rows=10,
+        )
+    )
 
 
 def _query_cemetery_options(area_id='', area='', search='', limit=10):
@@ -3597,7 +3622,36 @@ def location_areas():
     search = request.args.get('search', '').strip()
     if not search:
         return jsonify({"total": 0, "items": []})
-    items = geonames_search_areas(search, GEONAMES_USER, GEONAMES_LANG)
+    items = search_location_areas(
+        search,
+        provider=LOCATION_PROVIDER,
+        locationiq_api_key=LOCATIONIQ_API_KEY,
+        locationiq_region=LOCATIONIQ_REGION,
+        locationiq_language=LOCATION_ACCEPT_LANGUAGE,
+        country_codes=LOCATION_COUNTRY_CODES,
+        geonames_user=GEONAMES_USER,
+        geonames_lang=GEONAMES_LANG,
+        max_rows=10,
+    )
+    return jsonify({"total": len(items), "items": items})
+
+
+@application.route('/api/location/addresses', methods=['GET'])
+def location_addresses():
+    search = request.args.get('search', '').strip()
+    if not search:
+        return jsonify({"total": 0, "items": []})
+    items = search_location_addresses(
+        search,
+        provider=LOCATION_PROVIDER,
+        locationiq_api_key=LOCATIONIQ_API_KEY,
+        locationiq_region=LOCATIONIQ_REGION,
+        locationiq_language=LOCATION_ACCEPT_LANGUAGE,
+        country_codes=LOCATION_COUNTRY_CODES,
+        geonames_user=GEONAMES_USER,
+        geonames_lang=GEONAMES_LANG,
+        max_rows=20,
+    )
     return jsonify({"total": len(items), "items": items})
 
 

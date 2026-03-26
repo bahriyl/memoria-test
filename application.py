@@ -28,6 +28,33 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+from location_mapper import (
+    cemetery_location_to_legacy,
+    church_location_to_legacy,
+    merge_dict,
+    normalize_cemetery_location,
+    normalize_church_location,
+    normalize_person_burial,
+    normalize_refs_list,
+    normalize_ritual_hq_location,
+    person_burial_to_legacy_fields,
+    refs_to_legacy_names,
+    ritual_location_to_legacy,
+)
+from location_schema import (
+    clean_str as loc_clean_str,
+    clean_str_list as loc_clean_str_list,
+    normalize_location_core,
+    parse_float as loc_parse_float,
+    parse_geo_point as loc_parse_geo_point,
+)
+from location_service import (
+    cemetery_option_from_doc,
+    filter_docs_by_radius,
+    geonames_search_areas,
+    normalize_location_input,
+)
+
 load_dotenv()
 
 
@@ -189,10 +216,41 @@ ALLOWED_UPDATE_FIELDS = {
     "comments",
     "relatives",
     "heroImage",
+    "burial",
 }
 
 GEONAMES_USER = os.environ.get("GEONAMES_USER", "memoria")
 GEONAMES_LANG = "uk"
+LOCATION_READ_MODE = os.environ.get("LOCATION_READ_MODE", "hybrid").strip().lower() or "hybrid"
+LOCATION_WRITE_MODE = os.environ.get("LOCATION_WRITE_MODE", "dual").strip().lower() or "dual"
+
+
+def _location_read_mode():
+    if LOCATION_READ_MODE in {"legacy", "canonical", "hybrid"}:
+        return LOCATION_READ_MODE
+    return "hybrid"
+
+
+def _location_write_mode():
+    if LOCATION_WRITE_MODE in {"legacy", "canonical", "dual"}:
+        return LOCATION_WRITE_MODE
+    return "dual"
+
+
+def _location_read_uses_canonical():
+    return _location_read_mode() in {"canonical", "hybrid"}
+
+
+def _location_write_is_legacy():
+    return _location_write_mode() == "legacy"
+
+
+def _location_write_is_canonical():
+    return _location_write_mode() == "canonical"
+
+
+def _location_write_is_dual():
+    return _location_write_mode() == "dual"
 
 try:
     liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
@@ -221,6 +279,51 @@ except Exception:
 
 try:
     ritual_service_categories_collection.create_index([("nameNormalized", ASCENDING)], unique=True)
+except Exception:
+    pass
+
+try:
+    people_collection.create_index([("burial.location.area.id", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    people_collection.create_index([("burial.cemeteryRef.id", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    people_collection.create_index([("burial.location.geo", "2dsphere")])
+except Exception:
+    pass
+
+try:
+    cemeteries_collection.create_index([("location.area.id", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    cemeteries_collection.create_index([("location.geo", "2dsphere")])
+except Exception:
+    pass
+
+try:
+    churches_collection.create_index([("location.area.id", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    churches_collection.create_index([("location.geo", "2dsphere")])
+except Exception:
+    pass
+
+try:
+    ritual_services_collection.create_index([("hqLocation.area.id", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    ritual_services_collection.create_index([("hqLocation.geo", "2dsphere")])
 except Exception:
     pass
 
@@ -303,6 +406,48 @@ def get_coin_icon():
     })
 
 
+def _str_to_bool(value):
+    raw = loc_clean_str(value).lower()
+    if raw in {"1", "true", "yes", "y"}:
+        return True
+    if raw in {"0", "false", "no", "n"}:
+        return False
+    return None
+
+
+def _person_with_location_projection(person):
+    burial = normalize_person_burial(person)
+    legacy = person_burial_to_legacy_fields(burial)
+
+    result = dict(person)
+    if _location_read_uses_canonical() or not _location_write_is_canonical():
+        result["burial"] = burial
+    result["areaId"] = legacy["areaId"] or loc_clean_str(result.get("areaId"))
+    result["area"] = legacy["area"] or loc_clean_str(result.get("area"))
+    result["cemetery"] = legacy["cemetery"] or loc_clean_str(result.get("cemetery"))
+    result["location"] = legacy["location"]
+    return result
+
+
+def _person_list_payload(person):
+    person = _person_with_location_projection(person)
+    payload = {
+        "id": str(person.get('_id')),
+        "name": person.get('name'),
+        "birthYear": person.get('birthYear'),
+        "deathYear": person.get('deathYear'),
+        "notable": person.get('notable'),
+        "avatarUrl": person.get('avatarUrl'),
+        "portraitUrl": person.get('portraitUrl'),
+        "areaId": person.get('areaId'),
+        "area": person.get('area'),
+        "cemetery": person.get('cemetery'),
+    }
+    if _location_read_uses_canonical():
+        payload["burial"] = person.get("burial")
+    return payload
+
+
 @application.route('/api/people', methods=['GET'])
 def people():
     search_query = request.args.get('search', '').strip()
@@ -311,65 +456,80 @@ def people():
     area_id = request.args.get('areaId', '').strip()
     area = request.args.get('area', '').strip()
     cemetery = request.args.get('cemetery', '').strip()
+    cemetery_id = request.args.get('cemeteryId', '').strip()
+    has_geo = _str_to_bool(request.args.get('hasGeo'))
+    lat = request.args.get('lat')
+    lng = request.args.get('lng')
+    radius_km = request.args.get('radiusKm')
 
-    # Будуємо список умов і комбінуємо їх через $and,
-    # при цьому areaId та area об'єднуємо через $or (як дублюючі ключі місця).
     conditions = []
-
     if search_query:
         conditions.append({'name': {'$regex': re.escape(search_query), '$options': 'i'}})
-
     if birth_year and birth_year.isdigit():
         conditions.append({'birthYear': int(birth_year)})
-
     if death_year and death_year.isdigit():
         conditions.append({'deathYear': int(death_year)})
 
-    area_or = []
     if area_id:
-        area_or.append({'areaId': area_id})
-    if area:
-        # area з фронта може бути у форматі "Місто, Область, ...".
-        # Для фільтрації по документах осіб використовуємо лише перше слово/частину (місто),
-        # щоб збігатися з рядками виду "м. Самбір, Львівська обл.".
+        conditions.append({
+            '$or': [
+                {'areaId': area_id},
+                {'burial.location.area.id': area_id},
+            ]
+        })
+    elif area:
         city_part = area.split(',')[0].strip()
         if city_part:
             pattern = r'\b' + re.escape(city_part) + r'\b'
-            area_or.append({'area': {'$regex': pattern, '$options': 'i'}})
-    if area_or:
-        conditions.append({'$or': area_or})
+            conditions.append({
+                '$or': [
+                    {'area': {'$regex': pattern, '$options': 'i'}},
+                    {'burial.location.area.display': {'$regex': pattern, '$options': 'i'}},
+                    {'burial.location.area.city': {'$regex': pattern, '$options': 'i'}},
+                ]
+            })
 
-    if cemetery:
-        conditions.append({'cemetery': {'$regex': re.escape(cemetery), '$options': 'i'}})
-
-    if not conditions:
-        mongo_filter = {}
-    elif len(conditions) == 1:
-        mongo_filter = conditions[0]
-    else:
-        mongo_filter = {'$and': conditions}
-
-    people_cursor = people_collection.find(mongo_filter)
-
-    people_list = []
-    for person in people_cursor:
-        people_list.append({
-            "id": str(person.get('_id')),
-            "name": person.get('name'),
-            "birthYear": person.get('birthYear'),
-            "deathYear": person.get('deathYear'),
-            "notable": person.get('notable'),
-            "avatarUrl": person.get('avatarUrl'),
-            "portraitUrl": person.get('portraitUrl'),
-            "areaId": person.get('areaId'),
-            "area": person.get('area'),
-            "cemetery": person.get('cemetery')
+    if cemetery_id:
+        conditions.append({
+            '$or': [
+                {'cemeteryId': cemetery_id},
+                {'burial.cemeteryRef.id': cemetery_id},
+            ]
+        })
+    elif cemetery:
+        cem_regex = {'$regex': re.escape(cemetery), '$options': 'i'}
+        conditions.append({
+            '$or': [
+                {'cemetery': cem_regex},
+                {'burial.cemeteryRef.name': cem_regex},
+            ]
         })
 
-    return jsonify({
-        "total": len(people_list),
-        "people": people_list
-    })
+    mongo_filter = {'$and': conditions} if len(conditions) > 1 else (conditions[0] if conditions else {})
+    docs = list(people_collection.find(mongo_filter))
+
+    if has_geo is not None:
+        filtered = []
+        for person in docs:
+            burial = normalize_person_burial(person)
+            has_person_geo = bool(loc_parse_geo_point((burial.get("location") or {}).get("geo")))
+            if has_geo and has_person_geo:
+                filtered.append(person)
+            if has_geo is False and not has_person_geo:
+                filtered.append(person)
+        docs = filtered
+
+    if lat is not None and lng is not None and radius_km is not None:
+        docs = filter_docs_by_radius(
+            docs,
+            origin_lat=lat,
+            origin_lng=lng,
+            radius_km=radius_km,
+            location_getter=lambda item: (normalize_person_burial(item).get("location") if isinstance(item, dict) else None),
+        )
+
+    people_list = [_person_list_payload(person) for person in docs]
+    return jsonify({"total": len(people_list), "people": people_list})
 
 
 def _validate_shared_pending(value):
@@ -605,6 +765,7 @@ def get_person(person_id):
             if n:
                 photos_norm.append(n)
 
+    person = _person_with_location_projection(person)
     response = {
         "id": str(person['_id']),
         "name": person.get('name'),
@@ -620,6 +781,7 @@ def get_person(person_id):
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
+        "burial": person.get('burial') if _location_read_uses_canonical() else None,
         "bio": person.get('bio'),
         "photos": photos_norm,
         "sharedPending": person.get('sharedPending', []),
@@ -881,6 +1043,10 @@ def update_person(person_id):
     if 'photoDescriptions' in data:
         abort(400, description="`photoDescriptions` is no longer supported. Use `photos: [{url, description}]`.")
 
+    existing_person = people_collection.find_one({'_id': oid})
+    if not existing_person:
+        abort(404, description="Person not found")
+
     update_doc = {}
     for field, value in data.items():
         if field not in ALLOWED_UPDATE_FIELDS:
@@ -896,18 +1062,60 @@ def update_person(person_id):
             update_doc['relatives'] = _validate_relatives(value)
         elif field == 'comments':
             update_doc['comments'] = _sanitize_comment_authors(value)
+        elif field == 'burial':
+            if value is None:
+                value = {}
+            if not isinstance(value, dict):
+                abort(400, description="`burial` must be an object")
+            update_doc['burial'] = {
+                "location": normalize_location_core(value.get("location") if isinstance(value.get("location"), dict) else {}),
+                "landmarks": loc_clean_str(value.get("landmarks")),
+                "photos": loc_clean_str_list(value.get("photos")),
+                "cemeteryRef": {
+                    "id": loc_clean_str((value.get("cemeteryRef") or {}).get("id")) or None,
+                    "name": loc_clean_str((value.get("cemeteryRef") or {}).get("name")),
+                },
+            }
         else:
-            # accepts avatarUrl=None and portraitUrl=None to clear either/both
             update_doc[field] = value
 
     if not update_doc:
         abort(400, description=f"No valid fields to update. Allowed: {', '.join(sorted(ALLOWED_UPDATE_FIELDS))}")
+
+    location_fields = {"area", "areaId", "cemetery", "location", "burial"}
+    has_location_changes = bool(location_fields.intersection(set(update_doc.keys())))
+    if has_location_changes:
+        if "burial" in update_doc:
+            merged_doc = merge_dict(existing_person, {"burial": update_doc["burial"]})
+        else:
+            legacy_updates = {k: update_doc[k] for k in ("area", "areaId", "cemetery", "location") if k in update_doc}
+            merged_doc = merge_dict(existing_person, legacy_updates)
+
+        burial_normalized = normalize_person_burial(merged_doc)
+
+        if _location_write_is_canonical() or _location_write_is_dual():
+            update_doc["burial"] = burial_normalized
+        else:
+            update_doc.pop("burial", None)
+
+        if _location_write_is_legacy() or _location_write_is_dual():
+            legacy_fields = person_burial_to_legacy_fields(burial_normalized)
+            update_doc["areaId"] = legacy_fields["areaId"]
+            update_doc["area"] = legacy_fields["area"]
+            update_doc["cemetery"] = legacy_fields["cemetery"]
+            update_doc["location"] = legacy_fields["location"]
+        else:
+            update_doc.pop("areaId", None)
+            update_doc.pop("area", None)
+            update_doc.pop("cemetery", None)
+            update_doc.pop("location", None)
 
     result = people_collection.update_one({'_id': oid}, {'$set': update_doc})
     if result.matched_count == 0:
         abort(404, description="Person not found")
 
     person = people_collection.find_one({'_id': oid})
+    person = _person_with_location_projection(person)
     response = {
         "id": str(person['_id']),
         "name": person.get('name'),
@@ -923,13 +1131,14 @@ def update_person(person_id):
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
         "location": person.get('location'),
+        "burial": person.get('burial') if _location_read_uses_canonical() else None,
         "bio": person.get('bio'),
         "photos": person.get('photos', []),
         "sharedPending": person.get('sharedPending', []),
         "sharedPhotos": person.get('sharedPhotos', []),
         "comments": _sort_comments(person.get('comments', [])),
         "relatives": [
-            {"personId": str(r['personId']), "role": r['role']}
+            {"personId": str(r['personId']), "role": r.get('role')}
             for r in person.get('relatives', [])
         ]
     }
@@ -966,13 +1175,40 @@ def offer_shared_photo(person_id):
 
 @application.route('/api/people/location_moderation', methods=['POST'])
 def people_location_moderation():
-    data = request.get_json()
-    personId = data.get('personId')
+    data = request.get_json(silent=True) or {}
+    person_id = data.get('personId')
     location = data.get('location')
+    burial_payload = data.get('burial') if isinstance(data.get('burial'), dict) else None
+
+    if burial_payload:
+        location_v2 = normalize_location_core(burial_payload.get("location") if isinstance(burial_payload.get("location"), dict) else {})
+        landmarks = loc_clean_str(burial_payload.get("landmarks"))
+        photos = loc_clean_str_list(burial_payload.get("photos"))
+    else:
+        legacy_doc = {
+            "location": location if isinstance(location, list) else [],
+            "areaId": data.get("areaId"),
+            "area": data.get("area"),
+            "cemetery": data.get("cemetery"),
+        }
+        burial = normalize_person_burial(legacy_doc)
+        location_v2 = burial.get("location")
+        landmarks = burial.get("landmarks")
+        photos = burial.get("photos")
 
     document = {
-        'personId': personId,
-        'location': location
+        'personId': person_id,
+        'location': location,
+        'locationV2': location_v2,
+        'landmarks': landmarks,
+        'photos': photos,
+        'burial': {
+            'location': location_v2,
+            'landmarks': landmarks,
+            'photos': photos,
+            'cemeteryRef': (burial_payload or {}).get('cemeteryRef', {}),
+        },
+        'createdAt': datetime.utcnow(),
     }
     location_moderation_collection.insert_one(document)
 
@@ -992,13 +1228,16 @@ def cemeteries_page():
 
     cemeteries_list = []
     for cemetery in cemeteries_cursor:
+        location = normalize_cemetery_location(cemetery)
+        legacy_loc = cemetery_location_to_legacy(location)
         cemeteries_list.append({
             "id": str(cemetery.get('_id')),
             "name": cemetery.get('name'),
             "image": cemetery.get('image'),
-            "address": cemetery.get('address'),
+            "address": cemetery.get('address') or legacy_loc.get("address"),
             "phone": cemetery.get('phone'),
-            "description": cemetery.get('description')
+            "description": cemetery.get('description'),
+            "location": location if _location_read_uses_canonical() else None,
         })
 
     return jsonify({
@@ -1021,13 +1260,16 @@ def get_cemetery_page(cemetery_id):
         abort(404, description="Cemetery not found")
 
     # 3) Build your response payload
+    location = normalize_cemetery_location(cemetery)
+    legacy_loc = cemetery_location_to_legacy(location)
     return jsonify({
         "id": str(cemetery.get('_id')),
         "name": cemetery.get('name'),
         "image": cemetery.get('image'),
-        "address": cemetery.get('address'),
+        "address": cemetery.get('address') or legacy_loc.get("address"),
         "phone": cemetery.get('phone'),
-        "description": cemetery.get('description')
+        "description": cemetery.get('description'),
+        "location": location if _location_read_uses_canonical() else None,
     })
 
 
@@ -1036,8 +1278,10 @@ ADMIN_CEMETERY_ADDED_LABELS = {'Memoria', 'Сторінки', 'Виробник�
 ADMIN_CEMETERY_ADDED_TONES = {'green', 'gold'}
 ADMIN_CEMETERY_ALLOWED_FIELDS = {
     'name',
+    'location',
     'locality',
     'addressLine',
+    'churchRefs',
     'addedLabel',
     'addedTone',
     'churchesList',
@@ -1090,8 +1334,10 @@ def _derive_added_tone(added_label):
 
 
 def _normalize_admin_cemetery(cemetery):
-    locality = _clean_str(cemetery.get('locality') or cemetery.get('addressLine') or cemetery.get('address'))
-    address_line = _clean_str(cemetery.get('addressLine') or cemetery.get('locality') or cemetery.get('address'))
+    location = normalize_cemetery_location(cemetery)
+    legacy_loc = cemetery_location_to_legacy(location)
+    locality = _clean_str(cemetery.get('locality') or legacy_loc.get('locality') or cemetery.get('addressLine') or cemetery.get('address'))
+    address_line = _clean_str(cemetery.get('addressLine') or legacy_loc.get('addressLine') or cemetery.get('locality') or cemetery.get('address'))
 
     added_label = _clean_str(cemetery.get('addedLabel')) or 'Memoria'
     if added_label not in ADMIN_CEMETERY_ADDED_LABELS:
@@ -1104,7 +1350,8 @@ def _normalize_admin_cemetery(cemetery):
     if status not in ADMIN_CEMETERY_STATUSES:
         status = 'Активний'
 
-    churches_list = _clean_str_list(cemetery.get('churchesList'), 'churchesList')
+    church_refs = normalize_refs_list(cemetery.get('churchRefs') if isinstance(cemetery.get('churchRefs'), list) else cemetery.get('churchesList'))
+    churches_list = refs_to_legacy_names(church_refs)
     fill_percent = _parse_fill_percent(cemetery.get('fillPercent'))
 
     phone_contacts = _clean_str_list(cemetery.get('phoneContacts'), 'phoneContacts')
@@ -1125,10 +1372,12 @@ def _normalize_admin_cemetery(cemetery):
         'name': _clean_str(cemetery.get('name')),
         'locality': locality,
         'addressLine': address_line,
+        'location': location,
         'addedLabel': added_label,
         'addedTone': added_tone,
         'churches': len(churches_list),
         'churchesList': churches_list,
+        'churchRefs': church_refs,
         'fillPercent': fill_percent,
         'status': status,
         'phoneContacts': phone_contacts,
@@ -1163,7 +1412,17 @@ def _build_admin_cemetery_payload(data, partial=False):
         payload[key] = cleaned
 
     _validate_required_text('name', required=not partial)
-    _validate_required_text('locality', required=not partial)
+    if not partial and 'location' not in data:
+        _validate_required_text('locality', required=True)
+
+    location_payload = None
+    if 'location' in data:
+        raw_location = data.get('location')
+        if raw_location is not None and not isinstance(raw_location, dict):
+            abort(400, description="`location` must be an object")
+        location_payload = normalize_location_core(raw_location or {})
+        if _location_write_is_canonical() or _location_write_is_dual():
+            payload['location'] = location_payload
 
     if 'addressLine' in data:
         address_line = _clean_str(data.get('addressLine'))
@@ -1185,6 +1444,10 @@ def _build_admin_cemetery_payload(data, partial=False):
 
     if 'churchesList' in data:
         payload['churchesList'] = _clean_str_list(data.get('churchesList'), 'churchesList')
+    if 'churchRefs' in data:
+        if not isinstance(data.get('churchRefs'), list):
+            abort(400, description="`churchRefs` must be an array")
+        payload['churchRefs'] = normalize_refs_list(data.get('churchRefs'))
 
     if 'fillPercent' in data:
         payload['fillPercent'] = _parse_fill_percent(data.get('fillPercent'))
@@ -1210,15 +1473,41 @@ def _build_admin_cemetery_payload(data, partial=False):
     if 'pageImage' in data:
         payload['pageImage'] = _clean_str(data.get('pageImage'))
 
-    if 'locality' in payload and 'addressLine' not in payload:
-        payload['addressLine'] = payload['locality']
-    if 'addressLine' in payload and 'locality' not in payload:
-        payload['locality'] = payload['addressLine']
+    if 'churchRefs' in payload and 'churchesList' not in payload:
+        payload['churchesList'] = refs_to_legacy_names(payload['churchRefs'])
+    if 'churchesList' in payload and 'churchRefs' not in payload:
+        payload['churchRefs'] = normalize_refs_list(payload['churchesList'])
+
+    legacy_locality = payload.get('locality')
+    legacy_address_line = payload.get('addressLine')
+    if legacy_locality and not legacy_address_line:
+        legacy_address_line = legacy_locality
+    if legacy_address_line and not legacy_locality:
+        legacy_locality = legacy_address_line
+
+    if location_payload is None and (
+        ('locality' in payload) or ('addressLine' in payload) or ('locality' in data) or ('addressLine' in data)
+    ):
+        location_payload = normalize_location_core({
+            'area': {'display': legacy_locality or ''},
+            'addressLine': legacy_address_line or '',
+        })
+        if _location_write_is_canonical() or _location_write_is_dual():
+            payload['location'] = location_payload
+
+    if location_payload and (_location_write_is_legacy() or _location_write_is_dual()):
+        legacy_loc = cemetery_location_to_legacy(location_payload)
+        payload['locality'] = legacy_loc.get('locality', '')
+        payload['addressLine'] = legacy_loc.get('addressLine', '')
+    elif legacy_locality or legacy_address_line:
+        payload['locality'] = legacy_locality or ''
+        payload['addressLine'] = legacy_address_line or ''
 
     if not partial:
         payload.setdefault('addedLabel', 'Memoria')
         payload.setdefault('addedTone', _derive_added_tone(payload.get('addedLabel')))
-        payload.setdefault('churchesList', [])
+        payload.setdefault('churchRefs', [])
+        payload.setdefault('churchesList', refs_to_legacy_names(payload.get('churchRefs')))
         payload.setdefault('fillPercent', 0)
         payload.setdefault('status', 'Активний')
         payload.setdefault('phoneContacts', [])
@@ -1228,6 +1517,16 @@ def _build_admin_cemetery_payload(data, partial=False):
         payload.setdefault('pageImage', '')
         payload.setdefault('addressLine', payload.get('locality', ''))
         payload.setdefault('locality', payload.get('addressLine', ''))
+
+        if 'location' not in payload and (_location_write_is_canonical() or _location_write_is_dual()):
+            payload['location'] = normalize_location_core({
+                'area': {'display': payload.get('locality', '')},
+                'addressLine': payload.get('addressLine', ''),
+            })
+        if ('locality' not in payload or 'addressLine' not in payload) and payload.get('location'):
+            legacy_loc = cemetery_location_to_legacy(payload.get('location'))
+            payload.setdefault('locality', legacy_loc.get('locality', ''))
+            payload.setdefault('addressLine', legacy_loc.get('addressLine', ''))
 
     if 'pageImage' in payload:
         payload['image'] = payload['pageImage']
@@ -1252,6 +1551,9 @@ def admin_list_cemeteries():
                 {'locality': regex},
                 {'addressLine': regex},
                 {'address': regex},
+                {'location.display': regex},
+                {'location.area.display': regex},
+                {'location.area.city': regex},
             ]
         }
 
@@ -1341,11 +1643,13 @@ WEEKDAY_TO_LITURGY_KEY = {2: 'Вт', 5: 'Пт', 6: 'Сб'}
 LITURGY_KEY_TO_WEEKDAY = {value: key for key, value in WEEKDAY_TO_LITURGY_KEY.items()}
 ADMIN_CHURCH_ALLOWED_FIELDS = {
     'name',
+    'location',
     'address',
     'locality',
     'workingDays',
     'liturgyEndTimes',
     'churchDays',
+    'cemeteryRefs',
     'cemeteries',
     'status',
     'contacts',
@@ -1508,6 +1812,8 @@ def _clean_church_days(value, field_name='churchDays'):
 
 
 def _normalize_admin_church(church):
+    location = normalize_church_location(church)
+    legacy_loc = church_location_to_legacy(location)
     contacts = _clean_contacts_list_loose(church.get('contacts'))
     first_contact = contacts[0] if contacts else {}
 
@@ -1524,7 +1830,8 @@ def _normalize_admin_church(church):
         status = 'Активний'
 
     working_days = _clean_str_list(church.get('workingDays'), 'workingDays') if isinstance(church.get('workingDays'), list) else []
-    cemeteries = _clean_str_list(church.get('cemeteries'), 'cemeteries') if isinstance(church.get('cemeteries'), list) else []
+    cemetery_refs = normalize_refs_list(church.get('cemeteryRefs') if isinstance(church.get('cemeteryRefs'), list) else church.get('cemeteries'))
+    cemeteries = refs_to_legacy_names(cemetery_refs)
     liturgy_end_times = _clean_liturgy_end_times(church.get('liturgyEndTimes'))
     church_days = _clean_church_days(church.get('churchDays'))
 
@@ -1543,8 +1850,9 @@ def _normalize_admin_church(church):
     return {
         'id': str(church.get('_id')),
         'name': _clean_str(church.get('name')),
-        'address': _clean_str(church.get('address')),
-        'locality': _clean_str(church.get('locality')),
+        'address': _clean_str(church.get('address') or legacy_loc.get('address')),
+        'locality': _clean_str(church.get('locality') or legacy_loc.get('locality')),
+        'location': location,
         'contactPerson': contact_person,
         'phone': phone,
         'status': status,
@@ -1552,6 +1860,7 @@ def _normalize_admin_church(church):
         'liturgyEndTimes': liturgy_end_times,
         'churchDays': church_days,
         'cemeteries': cemeteries,
+        'cemeteryRefs': cemetery_refs,
         'contacts': contacts,
         'infoNotes': _clean_str(church.get('infoNotes')),
         'iban': _clean_str(church.get('iban')),
@@ -1585,7 +1894,17 @@ def _build_admin_church_payload(data, partial=False):
         payload[key] = cleaned
 
     _validate_required_text('name', required=not partial)
-    _validate_required_text('address', required=not partial)
+    if not partial and 'location' not in data:
+        _validate_required_text('address', required=True)
+
+    location_payload = None
+    if 'location' in data:
+        raw_location = data.get('location')
+        if raw_location is not None and not isinstance(raw_location, dict):
+            abort(400, description="`location` must be an object")
+        location_payload = normalize_location_core(raw_location or {})
+        if _location_write_is_canonical() or _location_write_is_dual():
+            payload['location'] = location_payload
 
     if 'locality' in data:
         payload['locality'] = _clean_str(data.get('locality'))
@@ -1601,6 +1920,10 @@ def _build_admin_church_payload(data, partial=False):
 
     if 'cemeteries' in data:
         payload['cemeteries'] = _clean_str_list(data.get('cemeteries'), 'cemeteries')
+    if 'cemeteryRefs' in data:
+        if not isinstance(data.get('cemeteryRefs'), list):
+            abort(400, description="`cemeteryRefs` must be an array")
+        payload['cemeteryRefs'] = normalize_refs_list(data.get('cemeteryRefs'))
 
     if 'status' in data:
         status = _clean_str(data.get('status'))
@@ -1638,8 +1961,30 @@ def _build_admin_church_payload(data, partial=False):
         if not payload.get('phone'):
             payload['phone'] = payload['contacts'][0].get('phone', '')
 
+    if 'cemeteryRefs' in payload and 'cemeteries' not in payload:
+        payload['cemeteries'] = refs_to_legacy_names(payload['cemeteryRefs'])
+    if 'cemeteries' in payload and 'cemeteryRefs' not in payload:
+        payload['cemeteryRefs'] = normalize_refs_list(payload['cemeteries'])
+
     if 'infoNotes' in payload:
         payload['description'] = payload['infoNotes']
+
+    legacy_address = payload.get('address')
+    legacy_locality = payload.get('locality')
+    if location_payload is None and (
+        ('address' in payload) or ('locality' in payload) or ('address' in data) or ('locality' in data)
+    ):
+        location_payload = normalize_location_core({
+            'area': {'display': legacy_locality or ''},
+            'addressLine': legacy_address or '',
+        })
+        if _location_write_is_canonical() or _location_write_is_dual():
+            payload['location'] = location_payload
+
+    if location_payload and (_location_write_is_legacy() or _location_write_is_dual()):
+        legacy_loc = church_location_to_legacy(location_payload)
+        payload['locality'] = legacy_loc.get('locality', '')
+        payload['address'] = legacy_loc.get('address', '')
 
     if 'churchDays' in payload:
         if 'workingDays' not in payload:
@@ -1657,7 +2002,8 @@ def _build_admin_church_payload(data, partial=False):
         payload.setdefault('workingDays', [])
         payload.setdefault('liturgyEndTimes', {'Вт': '', 'Пт': '', 'Сб': ''})
         payload.setdefault('churchDays', _church_days_from_legacy(payload.get('workingDays', []), payload.get('liturgyEndTimes', {'Вт': '', 'Пт': '', 'Сб': ''})))
-        payload.setdefault('cemeteries', [])
+        payload.setdefault('cemeteryRefs', [])
+        payload.setdefault('cemeteries', refs_to_legacy_names(payload.get('cemeteryRefs')))
         payload.setdefault('status', 'Активний')
         payload.setdefault('contacts', [])
         payload.setdefault('contactPerson', '')
@@ -1668,6 +2014,16 @@ def _build_admin_church_payload(data, partial=False):
         payload.setdefault('recipientName', '')
         payload.setdefault('botCode', '')
         payload.setdefault('description', payload.get('infoNotes', ''))
+
+        if 'location' not in payload and (_location_write_is_canonical() or _location_write_is_dual()):
+            payload['location'] = normalize_location_core({
+                'area': {'display': payload.get('locality', '')},
+                'addressLine': payload.get('address', ''),
+            })
+        if ('address' not in payload or 'locality' not in payload) and payload.get('location'):
+            legacy_loc = church_location_to_legacy(payload.get('location'))
+            payload.setdefault('locality', legacy_loc.get('locality', ''))
+            payload.setdefault('address', legacy_loc.get('address', ''))
 
     return payload
 
@@ -1682,6 +2038,8 @@ def admin_list_churches():
             '$or': [
                 {'name': regex},
                 {'address': regex},
+                {'locality': regex},
+                {'location.display': regex},
                 {'contactPerson': regex},
                 {'phone': regex},
             ]
@@ -1760,6 +2118,8 @@ ADMIN_RITUAL_SERVICE_ALLOWED_FIELDS = {
     'payments',
     'latitude',
     'longitude',
+    'hqLocation',
+    'serviceAreaIds',
     'description',
     'items',
 }
@@ -1999,15 +2359,20 @@ def _get_active_ritual_period(payments):
 
 
 def _normalize_admin_ritual_service(ritual_service):
+    hq_location = normalize_ritual_hq_location(ritual_service)
+    legacy_loc = ritual_location_to_legacy(hq_location, current_doc=ritual_service)
     contacts = _clean_ritual_contacts_loose(ritual_service.get('contacts'))
     if not contacts:
         contacts = _derive_ritual_contacts_from_legacy(ritual_service)
 
     settlements = _clean_str_list(ritual_service.get('settlements'), 'settlements') if isinstance(ritual_service.get('settlements'), list) else []
+    service_area_ids = _clean_str_list(ritual_service.get('serviceAreaIds'), 'serviceAreaIds') if isinstance(ritual_service.get('serviceAreaIds'), list) else []
     payments = _clean_ritual_payments(ritual_service.get('payments'))
     active_period = _get_active_ritual_period(payments)
 
     addresses = [entry.get('address', '') for entry in contacts if _clean_str(entry.get('address'))]
+    if not addresses:
+        addresses = _coerce_ritual_addresses(ritual_service.get('address') or legacy_loc.get('address'))
     subtitle = addresses[0] if addresses else (settlements[0] if settlements else '')
 
     status = _normalize_ritual_service_status(ritual_service.get('status'))
@@ -2031,14 +2396,16 @@ def _normalize_admin_ritual_service(ritual_service):
         'settlements': settlements,
         'contacts': contacts,
         'payments': payments,
-        'addresses': _coerce_ritual_addresses(ritual_service.get('address')),
+        'addresses': _coerce_ritual_addresses(ritual_service.get('address') or legacy_loc.get('address')),
         'phones': _coerce_ritual_phones(ritual_service.get('phone')),
         'periodStart': active_period['periodStart'],
         'periodEnd': active_period['periodEnd'],
         'periodDays': active_period['periodDays'],
         'daysLeft': active_period['daysLeft'],
-        'latitude': ritual_service.get('latitude'),
-        'longitude': ritual_service.get('longitude'),
+        'latitude': ritual_service.get('latitude') if ritual_service.get('latitude') is not None else legacy_loc.get('latitude'),
+        'longitude': ritual_service.get('longitude') if ritual_service.get('longitude') is not None else legacy_loc.get('longitude'),
+        'hqLocation': hq_location,
+        'serviceAreaIds': service_area_ids,
         'description': ritual_service.get('description'),
         'items': ritual_service.get('items'),
         'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
@@ -2098,6 +2465,21 @@ def _build_admin_ritual_service_payload(data, partial=False):
         payload['latitude'] = data.get('latitude')
     if 'longitude' in data:
         payload['longitude'] = data.get('longitude')
+    if 'hqLocation' in data:
+        if data.get('hqLocation') is not None and not isinstance(data.get('hqLocation'), dict):
+            abort(400, description='`hqLocation` must be an object')
+        hq_location = normalize_location_core(data.get('hqLocation') or {})
+        if _location_write_is_canonical() or _location_write_is_dual():
+            payload['hqLocation'] = hq_location
+        if _location_write_is_legacy() or _location_write_is_dual():
+            legacy = ritual_location_to_legacy(hq_location, current_doc={'address': payload.get('address', [])})
+            payload['address'] = legacy.get('address', [])
+            payload['latitude'] = legacy.get('latitude')
+            payload['longitude'] = legacy.get('longitude')
+    if 'serviceAreaIds' in data:
+        if not isinstance(data.get('serviceAreaIds'), list):
+            abort(400, description='`serviceAreaIds` must be an array')
+        payload['serviceAreaIds'] = [loc_clean_str(v) for v in data.get('serviceAreaIds', []) if loc_clean_str(v)]
     if 'description' in data:
         payload['description'] = data.get('description')
     if 'items' in data:
@@ -2108,6 +2490,24 @@ def _build_admin_ritual_service_payload(data, partial=False):
         phones = [entry.get('phone', '') for entry in payload['contacts'] if _clean_str(entry.get('phone'))]
         payload['address'] = addresses
         payload['phone'] = phones
+
+    if 'hqLocation' not in payload and (
+        ('latitude' in payload) or ('longitude' in payload) or ('contacts' in payload) or ('settlements' in payload)
+    ):
+        address_seed = ''
+        if isinstance(payload.get('contacts'), list) and payload.get('contacts'):
+            address_seed = _clean_str((payload['contacts'][0] or {}).get('address'))
+        if not address_seed and isinstance(payload.get('address'), list) and payload.get('address'):
+            address_seed = _clean_str(payload['address'][0])
+        hq_location = normalize_location_core({
+            'addressLine': address_seed,
+            'geo': {
+                'lat': payload.get('latitude'),
+                'lng': payload.get('longitude'),
+            },
+        })
+        if _location_write_is_canonical() or _location_write_is_dual():
+            payload['hqLocation'] = hq_location
 
     if not partial:
         payload.setdefault('category', DEFAULT_RITUAL_SERVICE_CATEGORIES[1])
@@ -2124,10 +2524,19 @@ def _build_admin_ritual_service_payload(data, partial=False):
         payload.setdefault('items', [])
         payload.setdefault('latitude', None)
         payload.setdefault('longitude', None)
+        payload.setdefault('serviceAreaIds', [])
         if 'address' not in payload:
             payload['address'] = []
         if 'phone' not in payload:
             payload['phone'] = []
+        if 'hqLocation' not in payload and (_location_write_is_canonical() or _location_write_is_dual()):
+            payload['hqLocation'] = normalize_location_core({
+                'addressLine': payload['address'][0] if payload.get('address') else '',
+                'geo': {
+                    'lat': payload.get('latitude'),
+                    'lng': payload.get('longitude'),
+                },
+            })
 
     return payload
 
@@ -2233,6 +2642,7 @@ def admin_list_ritual_services():
                 {'name': regex},
                 {'category': regex},
                 {'address': regex},
+                {'hqLocation.display': regex},
                 {'settlements': regex},
                 {'contacts.address': regex},
                 {'contacts.phone': regex},
@@ -2309,13 +2719,16 @@ def churches_page():
 
     churches_list = []
     for church in churches_cursor:
+        location = normalize_church_location(church)
+        legacy_loc = church_location_to_legacy(location)
         churches_list.append({
             "id": str(church.get('_id')),
             "name": church.get('name'),
             "image": church.get('image'),
-            "address": church.get('address'),
+            "address": church.get('address') or legacy_loc.get("address"),
             "phone": church.get('phone'),
-            "description": church.get('description')
+            "description": church.get('description'),
+            "location": location if _location_read_uses_canonical() else None,
         })
 
     return jsonify({
@@ -2335,162 +2748,113 @@ def get_church_page(church_id):
     if not church:
         abort(404, description="Church not found")
 
+    location = normalize_church_location(church)
+    legacy_loc = church_location_to_legacy(location)
     return jsonify({
         "id": str(church.get('_id')),
         "name": church.get('name'),
         "image": church.get('image'),
-        "address": church.get('address'),
+        "address": church.get('address') or legacy_loc.get("address"),
         "phone": church.get('phone'),
-        "description": church.get('description')
+        "description": church.get('description'),
+        "location": location if _location_read_uses_canonical() else None,
     })
 
 
 @application.route('/api/locations', methods=['GET'])
 def locations():
-    """
-    Повертає список назв населених пунктів (area),
-    використовуючи той самий GeoNames API, що й сторінка ритуальних послуг.
-
-    Параметри:
-      - search — початок назви міста (name_startsWith).
-
-    Відповідь: масив об'єктів:
-      - id      — GeoNames geonameId (рядок)
-      - display — "Місто, Область, Країна"
-      - lat/lng — координати (float), опційно
-    """
     search = request.args.get('search', '').strip()
     if not search:
         return jsonify([])
+    return jsonify(geonames_search_areas(search, GEONAMES_USER, GEONAMES_LANG))
 
-    try:
-        url = (
-            "https://secure.geonames.org/searchJSON?"
-            f"name_startsWith={requests.utils.quote(search)}"
-            "&country=UA"
-            "&featureClass=P"
-            "&maxRows=10"
-            f"&lang={GEONAMES_LANG}"
-            f"&username={GEONAMES_USER}"
-        )
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        geonames = data.get("geonames") or []
-    except Exception as exc:
-        print(f"[GeoNames] locations error for search='{search}': {exc}")
-        return jsonify([])
 
+def _query_cemetery_options(area_id='', area='', search='', limit=10):
+    area_id = loc_clean_str(area_id)
+    area = loc_clean_str(area)
+    search = loc_clean_str(search)
+    query_filter = {}
+    if search:
+        query_filter["name"] = {'$regex': f'^{re.escape(search)}', '$options': 'i'}
+
+    docs = list(cemeteries_collection.find(query_filter).limit(max(int(limit), 1)))
+    options = []
+    for doc in docs:
+        item = cemetery_option_from_doc(doc)
+        if not item.get("name"):
+            continue
+        if area_id:
+            if item.get("areaId") != area_id:
+                continue
+        elif area:
+            city_part = area.split(',')[0].strip()
+            if city_part:
+                pattern = re.compile(r'\b' + re.escape(city_part) + r'\b', re.IGNORECASE)
+                area_text = item.get("area") or ""
+                if not pattern.search(area_text):
+                    continue
+        options.append(item)
+
+    # Fallback for legacy docs without normalized location.
+    if not options and (area_id or area):
+        legacy_query = {}
+        if area:
+            city_part = area.split(',')[0].strip()
+            if city_part:
+                legacy_query["locality"] = {'$regex': r'\b' + re.escape(city_part) + r'\b', '$options': 'i'}
+        if search:
+            legacy_query["name"] = {'$regex': f'^{re.escape(search)}', '$options': 'i'}
+        for doc in cemeteries_collection.find(legacy_query).limit(max(int(limit), 1)):
+            item = cemetery_option_from_doc(doc)
+            if area_id and item.get("areaId") and item.get("areaId") != area_id:
+                continue
+            options.append(item)
+
+    # Keep stable, unique response by name+areaId.
+    uniq = []
     seen = set()
-    areas = []
-    for place in geonames:
-        name = (place.get("name") or "").strip()
-        admin = (place.get("adminName1") or "").strip()
-        country = (place.get("countryName") or "").strip()
-        geoname_id = str(place.get("geonameId") or "").strip()
-        lat_raw = place.get("lat")
-        lng_raw = place.get("lng")
-        try:
-            lat = float(lat_raw) if lat_raw is not None else None
-        except (TypeError, ValueError):
-            lat = None
-        try:
-            lng = float(lng_raw) if lng_raw is not None else None
-        except (TypeError, ValueError):
-            lng = None
-        parts = [p for p in (name, admin, country) if p]
-        display = ", ".join(parts)
-        if geoname_id and display and geoname_id not in seen:
-            seen.add(geoname_id)
-            areas.append({
-                "id": geoname_id,
-                "display": display,
-                "lat": lat,
-                "lng": lng,
-            })
-
-    return jsonify(areas)
+    for item in options:
+        key = (item.get("name"), item.get("areaId") or item.get("area"))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(item)
+    uniq.sort(key=lambda x: (loc_clean_str(x.get("name")).lower(), loc_clean_str(x.get("area")).lower()))
+    return uniq[: max(int(limit), 1)]
 
 
 @application.route('/api/cemeteries', methods=['GET'])
 def cemeteries():
-    """
-    Повертає список об'єктів { name, area, areaId }:
-      - name: назва кладовища
-      - area: населений пункт / область, з документа areas_collection.area
-      - areaId: GeoNames ID населеного пункту (areas_collection.areaId)
-
-    Фільтри (будь-який з них опційний):
-      - areaId — унікальний GeoNames ID населеного пункту
-      - area   — місто (перша частина рядка "Місто, Область, ..."),
-                 шукається як окреме слово в полі area (case-insensitive),
-                 використовується як фолбек, якщо немає areaId
-      - search — початок рядка, case-insensitive по елементам масиву cemetries
-    """
     area_id = request.args.get('areaId', '').strip()
     area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
-
-    # Будуємо aggregation pipeline
-    pipeline = []
-
-    # 1) Фільтр по населеному пункту:
-    #    якщо передано areaId — використовуємо його;
-    #    інакше фолбек на текстовий area (місто як окреме слово).
-    if area_id:
-        pipeline.append({
-            '$match': {
-                'areaId': area_id
-            }
-        })
-    elif area:
-        city_part = area.split(',')[0].strip()
-        if city_part:
-            pattern = r'\b' + re.escape(city_part) + r'\b'
-            pipeline.append({
-                '$match': {
-                    'area': {'$regex': pattern, '$options': 'i'}
-                }
-            })
-
-    # 2) Беремо лише потрібні поля
-    pipeline.extend([
-        {'$project': {'area': 1, 'areaId': 1, 'cemetries': 1}},
-        {'$unwind': '$cemetries'}
-    ])
-
-    # 3) Фільтр по назві кладовища (тільки з початку рядка)
-    if search:
-        pipeline.append({
-            '$match': {
-                'cemetries': {'$regex': f'^{re.escape(search)}', '$options': 'i'}
-            }
-        })
-
-    # 4) Прибрати порожні значення
-    pipeline.append({
-        '$match': {
-            'cemetries': {'$nin': [None, '']}
-        }
-    })
-
-    # 5) Унікальні пари (кладовище, area, areaId)
-    pipeline.extend([
-        {'$group': {
-            '_id': {'name': '$cemetries', 'area': '$area', 'areaId': '$areaId'}
-        }},
-        {'$project': {
-            '_id': 0,
-            'name': '$_id.name',
-            'area': '$_id.area',
-            'areaId': '$_id.areaId'
-        }},
-        {'$sort': {'name': 1}},
-        {'$limit': 10}
-    ])
-
-    items = list(areas_collection.aggregate(pipeline))
+    items = _query_cemetery_options(area_id=area_id, area=area, search=search, limit=10)
     return jsonify(items)
+
+
+@application.route('/api/location/areas', methods=['GET'])
+def location_areas():
+    search = request.args.get('search', '').strip()
+    if not search:
+        return jsonify({"total": 0, "items": []})
+    items = geonames_search_areas(search, GEONAMES_USER, GEONAMES_LANG)
+    return jsonify({"total": len(items), "items": items})
+
+
+@application.route('/api/location/cemeteries', methods=['GET'])
+def location_cemeteries():
+    area_id = request.args.get('areaId', '').strip()
+    area = request.args.get('area', '').strip()
+    search = request.args.get('search', '').strip()
+    items = _query_cemetery_options(area_id=area_id, area=area, search=search, limit=20)
+    return jsonify({"total": len(items), "items": items})
+
+
+@application.route('/api/location/normalize', methods=['POST'])
+def location_normalize():
+    payload = request.get_json(silent=True) or {}
+    location = normalize_location_input(payload)
+    return jsonify({"location": location})
 
 
 @application.route('/api/ritual_services', methods=['GET'])
@@ -2504,21 +2868,28 @@ def ritual_services():
         query_filter['name'] = {'$regex': re.escape(search_query), '$options': 'i'}
 
     if address:
-        query_filter['address'] = {'$regex': re.escape(address),
-                                   '$options': 'i'}  # частковий, нечутливий до регістру пошук
+        query_filter['$or'] = [
+            {'address': {'$regex': re.escape(address), '$options': 'i'}},
+            {'hqLocation.display': {'$regex': re.escape(address), '$options': 'i'}},
+            {'contacts.address': {'$regex': re.escape(address), '$options': 'i'}},
+        ]
 
     ritual_services_cursor = ritual_services_collection.find(query_filter)
 
     ritual_services_list = []
     for ritual_service in ritual_services_cursor:
+        hq_location = normalize_ritual_hq_location(ritual_service)
+        legacy_loc = ritual_location_to_legacy(hq_location, current_doc=ritual_service)
         ritual_services_list.append({
             "id": str(ritual_service.get('_id')),
             "name": ritual_service.get('name'),
-            "address": ritual_service.get('address'),
+            "address": ritual_service.get('address') or legacy_loc.get("address"),
             "category": ritual_service.get('category'),
             "logo": ritual_service.get('logo'),
-            "latitude": ritual_service.get("latitude"),
-            "longitude": ritual_service.get("longitude")
+            "latitude": ritual_service.get("latitude") if ritual_service.get("latitude") is not None else legacy_loc.get("latitude"),
+            "longitude": ritual_service.get("longitude") if ritual_service.get("longitude") is not None else legacy_loc.get("longitude"),
+            "hqLocation": hq_location if _location_read_uses_canonical() else None,
+            "serviceAreaIds": ritual_service.get("serviceAreaIds", []),
         })
 
     return jsonify({
@@ -2595,19 +2966,23 @@ def get_ritual_service(ritual_service_id):
                     albums = [a for a in albums if _not_empty(a)]
                     norm_items.append([title, albums])
 
+        hq_location = normalize_ritual_hq_location(ritual_service)
+        legacy_loc = ritual_location_to_legacy(hq_location, current_doc=ritual_service)
         return jsonify({
             "id": str(ritual_service['_id']),
             "name": ritual_service.get('name'),
-            "address": ritual_service.get('address'),
+            "address": ritual_service.get('address') or legacy_loc.get("address"),
             "category": ritual_service.get('category'),
             "logo": ritual_service.get('logo'),
-            "latitude": ritual_service.get('latitude'),
-            "longitude": ritual_service.get('longitude'),
+            "latitude": ritual_service.get('latitude') if ritual_service.get('latitude') is not None else legacy_loc.get("latitude"),
+            "longitude": ritual_service.get('longitude') if ritual_service.get('longitude') is not None else legacy_loc.get("longitude"),
             "banner": ritual_service.get('banner'),
             "description": ritual_service.get('description'),
             "link": ritual_service.get('link'),
             "phone": ritual_service.get('phone'),
-            "items": norm_items  # normalized for the new UI (photos or video)
+            "items": norm_items,  # normalized for the new UI (photos or video)
+            "hqLocation": hq_location if _location_read_uses_canonical() else None,
+            "serviceAreaIds": ritual_service.get("serviceAreaIds", []),
         })
 
     # ---------------------------- PUT ----------------------------
@@ -2696,6 +3071,21 @@ def get_ritual_service(ritual_service_id):
             normalized_items.append([title, albums_out])
 
         update_fields['items'] = normalized_items
+
+    if 'hqLocation' in data:
+        if data['hqLocation'] is not None and not isinstance(data['hqLocation'], dict):
+            abort(400, description="`hqLocation` must be an object")
+        hq_location = normalize_location_core(data.get('hqLocation') or {})
+        update_fields['hqLocation'] = hq_location
+        legacy = ritual_location_to_legacy(hq_location, current_doc=ritual_service)
+        update_fields['address'] = legacy['address']
+        update_fields['latitude'] = legacy['latitude']
+        update_fields['longitude'] = legacy['longitude']
+
+    if 'serviceAreaIds' in data:
+        if not isinstance(data['serviceAreaIds'], list):
+            abort(400, description="`serviceAreaIds` must be an array")
+        update_fields['serviceAreaIds'] = [loc_clean_str(v) for v in data['serviceAreaIds'] if loc_clean_str(v)]
 
     if not update_fields:
         abort(400, description="Nothing to update")
@@ -2912,12 +3302,49 @@ def people_add_moderation():
     if death_year is None and death_date:
         death_year = int(death_date[:4])
 
+    area = loc_clean_str(data.get('area'))
+    area_id = loc_clean_str(data.get('areaId'))
+    cemetery = loc_clean_str(data.get('cemetery'))
+
+    burial_site_coords = loc_clean_str(data.get('burialSiteCoords'))
+    burial_site_photo_url = loc_clean_str(data.get('burialSitePhotoUrl'))
+    burial_site_photo_urls = loc_clean_str_list(data.get('burialSitePhotoUrls'))
+    if not burial_site_photo_urls and burial_site_photo_url:
+        burial_site_photo_urls = [burial_site_photo_url]
+
+    incoming_burial = data.get('burial') if isinstance(data.get('burial'), dict) else None
+    if incoming_burial:
+        burial = normalize_person_burial({
+            'burial': incoming_burial,
+            'area': area,
+            'areaId': area_id,
+            'cemetery': cemetery,
+            'location': [burial_site_coords, '', burial_site_photo_urls],
+        })
+    else:
+        burial = normalize_person_burial({
+            'area': area,
+            'areaId': area_id,
+            'cemetery': cemetery,
+            'location': [burial_site_coords, '', burial_site_photo_urls],
+        })
+
+    legacy = person_burial_to_legacy_fields(burial)
+
     document = {
         'name': data.get('name'),
-        'area': data.get('area'),
-        'cemetery': data.get('cemetery'),
+        'areaId': area_id or legacy.get('areaId', ''),
+        'area': area or legacy.get('area', ''),
+        'cemetery': cemetery or legacy.get('cemetery', ''),
+        'location': legacy.get('location', []),
+        'burialSiteCoords': burial_site_coords,
+        'burialSitePhotoUrl': burial_site_photo_urls[0] if burial_site_photo_urls else '',
+        'burialSitePhotoUrls': burial_site_photo_urls,
+        'burialSitePhotoCount': len(burial_site_photo_urls),
+        'burial': burial,
         'link': data.get('link', ''),
-        'bio': data.get('bio', '')
+        'bio': data.get('bio', ''),
+        'createdAt': datetime.utcnow(),
     }
 
     if birth_year is not None:

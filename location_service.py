@@ -176,6 +176,158 @@ def _to_country_codes(country_codes):
     return unique
 
 
+def _normalize_query_spaces(value):
+    text = clean_str(value)
+    if not text:
+        return ""
+    text = text.replace("№", " ")
+    text = re.sub(r"\s*,\s*", ", ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text, flags=re.UNICODE)
+    return text.strip(" ,")
+
+
+def _normalize_text_for_match(value):
+    text = clean_str(value).lower()
+    if not text:
+        return ""
+    text = text.replace("№", " ")
+    text = re.sub(r"[^\w\s/-]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text, flags=re.UNICODE)
+    return text.strip()
+
+
+def _street_prefix_pattern():
+    return r"^(?:вул\.?|вулиця|ул\.?|улица|street|st\.?|просп\.?|проспект|пр-т\.?|пров\.?|провулок|пл\.?|площа|б-р\.?|бульвар)\s+"
+
+
+def _strip_street_prefix(value):
+    text = _normalize_query_spaces(value)
+    if not text:
+        return ""
+    return re.sub(_street_prefix_pattern(), "", text, flags=re.IGNORECASE | re.UNICODE).strip(" ,")
+
+
+def _is_house_token(value):
+    token = clean_str(value)
+    if not token:
+        return False
+    return bool(re.match(r"^\d+[A-Za-zА-Яа-яІіЇїЄєҐґ0-9/-]*$", token, flags=re.UNICODE))
+
+
+def _parse_address_query_parts(search):
+    query = _normalize_query_spaces(search)
+    parsed = {
+        "query": query,
+        "street": "",
+        "house": "",
+    }
+    if not query:
+        return parsed
+
+    street = ""
+    house = ""
+
+    comma_parts = [clean_str(part) for part in query.split(",") if clean_str(part)]
+    if len(comma_parts) >= 2:
+        first, second = comma_parts[0], comma_parts[1]
+        if _is_house_token(second) and not _is_house_token(first):
+            street, house = first, second
+        elif _is_house_token(first) and not _is_house_token(second):
+            street, house = second, first
+
+    if not street or not house:
+        trailing = re.match(
+            r"^(.+?)\s+(\d+[A-Za-zА-Яа-яІіЇїЄєҐґ0-9/-]*)$",
+            query,
+            flags=re.UNICODE,
+        )
+        if trailing:
+            street = street or clean_str(trailing.group(1))
+            house = house or clean_str(trailing.group(2))
+
+    if not street or not house:
+        leading = re.match(
+            r"^(\d+[A-Za-zА-Яа-яІіЇїЄєҐґ0-9/-]*)\s+(.+)$",
+            query,
+            flags=re.UNICODE,
+        )
+        if leading:
+            house = house or clean_str(leading.group(1))
+            street = street or clean_str(leading.group(2))
+
+    street = _strip_street_prefix(street or query)
+    parsed["street"] = street
+    parsed["house"] = clean_str(house)
+    return parsed
+
+
+def _build_address_query_variants(search, city=""):
+    parsed = _parse_address_query_parts(search)
+    city_clean = _normalize_query_spaces(city)
+    street = clean_str(parsed.get("street"))
+    house = clean_str(parsed.get("house"))
+    original = clean_str(parsed.get("query"))
+
+    variants = []
+    seen = set()
+
+    def push(value):
+        text = _normalize_query_spaces(value)
+        if not text:
+            return
+        final_query = text
+        if city_clean and _normalize_text_for_match(city_clean) not in _normalize_text_for_match(final_query):
+            final_query = f"{text}, {city_clean}"
+        key = final_query.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        variants.append(final_query)
+
+    push(original)
+    if street and house:
+        push(f"{street} {house}")
+        push(f"{house} {street}")
+        push(f"{street}, {house}")
+    if street:
+        push(street)
+    if street and not house:
+        push(f"{street} 1")
+        push(f"{street} 2")
+        push(f"{street} 10")
+
+    return variants, parsed
+
+
+def _similarity_score(query, display, road="", house_number=""):
+    query_norm = _normalize_text_for_match(query)
+    if not query_norm:
+        return 0.0
+
+    candidate = _normalize_text_for_match(
+        " ".join([clean_str(display), clean_str(road), clean_str(house_number)])
+    )
+    if not candidate:
+        return 0.0
+
+    score = 0.0
+    if query_norm == candidate:
+        score += 1.0
+    elif query_norm in candidate:
+        score += 0.6
+
+    if candidate.startswith(query_norm):
+        score += 0.2
+
+    query_tokens = [token for token in query_norm.split(" ") if token]
+    candidate_tokens = set([token for token in candidate.split(" ") if token])
+    if query_tokens:
+        overlap = sum(1 for token in query_tokens if token in candidate_tokens)
+        score += 0.4 * (overlap / float(len(query_tokens)))
+
+    return score
+
+
 def _http_get_json(url, params=None, headers=None, timeout=5, retries=1):
     query = params if isinstance(params, dict) else {}
     req_headers = headers if isinstance(headers, dict) else {}
@@ -599,27 +751,30 @@ def search_address_suggestions(
     if cached is not None:
         return cached
 
-    query = search_clean
-    if city_clean:
-        query = f"{search_clean}, {city_clean}"
-
-    payload = _photon_request(
-        photon_base_url,
-        {
-            "q": query,
-            "limit": max(int(max_rows), 1),
-            "lang": clean_str(language) or "uk",
-        },
-        user_agent=user_agent,
-        timeout=timeout_seconds,
-        retries=retries,
-    )
-    features = payload.get("features") if isinstance(payload, dict) and isinstance(payload.get("features"), list) else []
+    queries, parsed_query = _build_address_query_variants(search_clean, city=city_clean)
+    feature_pool = []
+    request_limit = max(int(max_rows), 1)
+    for query_variant in queries[:6]:
+        payload = _photon_request(
+            photon_base_url,
+            {
+                "q": query_variant,
+                "limit": max(request_limit, 10),
+                "lang": clean_str(language) or "uk",
+            },
+            user_agent=user_agent,
+            timeout=timeout_seconds,
+            retries=retries,
+        )
+        features = payload.get("features") if isinstance(payload, dict) and isinstance(payload.get("features"), list) else []
+        feature_pool.extend(features)
 
     out = []
     allowed = set(_to_country_codes(country_codes))
+    city_norm = _normalize_text_for_match(city_clean)
+    query_for_score = clean_str(parsed_query.get("query") or search_clean)
 
-    for feature in features:
+    for feature in feature_pool:
         if not isinstance(feature, dict):
             continue
 
@@ -661,6 +816,17 @@ def search_address_suggestions(
         ) or clean_str(props.get("name")) or clean_str(area.get("display"))
 
         has_street_and_house = bool(road and house_number)
+        candidate_city = clean_str(address_parts.get("city")) or clean_str(area.get("city"))
+        candidate_city_norm = _normalize_text_for_match(candidate_city)
+        display_norm = _normalize_text_for_match(display)
+        city_match = bool(
+            city_norm
+            and (
+                (candidate_city_norm and city_norm in candidate_city_norm)
+                or (display_norm and city_norm in display_norm)
+            )
+        )
+        similarity = _similarity_score(query_for_score, display, road=road, house_number=house_number)
 
         out.append({
             "id": clean_str(area.get("id")),
@@ -686,10 +852,35 @@ def search_address_suggestions(
             "provider": "photon",
             "source": "photon",
             "hasStreetAndHouse": has_street_and_house,
+            "__rank": {
+                "streetHouse": 1 if has_street_and_house else 0,
+                "cityMatch": 1 if city_match else 0,
+                "similarity": similarity,
+            },
         })
 
-    out = _dedupe_by_key(out, lambda x: (x.get("placeId") or "", x.get("display") or "", x.get("id") or ""))
-    out = out[: max(int(max_rows), 1)]
+    out.sort(
+        key=lambda item: (
+            -int(((item.get("__rank") or {}).get("streetHouse"))),
+            -int(((item.get("__rank") or {}).get("cityMatch"))),
+            -float(((item.get("__rank") or {}).get("similarity") or 0.0)),
+            clean_str(item.get("display")).lower(),
+        )
+    )
+    out = _dedupe_by_key(
+        out,
+        lambda x: (
+            clean_str(x.get("id")).lower(),
+            _normalize_text_for_match(x.get("display")),
+            _normalize_text_for_match(((x.get("address") or {}).get("road"))),
+            _normalize_text_for_match(
+                ((x.get("address") or {}).get("houseNumber") or (x.get("address") or {}).get("house_number"))
+            ),
+        ),
+    )
+    for item in out:
+        item.pop("__rank", None)
+    out = out[: request_limit]
     _cache_set(cache_key, out, ttl_seconds=180)
     return out
 

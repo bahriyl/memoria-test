@@ -14,6 +14,7 @@ import tempfile
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import jwt
 try:
@@ -78,6 +79,10 @@ JWT_EXP_DELTA_SECONDS = 43200
 
 NP_API_KEY = os.getenv('NP_API_KEY')
 NP_BASE_URL = 'https://api.novaposhta.ua/v2.0/json/'
+NP_TRACKING_COOLDOWN_SECONDS = max(int(os.getenv('NP_TRACKING_COOLDOWN_SECONDS', '1800') or '1800'), 30)
+NP_TRACKING_BATCH_LIMIT_DEFAULT = max(int(os.getenv('NP_TRACKING_BATCH_LIMIT_DEFAULT', '25') or '25'), 1)
+NP_TRACKING_BATCH_LIMIT_MAX = max(int(os.getenv('NP_TRACKING_BATCH_LIMIT_MAX', '50') or '50'), NP_TRACKING_BATCH_LIMIT_DEFAULT)
+NP_TRACKING_BATCH_CONCURRENCY = max(int(os.getenv('NP_TRACKING_BATCH_CONCURRENCY', '4') or '4'), 1)
 
 application = Flask(__name__)
 CORS(application)
@@ -159,6 +164,7 @@ people_collection = db['people']
 areas_collection = db['areas']
 people_moderation_collection = db['people_moderation']
 orders_collection = db['orders']
+premium_orders_collection = db['premium_orders']
 chat_collection = db['chats']
 message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
@@ -285,14 +291,11 @@ def _location_has_provider_area_and_geo(location):
     return bool(area_id and area_source in {"photon", "nominatim"} and geo)
 
 
-def _location_has_address_place_and_street_house(location):
+def _location_has_manual_address_text(location):
     normalized = normalize_location_core(location if isinstance(location, dict) else {})
     address = normalized.get("address") if isinstance(normalized.get("address"), dict) else {}
-    address_display = loc_clean_str(address.get("display"))
-    place_id = loc_clean_str(address.get("placeId"))
-    road = loc_clean_str(address.get("road"))
-    house_number = loc_clean_str(address.get("houseNumber") or address.get("house_number"))
-    return bool(address_display and place_id and road and house_number)
+    address_display = loc_clean_str(address.get("display") or address.get("raw"))
+    return bool(address_display)
 
 
 def _location_has_geonames_area_and_geo(location):
@@ -303,8 +306,8 @@ def _location_has_geonames_area_and_geo(location):
 def _validate_admin_strict_location(field_name, location):
     if not _location_has_provider_area_and_geo(location):
         abort(400, description=f"`{field_name}` must come from provider suggestions (`area.id` + coordinates required)")
-    if not _location_has_address_place_and_street_house(location):
-        abort(400, description=f"`{field_name}.address` must include suggestion-backed `placeId`, `road`, and `house_number`")
+    if not _location_has_manual_address_text(location):
+        abort(400, description=f"`{field_name}.address` must include manual street text")
 
 try:
     liturgies_collection.create_index([("personId", ASCENDING), ("serviceDate", ASCENDING)])
@@ -594,6 +597,663 @@ def people():
 
     people_list = [_person_list_payload(person) for person in docs]
     return jsonify({"total": len(people_list), "people": people_list})
+
+
+def _admin_pages_str(value):
+    if value is None:
+        return ''
+    return str(value).strip()
+
+
+def _admin_pages_parse_year(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    raw = _admin_pages_str(value)
+    if not raw or not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def _admin_pages_parse_life_range(value):
+    raw = _admin_pages_str(value)
+    if not raw:
+        return None, None
+    years = re.findall(r'\b(\d{4})\b', raw)
+    if len(years) >= 2:
+        return int(years[0]), int(years[1])
+    if len(years) == 1:
+        return int(years[0]), None
+    return None, None
+
+
+def _admin_pages_parse_iso_date(value):
+    raw = _admin_pages_str(value)
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, '%Y-%m-%d').strftime('%Y-%m-%d')
+    except ValueError:
+        abort(400, description='birthDate/deathDate must be in YYYY-MM-DD format')
+
+
+def _admin_pages_ua_date(iso_value):
+    raw = _admin_pages_str(iso_value)
+    if not raw:
+        return ''
+    try:
+        dt = datetime.strptime(raw, '%Y-%m-%d')
+    except ValueError:
+        return ''
+    months = {
+        1: 'січня',
+        2: 'лютого',
+        3: 'березня',
+        4: 'квітня',
+        5: 'травня',
+        6: 'червня',
+        7: 'липня',
+        8: 'серпня',
+        9: 'вересня',
+        10: 'жовтня',
+        11: 'листопада',
+        12: 'грудня',
+    }
+    return f'{dt.day} {months.get(dt.month, "")} {dt.year}'.strip()
+
+
+def _admin_pages_has_premium(person):
+    premium = person.get('premium')
+    return isinstance(premium, dict) and bool(premium)
+
+
+def _admin_pages_status_tags(person):
+    tags = []
+    if _admin_pages_has_premium(person):
+        tags.append('Преміум QR')
+    if bool(person.get('notable')):
+        tags.append('видатна особа')
+
+    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
+    path_label = _admin_pages_str(admin_page.get('pathLabel'))
+    if path_label:
+        tags.append(path_label)
+
+    if not tags:
+        tags.append('Стандарт')
+    return tags
+
+
+def _admin_pages_build_burial_from_fields(area_id, area, cemetery):
+    burial = normalize_person_burial({
+        'areaId': area_id,
+        'area': area,
+        'cemetery': cemetery,
+    })
+    legacy = person_burial_to_legacy_fields(burial)
+    return burial, legacy
+
+
+def _admin_pages_projection(person, index):
+    item = _person_with_location_projection(person)
+    admin_page = item.get('adminPage') if isinstance(item.get('adminPage'), dict) else {}
+    burial = normalize_person_burial(item)
+    location = burial.get('location') if isinstance(burial.get('location'), dict) else {}
+    address = location.get('address') if isinstance(location.get('address'), dict) else {}
+    cemetery_ref = burial.get('cemeteryRef') if isinstance(burial.get('cemeteryRef'), dict) else {}
+
+    cemetery_name = _admin_pages_str(cemetery_ref.get('name')) or _admin_pages_str(item.get('cemetery'))
+    cemetery_address = _admin_pages_str(address.get('display')) or _admin_pages_str(item.get('area'))
+    birth_year = _admin_pages_parse_year(item.get('birthYear'))
+    death_year = _admin_pages_parse_year(item.get('deathYear'))
+    birth_date = _admin_pages_str(item.get('birthDate'))
+    death_date = _admin_pages_str(item.get('deathDate'))
+    years_label = ''
+    if birth_year and death_year:
+        years_label = f'{birth_year}-{death_year}'
+    elif birth_year:
+        years_label = f'{birth_year}-'
+    elif death_year:
+        years_label = f'-{death_year}'
+
+    birth_date_ua = _admin_pages_ua_date(birth_date)
+    death_date_ua = _admin_pages_ua_date(death_date)
+    if birth_date_ua and death_date_ua:
+        life_range_text = f'{birth_date_ua} - {death_date_ua}'
+    else:
+        life_range_text = years_label
+
+    status_tags = _admin_pages_status_tags(item)
+    qr_code = _admin_pages_str(admin_page.get('qrCode'))
+
+    return {
+        'id': str(item.get('_id')),
+        'index': int(index),
+        'name': _admin_pages_str(item.get('name')),
+        'birthYear': birth_year,
+        'deathYear': death_year,
+        'birthDate': birth_date,
+        'deathDate': death_date,
+        'yearsLabel': years_label,
+        'avatarUrl': _admin_pages_str(item.get('avatarUrl') or item.get('portraitUrl')),
+        'cemeteryName': cemetery_name,
+        'cemeteryAddress': cemetery_address,
+        'statusTags': status_tags,
+        'statusLabel': ', '.join(status_tags),
+        'qrCode': qr_code or None,
+        'qrLabel': qr_code,
+        'area': _admin_pages_str(item.get('area')),
+        'areaId': _admin_pages_str(item.get('areaId')),
+        'cemetery': _admin_pages_str(item.get('cemetery')),
+        'phone': _admin_pages_str(admin_page.get('phone')),
+        'notable': bool(item.get('notable')),
+        'lifeRangeText': life_range_text,
+    }
+
+
+@application.route('/api/admin/pages', methods=['GET'])
+def admin_list_pages():
+    search_query = _admin_pages_str(request.args.get('search'))
+    query_filter = {}
+    if search_query:
+        pattern = {'$regex': re.escape(search_query), '$options': 'i'}
+        query_filter = {
+            '$or': [
+                {'name': pattern},
+                {'cemetery': pattern},
+                {'burial.cemeteryRef.name': pattern},
+                {'area': pattern},
+                {'adminPage.phone': pattern},
+            ]
+        }
+
+    docs = list(people_collection.find(query_filter).sort([('createdAt', -1), ('_id', -1)]))
+    pages = [_admin_pages_projection(person, index + 1) for index, person in enumerate(docs)]
+    return jsonify({
+        'total': len(pages),
+        'pages': pages,
+    })
+
+
+@application.route('/api/admin/pages', methods=['POST'])
+def admin_create_page():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    name = _admin_pages_str(data.get('name'))
+    if not name:
+        abort(400, description='`name` is required')
+
+    area = _admin_pages_str(data.get('area'))
+    area_id = _admin_pages_str(data.get('areaId'))
+    cemetery = _admin_pages_str(data.get('cemetery'))
+    phone = _admin_pages_str(data.get('phone'))
+    qr_code = _admin_pages_str(data.get('qrCode'))
+
+    birth_year = _admin_pages_parse_year(data.get('birthYear'))
+    death_year = _admin_pages_parse_year(data.get('deathYear'))
+    birth_date = _admin_pages_parse_iso_date(data.get('birthDate'))
+    death_date = _admin_pages_parse_iso_date(data.get('deathDate'))
+    range_birth, range_death = _admin_pages_parse_life_range(data.get('lifeRangeText'))
+    if birth_date:
+        birth_year = int(birth_date[:4])
+    elif birth_year is None and range_birth is not None:
+        birth_year = range_birth
+    if death_date:
+        death_year = int(death_date[:4])
+    elif death_year is None and range_death is not None:
+        death_year = range_death
+
+    burial, legacy = _admin_pages_build_burial_from_fields(area_id, area, cemetery)
+
+    admin_page_payload = {}
+    if phone:
+        admin_page_payload['phone'] = phone
+    if qr_code:
+        admin_page_payload['qrCode'] = qr_code
+    admin_page_payload['updatedAt'] = datetime.utcnow()
+
+    doc = {
+        'name': name,
+        'notable': bool(data.get('notable', False)),
+        'adminPage': admin_page_payload,
+        'createdAt': datetime.utcnow(),
+        'updatedAt': datetime.utcnow(),
+    }
+
+    if _location_write_is_canonical() or _location_write_is_dual():
+        doc['burial'] = burial
+    if _location_write_is_legacy() or _location_write_is_dual():
+        doc['areaId'] = legacy['areaId']
+        doc['area'] = legacy['area']
+        doc['cemetery'] = legacy['cemetery']
+        doc['location'] = legacy['location']
+
+    if birth_year is not None:
+        doc['birthYear'] = birth_year
+    if birth_date:
+        doc['birthDate'] = birth_date
+    if death_year is not None:
+        doc['deathYear'] = death_year
+    if death_date:
+        doc['deathDate'] = death_date
+
+    inserted = people_collection.insert_one(doc)
+    created = people_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify(_admin_pages_projection(created, 1)), 201
+
+
+@application.route('/api/admin/pages/<string:person_id>', methods=['PATCH'])
+def admin_update_page(person_id):
+    try:
+        oid = ObjectId(person_id)
+    except Exception:
+        abort(400, description='Invalid person id')
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    existing = people_collection.find_one({'_id': oid})
+    if not existing:
+        abort(404, description='Person not found')
+
+    update_fields = {}
+    if 'name' in data:
+        name = _admin_pages_str(data.get('name'))
+        if not name:
+            abort(400, description='`name` cannot be empty')
+        update_fields['name'] = name
+
+    if 'notable' in data:
+        update_fields['notable'] = bool(data.get('notable'))
+
+    birth_year = _admin_pages_parse_year(data.get('birthYear')) if 'birthYear' in data else None
+    death_year = _admin_pages_parse_year(data.get('deathYear')) if 'deathYear' in data else None
+    birth_date = _admin_pages_parse_iso_date(data.get('birthDate')) if 'birthDate' in data else None
+    death_date = _admin_pages_parse_iso_date(data.get('deathDate')) if 'deathDate' in data else None
+    if 'lifeRangeText' in data:
+        range_birth, range_death = _admin_pages_parse_life_range(data.get('lifeRangeText'))
+        if 'birthYear' not in data and 'birthDate' not in data:
+            birth_year = range_birth
+        if 'deathYear' not in data and 'deathDate' not in data:
+            death_year = range_death
+    if birth_date:
+        birth_year = int(birth_date[:4])
+    if death_date:
+        death_year = int(death_date[:4])
+
+    if 'birthDate' in data:
+        if birth_date is None:
+            update_fields['birthDate'] = None
+        else:
+            update_fields['birthDate'] = birth_date
+    if 'deathDate' in data:
+        if death_date is None:
+            update_fields['deathDate'] = None
+        else:
+            update_fields['deathDate'] = death_date
+
+    if 'birthYear' in data or 'lifeRangeText' in data or 'birthDate' in data:
+        if birth_year is None:
+            update_fields['birthYear'] = None
+        else:
+            update_fields['birthYear'] = birth_year
+    if 'deathYear' in data or 'lifeRangeText' in data or 'deathDate' in data:
+        if death_year is None:
+            update_fields['deathYear'] = None
+        else:
+            update_fields['deathYear'] = death_year
+
+    merged_admin_page = dict(existing.get('adminPage') or {})
+    if 'phone' in data:
+        phone = _admin_pages_str(data.get('phone'))
+        if phone:
+            merged_admin_page['phone'] = phone
+        else:
+            merged_admin_page.pop('phone', None)
+    if 'qrCode' in data:
+        qr_code = _admin_pages_str(data.get('qrCode'))
+        if qr_code:
+            merged_admin_page['qrCode'] = qr_code
+        else:
+            merged_admin_page.pop('qrCode', None)
+    if any(key in data for key in ('phone', 'qrCode')):
+        merged_admin_page['updatedAt'] = datetime.utcnow()
+        update_fields['adminPage'] = merged_admin_page
+
+    location_change_keys = {'area', 'areaId', 'cemetery'}
+    has_location_changes = any(key in data for key in location_change_keys)
+    if has_location_changes:
+        next_area_id = _admin_pages_str(data.get('areaId')) if 'areaId' in data else _admin_pages_str(existing.get('areaId'))
+        next_area = _admin_pages_str(data.get('area')) if 'area' in data else _admin_pages_str(existing.get('area'))
+        next_cemetery = _admin_pages_str(data.get('cemetery')) if 'cemetery' in data else _admin_pages_str(existing.get('cemetery'))
+        burial, legacy = _admin_pages_build_burial_from_fields(next_area_id, next_area, next_cemetery)
+
+        if _location_write_is_canonical() or _location_write_is_dual():
+            update_fields['burial'] = burial
+        if _location_write_is_legacy() or _location_write_is_dual():
+            update_fields['areaId'] = legacy['areaId']
+            update_fields['area'] = legacy['area']
+            update_fields['cemetery'] = legacy['cemetery']
+            update_fields['location'] = legacy['location']
+
+    if not update_fields:
+        abort(400, description='No fields to update')
+
+    update_fields['updatedAt'] = datetime.utcnow()
+    people_collection.update_one({'_id': oid}, {'$set': update_fields})
+    updated = people_collection.find_one({'_id': oid})
+    return jsonify(_admin_pages_projection(updated, 1))
+
+
+@application.route('/api/admin/pages/<string:person_id>', methods=['DELETE'])
+def admin_delete_page(person_id):
+    try:
+        oid = ObjectId(person_id)
+    except Exception:
+        abort(400, description='Invalid person id')
+
+    result = people_collection.delete_one({'_id': oid})
+    if result.deleted_count == 0:
+        abort(404, description='Person not found')
+
+    return ('', 204)
+
+
+def _admin_moderation_parse_iso_date(value):
+    raw = loc_clean_str(value)
+    if not raw:
+        return ''
+    try:
+        return datetime.strptime(raw, '%Y-%m-%d').strftime('%Y-%m-%d')
+    except ValueError:
+        return ''
+
+
+def _admin_moderation_parse_year(value):
+    if value is None or value == '' or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    raw = loc_clean_str(value)
+    if not raw or not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def _admin_moderation_cemetery_exists(name, area=''):
+    cleaned_name = loc_clean_str(name)
+    if not cleaned_name:
+        return False
+
+    name_regex = {'$regex': f'^{re.escape(cleaned_name)}$', '$options': 'i'}
+    candidates = list(cemeteries_collection.find({'name': name_regex}).limit(60))
+    if not candidates:
+        return False
+
+    area_text = loc_clean_str(area)
+    if not area_text:
+        return True
+
+    city_part = area_text.split(',')[0].strip()
+    if not city_part:
+        return True
+
+    pattern = re.compile(r'\b' + re.escape(city_part) + r'\b', re.IGNORECASE)
+    for doc in candidates:
+        option = cemetery_option_from_doc(doc)
+        area_candidate = loc_clean_str(option.get('area'))
+        if area_candidate and pattern.search(area_candidate):
+            return True
+    return False
+
+
+def _admin_moderation_projection(raw_doc):
+    item = _person_with_location_projection(raw_doc)
+    burial = normalize_person_burial(item)
+    location = burial.get('location') if isinstance(burial.get('location'), dict) else {}
+    address = location.get('address') if isinstance(location.get('address'), dict) else {}
+    cemetery_ref = burial.get('cemeteryRef') if isinstance(burial.get('cemeteryRef'), dict) else {}
+
+    birth_date = _admin_moderation_parse_iso_date(item.get('birthDate'))
+    death_date = _admin_moderation_parse_iso_date(item.get('deathDate'))
+    birth_year = _admin_moderation_parse_year(item.get('birthYear'))
+    death_year = _admin_moderation_parse_year(item.get('deathYear'))
+    if birth_year is None and birth_date:
+        birth_year = int(birth_date[:4])
+    if death_year is None and death_date:
+        death_year = int(death_date[:4])
+
+    burial_photo_urls = loc_clean_str_list(
+        item.get('burialSitePhotoUrls') or ((burial.get('photos') if isinstance(burial, dict) else []) or [])
+    )
+    if not burial_photo_urls:
+        single_photo = loc_clean_str(item.get('burialSitePhotoUrl'))
+        if single_photo:
+            burial_photo_urls = [single_photo]
+
+    cemetery_name = loc_clean_str(cemetery_ref.get('name')) or loc_clean_str(item.get('cemetery'))
+    area = loc_clean_str(item.get('area')) or loc_clean_str(address.get('display'))
+    cemetery_exists = _admin_moderation_cemetery_exists(cemetery_name, area)
+
+    link = loc_clean_str(item.get('link') or item.get('internetLinks'))
+    achievements = loc_clean_str(item.get('bio') or item.get('achievements'))
+    occupation = loc_clean_str(item.get('occupation'))
+    notable = bool(item.get('notable')) or bool(link) or bool(achievements)
+
+    return {
+        'id': str(item.get('_id')),
+        'name': loc_clean_str(item.get('name')),
+        'birthYear': birth_year,
+        'deathYear': death_year,
+        'birthDate': birth_date,
+        'deathDate': death_date,
+        'area': area,
+        'areaId': loc_clean_str(item.get('areaId')),
+        'cemetery': cemetery_name,
+        'notable': notable,
+        'phone': loc_clean_str(item.get('phone')),
+        'internetLinks': link,
+        'achievements': achievements,
+        'link': link,
+        'bio': achievements,
+        'occupation': occupation,
+        'burialSiteCoords': loc_clean_str(item.get('burialSiteCoords')),
+        'burialSitePhotoUrls': burial_photo_urls,
+        'burialSitePhotoUrl': burial_photo_urls[0] if burial_photo_urls else '',
+        'cemeteryExists': cemetery_exists,
+        'createdAt': item.get('createdAt'),
+        'updatedAt': item.get('updatedAt'),
+    }
+
+
+def _admin_build_person_from_moderation(moderation_doc, incoming):
+    source = moderation_doc or {}
+    payload = incoming if isinstance(incoming, dict) else {}
+
+    name = loc_clean_str(payload.get('name') if 'name' in payload else source.get('name'))
+    if not name:
+        abort(400, description='`name` is required')
+
+    birth_date = _admin_moderation_parse_iso_date(payload.get('birthDate') if 'birthDate' in payload else source.get('birthDate'))
+    death_date = _admin_moderation_parse_iso_date(payload.get('deathDate') if 'deathDate' in payload else source.get('deathDate'))
+    birth_year = _admin_moderation_parse_year(payload.get('birthYear') if 'birthYear' in payload else source.get('birthYear'))
+    death_year = _admin_moderation_parse_year(payload.get('deathYear') if 'deathYear' in payload else source.get('deathYear'))
+    if birth_year is None and birth_date:
+        birth_year = int(birth_date[:4])
+    if death_year is None and death_date:
+        death_year = int(death_date[:4])
+
+    area = loc_clean_str(payload.get('area') if 'area' in payload else source.get('area'))
+    area_id = loc_clean_str(payload.get('areaId') if 'areaId' in payload else source.get('areaId'))
+    cemetery = loc_clean_str(payload.get('cemetery') if 'cemetery' in payload else source.get('cemetery'))
+
+    incoming_burial = payload.get('burial') if isinstance(payload.get('burial'), dict) else None
+    source_burial = source.get('burial') if isinstance(source.get('burial'), dict) else None
+    burial_source = incoming_burial if incoming_burial is not None else source_burial
+
+    burial = normalize_person_burial({
+        'burial': burial_source,
+        'area': area,
+        'areaId': area_id,
+        'cemetery': cemetery,
+        'location': source.get('location'),
+        'burialSiteCoords': loc_clean_str(source.get('burialSiteCoords')),
+        'burialSitePhotoUrls': loc_clean_str_list(source.get('burialSitePhotoUrls')),
+    })
+    legacy = person_burial_to_legacy_fields(burial)
+
+    burial_photo_urls = loc_clean_str_list(
+        payload.get('burialSitePhotoUrls')
+        if 'burialSitePhotoUrls' in payload
+        else source.get('burialSitePhotoUrls') or (burial.get('photos') if isinstance(burial, dict) else [])
+    )
+    if not burial_photo_urls:
+        one_photo = loc_clean_str(payload.get('burialSitePhotoUrl') if 'burialSitePhotoUrl' in payload else source.get('burialSitePhotoUrl'))
+        if one_photo:
+            burial_photo_urls = [one_photo]
+
+    internet_links = loc_clean_str(
+        payload.get('internetLinks') if 'internetLinks' in payload
+        else payload.get('link') if 'link' in payload
+        else source.get('internetLinks') if 'internetLinks' in source
+        else source.get('link')
+    )
+    achievements = loc_clean_str(
+        payload.get('achievements') if 'achievements' in payload
+        else payload.get('bio') if 'bio' in payload
+        else source.get('achievements') if 'achievements' in source
+        else source.get('bio')
+    )
+    occupation = loc_clean_str(payload.get('occupation') if 'occupation' in payload else source.get('occupation'))
+    notable_flag = payload.get('notable') if 'notable' in payload else source.get('notable')
+    notable = bool(notable_flag) or bool(internet_links) or bool(achievements) or bool(occupation)
+
+    phone = loc_clean_str(payload.get('phone') if 'phone' in payload else source.get('phone'))
+
+    doc = {
+        'name': name,
+        'notable': notable,
+        'bio': achievements,
+        'createdAt': datetime.utcnow(),
+        'updatedAt': datetime.utcnow(),
+    }
+
+    if _location_write_is_canonical() or _location_write_is_dual():
+        doc['burial'] = burial
+    if _location_write_is_legacy() or _location_write_is_dual():
+        doc['areaId'] = legacy.get('areaId', '')
+        doc['area'] = legacy.get('area', '')
+        doc['cemetery'] = legacy.get('cemetery', '')
+        doc['location'] = legacy.get('location', [])
+
+    if birth_year is not None:
+        doc['birthYear'] = birth_year
+    if death_year is not None:
+        doc['deathYear'] = death_year
+    if birth_date:
+        doc['birthDate'] = birth_date
+    if death_date:
+        doc['deathDate'] = death_date
+
+    if burial_photo_urls:
+        doc['photos'] = [{'url': url, 'description': ''} for url in burial_photo_urls]
+
+    if internet_links:
+        doc['sourceLink'] = internet_links
+    if occupation:
+        doc['occupation'] = occupation
+
+    if phone:
+        doc['adminPage'] = {
+            'phone': phone,
+            'updatedAt': datetime.utcnow(),
+        }
+
+    return doc
+
+
+@application.route('/api/admin/pages/moderation/people', methods=['GET'])
+def admin_list_person_moderation():
+    search = loc_clean_str(request.args.get('search'))
+    query = {}
+    if search:
+        pattern = {'$regex': re.escape(search), '$options': 'i'}
+        query = {
+            '$or': [
+                {'name': pattern},
+                {'cemetery': pattern},
+                {'area': pattern},
+                {'bio': pattern},
+                {'link': pattern},
+                {'achievements': pattern},
+                {'internetLinks': pattern},
+            ]
+        }
+
+    docs = list(people_moderation_collection.find(query).sort([('createdAt', -1), ('_id', -1)]))
+    items = [_admin_moderation_projection(doc) for doc in docs]
+    return jsonify({
+        'total': len(items),
+        'items': items,
+    })
+
+
+@application.route('/api/admin/pages/moderation/people/<string:moderation_id>/verify', methods=['POST'])
+def admin_verify_person_moderation(moderation_id):
+    try:
+        oid = ObjectId(moderation_id)
+    except Exception:
+        abort(400, description='Invalid moderation id')
+
+    moderation_doc = people_moderation_collection.find_one({'_id': oid})
+    if not moderation_doc:
+        abort(404, description='Moderation record not found')
+
+    payload = request.get_json(silent=True) or {}
+    person_doc = _admin_build_person_from_moderation(moderation_doc, payload)
+
+    created = people_collection.insert_one(person_doc)
+    people_moderation_collection.delete_one({'_id': oid})
+
+    return jsonify({
+        'success': True,
+        'personId': str(created.inserted_id),
+    })
+
+
+@application.route('/api/admin/pages/moderation/people/<string:moderation_id>/reject', methods=['POST'])
+def admin_reject_person_moderation(moderation_id):
+    try:
+        oid = ObjectId(moderation_id)
+    except Exception:
+        abort(400, description='Invalid moderation id')
+
+    deleted = people_moderation_collection.delete_one({'_id': oid})
+    if deleted.deleted_count == 0:
+        abort(404, description='Moderation record not found')
+
+    return jsonify({'success': True})
+
+
+@application.route('/api/admin/cemeteries/exists', methods=['GET'])
+def admin_cemetery_exists():
+    name = loc_clean_str(request.args.get('name'))
+    area = loc_clean_str(request.args.get('area'))
+    if not name:
+        abort(400, description='`name` is required')
+
+    exists = _admin_moderation_cemetery_exists(name, area)
+    return jsonify({
+        'exists': bool(exists),
+    })
 
 
 def _validate_shared_pending(value):
@@ -1397,6 +2057,44 @@ def _derive_added_tone(added_label):
     return 'green' if _clean_str(added_label).lower() == 'memoria' else 'gold'
 
 
+def _calculate_admin_cemetery_fill_percent(cemetery):
+    location = normalize_location_core(cemetery.get('location') if isinstance(cemetery.get('location'), dict) else {})
+    legacy_loc = cemetery_location_to_legacy(location)
+
+    name = _clean_str(cemetery.get('name'))
+    locality = _clean_str(cemetery.get('locality') or legacy_loc.get('locality'))
+    street = _clean_str(cemetery.get('addressLine') or legacy_loc.get('addressLine') or cemetery.get('address'))
+    description = _clean_str(cemetery.get('description'))
+    page_image = _clean_str(cemetery.get('pageImage') or cemetery.get('image'))
+
+    church_refs_raw = cemetery.get('churchRefs')
+    churches_list_raw = cemetery.get('churchesList')
+    church_refs = normalize_refs_list(church_refs_raw if isinstance(church_refs_raw, list) else churches_list_raw)
+
+    phone_contacts = _clean_str_list(cemetery.get('phoneContacts'), 'phoneContacts')
+    legacy_phone = _clean_str(cemetery.get('phone'))
+    if not phone_contacts and legacy_phone:
+        phone_contacts = [legacy_phone]
+    contact_persons = _clean_str_list(cemetery.get('contactPersons'), 'contactPersons')
+
+    score = 0
+    if name:
+        score += 15
+    if locality:
+        score += 15
+    if street:
+        score += 15
+    if church_refs:
+        score += 15
+    if page_image:
+        score += 15
+    if phone_contacts or contact_persons:
+        score += 15
+    if description:
+        score += 10
+    return max(0, min(100, score))
+
+
 def _normalize_admin_cemetery(cemetery):
     location = normalize_cemetery_location(cemetery)
     legacy_loc = cemetery_location_to_legacy(location)
@@ -1416,7 +2114,7 @@ def _normalize_admin_cemetery(cemetery):
 
     church_refs = normalize_refs_list(cemetery.get('churchRefs') if isinstance(cemetery.get('churchRefs'), list) else cemetery.get('churchesList'))
     churches_list = refs_to_legacy_names(church_refs)
-    fill_percent = _parse_fill_percent(cemetery.get('fillPercent'))
+    fill_percent = _calculate_admin_cemetery_fill_percent(cemetery)
 
     phone_contacts = _clean_str_list(cemetery.get('phoneContacts'), 'phoneContacts')
     legacy_phone = _clean_str(cemetery.get('phone'))
@@ -1519,9 +2217,6 @@ def _build_admin_cemetery_payload(data, partial=False):
             abort(400, description="`churchRefs` must be an array")
         payload['churchRefs'] = normalize_refs_list(data.get('churchRefs'))
 
-    if 'fillPercent' in data:
-        payload['fillPercent'] = _parse_fill_percent(data.get('fillPercent'))
-
     if 'status' in data:
         status = _clean_str(data.get('status'))
         if status not in ADMIN_CEMETERY_STATUSES:
@@ -1578,7 +2273,6 @@ def _build_admin_cemetery_payload(data, partial=False):
         payload.setdefault('addedTone', _derive_added_tone(payload.get('addedLabel')))
         payload.setdefault('churchRefs', [])
         payload.setdefault('churchesList', refs_to_legacy_names(payload.get('churchRefs')))
-        payload.setdefault('fillPercent', 0)
         payload.setdefault('status', 'Активний')
         payload.setdefault('phoneContacts', [])
         payload.setdefault('contactPersons', [])
@@ -1640,6 +2334,7 @@ def admin_list_cemeteries():
 def admin_create_cemetery():
     data = request.get_json(silent=True) or {}
     payload = _build_admin_cemetery_payload(data, partial=False)
+    payload['fillPercent'] = _calculate_admin_cemetery_fill_percent(payload)
     now = datetime.utcnow()
     payload['createdAt'] = now
     payload['updatedAt'] = now
@@ -1671,10 +2366,17 @@ def admin_update_cemetery(cemetery_id):
         abort(400, description='Invalid cemetery id')
 
     data = request.get_json(silent=True) or {}
+    existing = cemeteries_collection.find_one({'_id': oid})
+    if not existing:
+        abort(404, description='Cemetery not found')
+
     update_fields = _build_admin_cemetery_payload(data, partial=True)
     if not update_fields:
         abort(400, description='Nothing to update')
 
+    merged_for_fill = dict(existing)
+    merged_for_fill.update(update_fields)
+    update_fields['fillPercent'] = _calculate_admin_cemetery_fill_percent(merged_for_fill)
     update_fields['updatedAt'] = datetime.utcnow()
     result = cemeteries_collection.update_one({'_id': oid}, {'$set': update_fields})
     if result.matched_count == 0:
@@ -1726,6 +2428,8 @@ ADMIN_CHURCH_ALLOWED_FIELDS = {
     'contactPerson',
     'phone',
     'infoNotes',
+    'description',
+    'pageImage',
     'iban',
     'taxCode',
     'recipientName',
@@ -1893,7 +2597,7 @@ def _normalize_admin_church(church):
 
     phone = _clean_str(church.get('phone')) or _clean_str(first_contact.get('phone'))
     if not phone:
-        phone = '+380-(00)-000-0000'
+        phone = ''
 
     status = _clean_str(church.get('status'))
     if status not in ADMIN_CHURCH_STATUSES:
@@ -1933,6 +2637,8 @@ def _normalize_admin_church(church):
         'cemeteryRefs': cemetery_refs,
         'contacts': contacts,
         'infoNotes': _clean_str(church.get('infoNotes')),
+        'description': _clean_str(church.get('description')),
+        'pageImage': _clean_str(church.get('pageImage') or church.get('image')),
         'iban': _clean_str(church.get('iban')),
         'taxCode': _clean_str(church.get('taxCode')),
         'recipientName': _clean_str(church.get('recipientName')),
@@ -2019,6 +2725,12 @@ def _build_admin_church_payload(data, partial=False):
     if 'infoNotes' in data:
         payload['infoNotes'] = _clean_str(data.get('infoNotes'))
 
+    if 'description' in data:
+        payload['description'] = _clean_str(data.get('description'))
+
+    if 'pageImage' in data:
+        payload['pageImage'] = _clean_str(data.get('pageImage'))
+
     if 'iban' in data:
         payload['iban'] = _clean_str(data.get('iban'))
 
@@ -2042,8 +2754,8 @@ def _build_admin_church_payload(data, partial=False):
     if 'cemeteries' in payload and 'cemeteryRefs' not in payload:
         payload['cemeteryRefs'] = normalize_refs_list(payload['cemeteries'])
 
-    if 'infoNotes' in payload:
-        payload['description'] = payload['infoNotes']
+    if 'pageImage' in payload:
+        payload['image'] = payload['pageImage']
 
     legacy_address = payload.get('address')
     legacy_locality = payload.get('locality')
@@ -2085,11 +2797,13 @@ def _build_admin_church_payload(data, partial=False):
         payload.setdefault('contactPerson', '')
         payload.setdefault('phone', '')
         payload.setdefault('infoNotes', '')
+        payload.setdefault('description', '')
+        payload.setdefault('pageImage', '')
+        payload.setdefault('image', payload.get('pageImage', ''))
         payload.setdefault('iban', '')
         payload.setdefault('taxCode', '')
         payload.setdefault('recipientName', '')
         payload.setdefault('botCode', '')
-        payload.setdefault('description', payload.get('infoNotes', ''))
 
         if 'location' not in payload and (_location_write_is_canonical() or _location_write_is_dual()):
             payload['location'] = normalize_location_core({
@@ -3200,7 +3914,75 @@ def _normalize_admin_ritual_service(ritual_service):
     }
 
 
-def _build_admin_ritual_service_payload(data, partial=False):
+def _derive_ritual_hq_location_from_payload(payload, current_doc=None):
+    current_doc = current_doc if isinstance(current_doc, dict) else {}
+
+    service_area_ids = payload.get('serviceAreaIds')
+    if not isinstance(service_area_ids, list):
+        service_area_ids = current_doc.get('serviceAreaIds') if isinstance(current_doc.get('serviceAreaIds'), list) else []
+    service_area_ids = [loc_clean_str(v) for v in service_area_ids if loc_clean_str(v)]
+
+    settlements = payload.get('settlements')
+    if not isinstance(settlements, list):
+        settlements = current_doc.get('settlements') if isinstance(current_doc.get('settlements'), list) else []
+    settlements = [_clean_str(v) for v in settlements if _clean_str(v)]
+
+    contacts = payload.get('contacts')
+    if not isinstance(contacts, list):
+        contacts = current_doc.get('contacts') if isinstance(current_doc.get('contacts'), list) else []
+    address_seed = ''
+    if contacts:
+        address_seed = _clean_str((contacts[0] or {}).get('address'))
+
+    if not address_seed:
+        legacy_address = payload.get('address')
+        if not isinstance(legacy_address, list):
+            legacy_address = current_doc.get('address') if isinstance(current_doc.get('address'), list) else []
+        address_seed = _clean_str(legacy_address[0]) if legacy_address else ''
+
+    lat_value = payload.get('latitude', current_doc.get('latitude'))
+    lng_value = payload.get('longitude', current_doc.get('longitude'))
+
+    seed = {}
+    area_id = service_area_ids[0] if service_area_ids else ''
+    area_display = settlements[0] if settlements else ''
+    if area_id or area_display:
+        seed['area'] = {
+            'id': area_id,
+            'display': area_display,
+            'city': area_display,
+            'source': 'manual',
+        }
+    if address_seed:
+        seed['address'] = {
+            'raw': address_seed,
+            'display': address_seed,
+        }
+    lat_float = None
+    lng_float = None
+    try:
+        lat_float = float(lat_value) if lat_value is not None and str(lat_value).strip() != '' else None
+    except Exception:
+        lat_float = None
+    try:
+        lng_float = float(lng_value) if lng_value is not None and str(lng_value).strip() != '' else None
+    except Exception:
+        lng_float = None
+    if lat_float is not None and lng_float is not None:
+        seed['geo'] = {
+            'lat': lat_float,
+            'lng': lng_float,
+        }
+
+    if not seed:
+        return None
+    location = normalize_location_core(seed)
+    if not (location.get('area') or location.get('address') or location.get('geo')):
+        return None
+    return location
+
+
+def _build_admin_ritual_service_payload(data, partial=False, current_doc=None):
     if not isinstance(data, dict):
         abort(400, description='Body must be a JSON object')
 
@@ -3215,8 +3997,6 @@ def _build_admin_ritual_service_payload(data, partial=False):
         name = _clean_str(data.get('name'))
         if not name:
             abort(400, description='`name` is required')
-        if _location_admin_strict_geonames_enabled() and 'hqLocation' not in data:
-            abort(400, description="`hqLocation` is required and must come from provider suggestions")
 
     if 'name' in data:
         name = _clean_str(data.get('name'))
@@ -3282,23 +4062,25 @@ def _build_admin_ritual_service_payload(data, partial=False):
         payload['address'] = addresses
         payload['phone'] = phones
 
-    if 'hqLocation' not in payload and (
-        ('latitude' in payload) or ('longitude' in payload) or ('contacts' in payload) or ('settlements' in payload)
-    ):
-        address_seed = ''
-        if isinstance(payload.get('contacts'), list) and payload.get('contacts'):
-            address_seed = _clean_str((payload['contacts'][0] or {}).get('address'))
-        if not address_seed and isinstance(payload.get('address'), list) and payload.get('address'):
-            address_seed = _clean_str(payload['address'][0])
-        hq_location = normalize_location_core({
-            'addressLine': address_seed,
-            'geo': {
-                'lat': payload.get('latitude'),
-                'lng': payload.get('longitude'),
-            },
-        })
-        if _location_write_is_canonical() or _location_write_is_dual():
-            payload['hqLocation'] = hq_location
+    should_attempt_derive_hq = (not partial) or bool(
+        {'serviceAreaIds', 'settlements', 'contacts', 'latitude', 'longitude'}.intersection(set(data.keys()))
+    )
+    if 'hqLocation' not in payload and should_attempt_derive_hq:
+        derived_hq_location = _derive_ritual_hq_location_from_payload(payload, current_doc=current_doc)
+        if derived_hq_location is not None:
+            if _location_write_is_canonical() or _location_write_is_dual():
+                payload['hqLocation'] = derived_hq_location
+            if _location_write_is_legacy() or _location_write_is_dual():
+                legacy = ritual_location_to_legacy(
+                    derived_hq_location,
+                    current_doc={'address': payload.get('address', [])}
+                )
+                if 'address' not in payload and isinstance(legacy.get('address'), list):
+                    payload['address'] = legacy.get('address', [])
+                if payload.get('latitude') is None:
+                    payload['latitude'] = legacy.get('latitude')
+                if payload.get('longitude') is None:
+                    payload['longitude'] = legacy.get('longitude')
 
     if not partial:
         payload.setdefault('category', DEFAULT_RITUAL_SERVICE_CATEGORIES[1])
@@ -3320,14 +4102,6 @@ def _build_admin_ritual_service_payload(data, partial=False):
             payload['address'] = []
         if 'phone' not in payload:
             payload['phone'] = []
-        if 'hqLocation' not in payload and (_location_write_is_canonical() or _location_write_is_dual()):
-            payload['hqLocation'] = normalize_location_core({
-                'addressLine': payload['address'][0] if payload.get('address') else '',
-                'geo': {
-                    'lat': payload.get('latitude'),
-                    'lng': payload.get('longitude'),
-                },
-            })
 
     return payload
 
@@ -3452,7 +4226,7 @@ def admin_list_ritual_services():
 @application.route('/api/admin/ritual-services', methods=['POST'])
 def admin_create_ritual_service():
     data = request.get_json(silent=True) or {}
-    payload = _build_admin_ritual_service_payload(data, partial=False)
+    payload = _build_admin_ritual_service_payload(data, partial=False, current_doc=None)
     now = datetime.utcnow()
     payload['createdAt'] = now
     payload['updatedAt'] = now
@@ -3469,8 +4243,12 @@ def admin_update_ritual_service(service_id):
     except Exception:
         abort(400, description='Invalid ritual service id')
 
+    ritual_service = ritual_services_collection.find_one({'_id': oid})
+    if not ritual_service:
+        abort(404, description='Ritual service not found')
+
     data = request.get_json(silent=True) or {}
-    update_fields = _build_admin_ritual_service_payload(data, partial=True)
+    update_fields = _build_admin_ritual_service_payload(data, partial=True, current_doc=ritual_service)
     if not update_fields:
         abort(400, description='Nothing to update')
 
@@ -3508,19 +4286,33 @@ def churches_page():
 
     churches_cursor = churches_collection.find(query_filter)
 
-    churches_list = []
-    for church in churches_cursor:
+    def _church_page_payload(church):
         location = normalize_church_location(church)
         legacy_loc = church_location_to_legacy(location)
-        churches_list.append({
+        contacts = _clean_contacts_list_loose(church.get('contacts'))
+        first_contact = contacts[0] if contacts else {}
+
+        image = _clean_str(church.get('image') or church.get('pageImage'))
+        address = _clean_str(
+            church.get('address')
+            or legacy_loc.get("address")
+            or ((location.get('address') or {}).get('display') if isinstance(location, dict) else '')
+            or (location.get('display') if isinstance(location, dict) else '')
+        )
+        phone = _clean_str(church.get('phone')) or _clean_str(first_contact.get('phone'))
+        description = _clean_str(church.get('description')) or _clean_str(church.get('infoNotes'))
+
+        return {
             "id": str(church.get('_id')),
-            "name": church.get('name'),
-            "image": church.get('image'),
-            "address": church.get('address') or legacy_loc.get("address"),
-            "phone": church.get('phone'),
-            "description": church.get('description'),
+            "name": _clean_str(church.get('name')),
+            "image": image,
+            "address": address,
+            "phone": phone,
+            "description": description,
             "location": location if _location_read_uses_canonical() else None,
-        })
+        }
+
+    churches_list = [_church_page_payload(church) for church in churches_cursor]
 
     return jsonify({
         "total": len(churches_list),
@@ -3541,13 +4333,26 @@ def get_church_page(church_id):
 
     location = normalize_church_location(church)
     legacy_loc = church_location_to_legacy(location)
+    contacts = _clean_contacts_list_loose(church.get('contacts'))
+    first_contact = contacts[0] if contacts else {}
+
+    image = _clean_str(church.get('image') or church.get('pageImage'))
+    address = _clean_str(
+        church.get('address')
+        or legacy_loc.get("address")
+        or ((location.get('address') or {}).get('display') if isinstance(location, dict) else '')
+        or (location.get('display') if isinstance(location, dict) else '')
+    )
+    phone = _clean_str(church.get('phone')) or _clean_str(first_contact.get('phone'))
+    description = _clean_str(church.get('description')) or _clean_str(church.get('infoNotes'))
+
     return jsonify({
         "id": str(church.get('_id')),
-        "name": church.get('name'),
-        "image": church.get('image'),
-        "address": church.get('address') or legacy_loc.get("address"),
-        "phone": church.get('phone'),
-        "description": church.get('description'),
+        "name": _clean_str(church.get('name')),
+        "image": image,
+        "address": address,
+        "phone": phone,
+        "description": description,
         "location": location if _location_read_uses_canonical() else None,
     })
 
@@ -3657,6 +4462,8 @@ def location_addresses():
     search = request.args.get('search', '').strip()
     area_id = request.args.get('areaId', '').strip()
     city = request.args.get('city', '').strip()
+    lat = request.args.get('lat')
+    lng = request.args.get('lng')
     if not search:
         return jsonify({"total": 0, "items": []})
     items = search_location_addresses(
@@ -3670,6 +4477,8 @@ def location_addresses():
         max_rows=20,
         area_id=area_id,
         city=city,
+        bias_lat=lat,
+        bias_lng=lng,
     )
     return jsonify({"total": len(items), "items": items})
 
@@ -4191,6 +5000,10 @@ def people_add_moderation():
 
     legacy = person_burial_to_legacy_fields(burial)
 
+    link = loc_clean_str(data.get('link'))
+    bio = loc_clean_str(data.get('bio'))
+    notable = bool(data.get('notable')) or bool(link) or bool(bio)
+
     document = {
         'name': data.get('name'),
         'areaId': area_id or legacy.get('areaId', ''),
@@ -4202,8 +5015,9 @@ def people_add_moderation():
         'burialSitePhotoUrls': burial_site_photo_urls,
         'burialSitePhotoCount': len(burial_site_photo_urls),
         'burial': burial,
-        'link': data.get('link', ''),
-        'bio': data.get('bio', ''),
+        'notable': notable,
+        'link': link,
+        'bio': bio,
         'createdAt': datetime.utcnow(),
     }
 
@@ -4344,6 +5158,778 @@ def create_order():
     return jsonify({'orderId': str(result.inserted_id)}), 201
 
 
+PREMIUM_ORDER_ALLOWED_STATUSES = {
+    'on_moderation',
+    'sent',
+    'received',
+    'rejected',
+    'refused',
+}
+
+PREMIUM_ORDER_TERMINAL_STATUSES = {'received', 'rejected', 'refused'}
+
+
+def _parse_status_codes_env(raw, defaults):
+    cleaned = '' if raw is None else str(raw).strip()
+    if not cleaned:
+        return set(defaults)
+    return {part.strip() for part in cleaned.split(',') if part.strip()}
+
+
+NP_TRACKING_DELIVERED_CODES = _parse_status_codes_env(os.getenv('NP_TRACKING_DELIVERED_CODES'), {'9'})
+NP_TRACKING_REFUSED_CODES = _parse_status_codes_env(
+    os.getenv('NP_TRACKING_REFUSED_CODES'),
+    {'102', '103', '108'},
+)
+
+
+def _premium_order_str(value):
+    if value is None:
+        return ''
+    return str(value).strip()
+
+
+def _premium_split_comma_head_tail(value):
+    cleaned = _premium_order_str(value)
+    if not cleaned:
+        return '', ''
+    parts = [part.strip() for part in cleaned.split(',') if part and part.strip()]
+    if not parts:
+        return '', ''
+    head = parts[0]
+    tail = ', '.join(parts[1:]) if len(parts) > 1 else ''
+    return head, tail
+
+
+def _premium_has_street_hint(value):
+    normalized = _premium_order_str(value).lower()
+    if not normalized:
+        return False
+    markers = ('вул', 'вулиця', 'просп', 'пров', 'площа', 'буд', 'street', 'st.', 'ave', 'road')
+    return any(marker in normalized for marker in markers)
+
+
+def _premium_normalize_cemetery_and_address(cemetery_raw, address_raw):
+    cemetery_name, cemetery_tail = _premium_split_comma_head_tail(cemetery_raw)
+    explicit_address = _premium_order_str(address_raw)
+
+    # Prefer address that includes street marker, fallback to any non-empty candidate.
+    candidates = [explicit_address, cemetery_tail]
+    address = ''
+    for candidate in candidates:
+        if _premium_has_street_hint(candidate):
+            address = candidate
+            break
+    if not address:
+        for candidate in candidates:
+            cleaned = _premium_order_str(candidate)
+            if cleaned:
+                address = cleaned
+                break
+
+    return cemetery_name or _premium_order_str(cemetery_raw), address
+
+
+def _premium_status_is_terminal(status):
+    return _premium_order_str(status) in PREMIUM_ORDER_TERMINAL_STATUSES
+
+
+def _premium_np_status_text(entry):
+    if not isinstance(entry, dict):
+        return ''
+    for key in ('Status', 'status', 'StatusName', 'statusName'):
+        value = _premium_order_str(entry.get(key))
+        if value:
+            return value
+    return ''
+
+
+def _premium_np_status_code(entry):
+    if not isinstance(entry, dict):
+        return ''
+    for key in ('StatusCode', 'statusCode'):
+        value = _premium_order_str(entry.get(key))
+        if value:
+            return value
+    return ''
+
+
+def _premium_np_is_delivered(status_text, status_code):
+    if status_code and status_code in NP_TRACKING_DELIVERED_CODES:
+        return True
+    normalized = _premium_order_str(status_text).lower()
+    return any(
+        marker in normalized
+        for marker in ('отримано', 'видано', 'доставлено', 'delivered')
+    )
+
+
+def _premium_np_is_refused(status_text, status_code):
+    if status_code and status_code in NP_TRACKING_REFUSED_CODES:
+        return True
+    normalized = _premium_order_str(status_text).lower()
+    return any(
+        marker in normalized
+        for marker in ('відмова', 'отказ', 'не забра', 'повернен', 'return to sender', 'refused')
+    )
+
+
+def _premium_np_check_ttn(ttn):
+    cleaned_ttn = _premium_order_str(ttn)
+    if not cleaned_ttn:
+        return {
+            'ok': False,
+            'error': 'ТТН порожній',
+            'statusText': '',
+            'statusCode': '',
+            'isDelivered': False,
+            'isRefused': False,
+        }
+
+    payload = {
+        'apiKey': NP_API_KEY,
+        'modelName': 'TrackingDocumentGeneral',
+        'calledMethod': 'getStatusDocuments',
+        'methodProperties': {
+            'Documents': [{'DocumentNumber': cleaned_ttn}],
+        },
+    }
+    try:
+        response = requests.post(NP_BASE_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        body = response.json() or {}
+    except Exception as exc:
+        return {
+            'ok': False,
+            'error': str(exc),
+            'statusText': '',
+            'statusCode': '',
+            'isDelivered': False,
+            'isRefused': False,
+        }
+
+    data = body.get('data')
+    if not isinstance(data, list) or not data:
+        return {
+            'ok': False,
+            'error': 'Нова Пошта не повернула статус',
+            'statusText': '',
+            'statusCode': '',
+            'isDelivered': False,
+            'isRefused': False,
+        }
+
+    first = data[0] if isinstance(data[0], dict) else {}
+    status_text = _premium_np_status_text(first)
+    status_code = _premium_np_status_code(first)
+    return {
+        'ok': True,
+        'error': '',
+        'statusText': status_text,
+        'statusCode': status_code,
+        'isDelivered': _premium_np_is_delivered(status_text, status_code),
+        'isRefused': _premium_np_is_refused(status_text, status_code),
+    }
+
+
+def _premium_parse_bool(value):
+    normalized = _premium_order_str(value).lower()
+    return normalized in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _premium_tracking_cooldown_until(now):
+    return now + timedelta(seconds=max(0, NP_TRACKING_COOLDOWN_SECONDS))
+
+
+def _premium_tracking_transition_from_np(current_status, tracking_result):
+    if _premium_status_is_terminal(current_status):
+        return current_status
+
+    if tracking_result.get('ok'):
+        if tracking_result.get('isRefused'):
+            return 'refused'
+        if tracking_result.get('isDelivered'):
+            return 'received'
+    return current_status
+
+
+def _premium_refresh_tracking_for_order(order_doc, *, force=False):
+    now = datetime.utcnow()
+    order_id = order_doc.get('_id')
+    current_status = _premium_order_str(order_doc.get('status')) or 'on_moderation'
+    ttn = _premium_order_str(order_doc.get('ttn'))
+
+    if not ttn:
+        return {
+            'id': str(order_id),
+            'checked': False,
+            'updated': False,
+            'status': current_status,
+            'reason': 'missing_ttn',
+        }
+
+    if _premium_status_is_terminal(current_status):
+        return {
+            'id': str(order_id),
+            'checked': False,
+            'updated': False,
+            'status': current_status,
+            'reason': 'terminal',
+        }
+
+    if not force:
+        next_check_at = order_doc.get('npNextCheckAt')
+        if isinstance(next_check_at, datetime) and next_check_at > now:
+            return {
+                'id': str(order_id),
+                'checked': False,
+                'updated': False,
+                'status': current_status,
+                'reason': 'cooldown',
+            }
+
+    tracking_result = _premium_np_check_ttn(ttn)
+    next_status = _premium_tracking_transition_from_np(current_status, tracking_result)
+
+    set_fields = {
+        'npStatusRaw': _premium_order_str(tracking_result.get('statusText')),
+        'npStatusCode': _premium_order_str(tracking_result.get('statusCode')),
+        'npLastCheckedAt': now,
+        'npNextCheckAt': _premium_tracking_cooldown_until(now),
+        'npCheckError': _premium_order_str(tracking_result.get('error')) if not tracking_result.get('ok') else '',
+    }
+
+    if next_status != current_status:
+        set_fields['status'] = next_status
+        set_fields['updatedAt'] = now
+        if next_status == 'received':
+            set_fields['npDeliveredAt'] = now
+        if next_status == 'refused':
+            set_fields['npRefusedAt'] = now
+
+    premium_orders_collection.update_one({'_id': order_id}, {'$set': set_fields})
+    return {
+        'id': str(order_id),
+        'checked': True,
+        'updated': next_status != current_status,
+        'status': next_status,
+        'reason': '',
+        'ok': bool(tracking_result.get('ok')),
+        'error': _premium_order_str(tracking_result.get('error')),
+    }
+
+
+def _premium_order_status_label(status):
+    mapping = {
+        'on_moderation': 'На модерації',
+        'sent': 'Надіслано',
+        'received': 'Отримано',
+        'rejected': 'Відхилено',
+        'refused': 'Відмова',
+    }
+    cleaned = _premium_order_str(status)
+    return mapping.get(cleaned, mapping['on_moderation'])
+
+
+def _generate_premium_order_password(length=8):
+    alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%'
+    if length < 8:
+        length = 8
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _premium_order_projection(doc):
+    if not isinstance(doc, dict):
+        return {}
+
+    person_names = doc.get('personNames')
+    if not isinstance(person_names, list):
+        person_names = []
+    person_names = [_premium_order_str(name) for name in person_names if _premium_order_str(name)]
+
+    status = _premium_order_str(doc.get('status')) or 'on_moderation'
+    if status not in PREMIUM_ORDER_ALLOWED_STATUSES:
+        status = 'on_moderation'
+
+    certificates = doc.get('certificates')
+    if not isinstance(certificates, list):
+        certificates = []
+    normalized_certificates = []
+    for certificate in certificates:
+        cleaned_certificate = _premium_order_str(certificate)
+        if cleaned_certificate:
+            normalized_certificates.append(cleaned_certificate)
+
+    cemetery_name, cemetery_address = _premium_normalize_cemetery_and_address(
+        doc.get('cemetery'),
+        doc.get('cemeteryAddress'),
+    )
+
+    return {
+        'id': str(doc.get('_id')),
+        'personId': _premium_order_str(doc.get('personId')),
+        'personIds': [_premium_order_str(item) for item in (doc.get('personIds') or []) if _premium_order_str(item)],
+        'personName': _premium_order_str(doc.get('personName')),
+        'personNames': person_names,
+        'lifeRange': _premium_order_str(doc.get('lifeRange')),
+        'cemetery': cemetery_name,
+        'address': cemetery_address,
+        'avatarUrl': _premium_order_str(doc.get('avatarUrl') or doc.get('portraitUrl')),
+        'pathType': _premium_order_str(doc.get('pathType')) or 'Сайт',
+        'status': status,
+        'statusLabel': _premium_order_status_label(status),
+        'paymentMethod': _premium_order_str(doc.get('paymentMethod')),
+        'paymentStatus': _premium_order_str(doc.get('paymentStatus')) or 'pending',
+        'invoiceId': _premium_order_str(doc.get('invoiceId')),
+        'customerName': _premium_order_str(doc.get('customerName')),
+        'customerPhone': _premium_order_str(doc.get('customerPhone')),
+        'customerEmail': _premium_order_str(doc.get('customerEmail')),
+        'deliveryCityRef': _premium_order_str(doc.get('deliveryCityRef')),
+        'deliveryCityName': _premium_order_str(doc.get('deliveryCityName')),
+        'deliveryBranchRef': _premium_order_str(doc.get('deliveryBranchRef')),
+        'deliveryBranchDesc': _premium_order_str(doc.get('deliveryBranchDesc')),
+        'ttn': _premium_order_str(doc.get('ttn')),
+        'generatedPassword': _premium_order_str(doc.get('generatedPassword')),
+        'adminNotes': _premium_order_str(doc.get('adminNotes')),
+        'orderNumber': _premium_order_str(doc.get('orderNumber')),
+        'npStatusRaw': _premium_order_str(doc.get('npStatusRaw')),
+        'npStatusCode': _premium_order_str(doc.get('npStatusCode')),
+        'npCheckError': _premium_order_str(doc.get('npCheckError')),
+        'npLastCheckedAt': doc.get('npLastCheckedAt'),
+        'npNextCheckAt': doc.get('npNextCheckAt'),
+        'npDeliveredAt': doc.get('npDeliveredAt'),
+        'npRefusedAt': doc.get('npRefusedAt'),
+        'certificates': normalized_certificates,
+        'documentImageUrl': normalized_certificates[0] if normalized_certificates else '',
+        'createdAt': doc.get('createdAt'),
+        'updatedAt': doc.get('updatedAt'),
+        'activatedAt': doc.get('activatedAt'),
+    }
+
+
+@application.route('/api/premium-orders', methods=['POST'])
+def create_premium_order():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    raw_person_ids = data.get('personIds')
+    if raw_person_ids is None:
+        single_person_id = _premium_order_str(data.get('personId'))
+        raw_person_ids = [single_person_id] if single_person_id else []
+    if not isinstance(raw_person_ids, list):
+        abort(400, description='`personIds` must be an array')
+
+    person_ids = [_premium_order_str(pid) for pid in raw_person_ids if _premium_order_str(pid)]
+    if not person_ids:
+        abort(400, description='`personIds` is required')
+
+    customer_name = _premium_order_str(data.get('customerName') or data.get('name'))
+    customer_phone = _premium_order_str(data.get('customerPhone') or data.get('phone'))
+    customer_email = _premium_order_str(data.get('customerEmail') or data.get('email')).lower()
+    city_ref = _premium_order_str(data.get('deliveryCityRef') or data.get('cityRef'))
+    city_name = _premium_order_str(data.get('deliveryCityName') or data.get('cityName'))
+    branch_ref = _premium_order_str(data.get('deliveryBranchRef') or data.get('branchRef'))
+    branch_desc = _premium_order_str(data.get('deliveryBranchDesc') or data.get('branchDesc'))
+    payment_method = _premium_order_str(data.get('paymentMethod')).lower()
+    invoice_id = _premium_order_str(data.get('invoiceId'))
+    path_type = _premium_order_str(data.get('pathType') or 'Сайт')
+
+    if not customer_name:
+        abort(400, description='`customerName` is required')
+    if not customer_phone:
+        abort(400, description='`customerPhone` is required')
+    if not city_ref or not city_name:
+        abort(400, description='Delivery city is required')
+    if not branch_ref or not branch_desc:
+        abort(400, description='Delivery branch is required')
+    if payment_method not in {'online', 'cod'}:
+        abort(400, description='`paymentMethod` must be `online` or `cod`')
+    if payment_method == 'online' and not invoice_id:
+        abort(400, description='`invoiceId` is required for online payments')
+
+    person_docs = []
+    for person_id in person_ids:
+        try:
+            oid = ObjectId(person_id)
+        except Exception:
+            abort(400, description='Invalid person id')
+        person_doc = people_collection.find_one({'_id': oid})
+        if not person_doc:
+            abort(404, description='Person not found')
+        person_docs.append(_person_with_location_projection(person_doc))
+
+    raw_person_names = data.get('personNames')
+    person_names = []
+    if isinstance(raw_person_names, list):
+        person_names = [_premium_order_str(name) for name in raw_person_names if _premium_order_str(name)]
+    if not person_names:
+        person_names = [_premium_order_str(person.get('name')) for person in person_docs if _premium_order_str(person.get('name'))]
+
+    first_person = person_docs[0]
+    normalized_cemetery, normalized_address = _premium_normalize_cemetery_and_address(
+        first_person.get('cemetery'),
+        first_person.get('area'),
+    )
+    life_range = ''
+    birth_year = first_person.get('birthYear')
+    death_year = first_person.get('deathYear')
+    if birth_year and death_year:
+        life_range = f'{birth_year}-{death_year}'
+    elif birth_year:
+        life_range = f'{birth_year}-'
+    elif death_year:
+        life_range = f'-{death_year}'
+
+    certificates = data.get('certificates')
+    if certificates is None:
+        certificates = []
+    if not isinstance(certificates, list):
+        abort(400, description='`certificates` must be an array')
+    normalized_certificates = []
+    for certificate in certificates:
+        cleaned_certificate = _premium_order_str(certificate)
+        if not cleaned_certificate:
+            abort(400, description='`certificates` contains empty value')
+        normalized_certificates.append(cleaned_certificate)
+
+    now = datetime.utcnow()
+    generated_password = _generate_premium_order_password()
+    order_doc = {
+        'personId': person_ids[0],
+        'personIds': person_ids,
+        'personName': person_names[0] if person_names else _premium_order_str(first_person.get('name')),
+        'personNames': person_names,
+        'lifeRange': life_range,
+        'cemetery': normalized_cemetery,
+        'cemeteryAddress': normalized_address,
+        'avatarUrl': _premium_order_str(first_person.get('avatarUrl') or first_person.get('portraitUrl')),
+        'pathType': path_type or 'Сайт',
+        'status': 'on_moderation',
+        'customerName': customer_name,
+        'customerPhone': customer_phone,
+        'customerEmail': customer_email or '',
+        'deliveryCityRef': city_ref,
+        'deliveryCityName': city_name,
+        'deliveryBranchRef': branch_ref,
+        'deliveryBranchDesc': branch_desc,
+        'paymentMethod': payment_method,
+        'paymentStatus': 'pending' if payment_method == 'online' else 'cod',
+        'invoiceId': invoice_id or '',
+        'certificates': normalized_certificates,
+        'ttn': '',
+        'generatedPassword': generated_password,
+        'adminNotes': '',
+        'createdAt': now,
+        'updatedAt': now,
+    }
+
+    try:
+        result = premium_orders_collection.insert_one(order_doc)
+    except Exception as exc:
+        return jsonify({'error': 'DB insert failed', 'details': str(exc)}), 500
+
+    return jsonify({
+        'orderId': str(result.inserted_id),
+        'status': 'on_moderation',
+        'generatedPassword': generated_password,
+        'paymentStatus': order_doc['paymentStatus'],
+        'createdAt': now.isoformat(),
+    }), 201
+
+
+@application.route('/api/admin/premium-orders', methods=['GET'])
+def admin_list_premium_orders():
+    search = _premium_order_str(request.args.get('search'))
+    status = _premium_order_str(request.args.get('status'))
+
+    query = {}
+    if status:
+        query['status'] = status
+    if search:
+        pattern = {'$regex': re.escape(search), '$options': 'i'}
+        query['$or'] = [
+            {'personName': pattern},
+            {'personNames': pattern},
+            {'cemetery': pattern},
+            {'cemeteryAddress': pattern},
+            {'customerName': pattern},
+            {'deliveryCityName': pattern},
+            {'deliveryBranchDesc': pattern},
+            {'ttn': pattern},
+            {'generatedPassword': pattern},
+        ]
+
+    docs = list(premium_orders_collection.find(query).sort([('createdAt', -1), ('_id', -1)]))
+    items = [_premium_order_projection(doc) for doc in docs]
+    return jsonify({'total': len(items), 'items': items})
+
+
+@application.route('/api/admin/premium-orders/<string:order_id>', methods=['GET'])
+def admin_get_premium_order(order_id):
+    try:
+        oid = ObjectId(order_id)
+    except Exception:
+        abort(400, description='Invalid order id')
+
+    doc = premium_orders_collection.find_one({'_id': oid})
+    if not doc:
+        abort(404, description='Order not found')
+
+    payload = _premium_order_projection(doc)
+    if not _premium_order_str(payload.get('avatarUrl')):
+        person_id = _premium_order_str(doc.get('personId'))
+        if not person_id:
+            person_ids = doc.get('personIds')
+            if isinstance(person_ids, list) and person_ids:
+                person_id = _premium_order_str(person_ids[0])
+        if person_id:
+            try:
+                person_doc = people_collection.find_one(
+                    {'_id': ObjectId(person_id)},
+                    {'avatarUrl': 1, 'portraitUrl': 1},
+                )
+            except Exception:
+                person_doc = None
+            if person_doc:
+                payload['avatarUrl'] = _premium_order_str(person_doc.get('avatarUrl') or person_doc.get('portraitUrl'))
+
+    return jsonify(payload)
+
+
+@application.route('/api/admin/premium-orders/<string:order_id>', methods=['PATCH'])
+def admin_update_premium_order(order_id):
+    try:
+        oid = ObjectId(order_id)
+    except Exception:
+        abort(400, description='Invalid order id')
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    current_doc = premium_orders_collection.find_one({'_id': oid})
+    if not current_doc:
+        abort(404, description='Order not found')
+
+    current_status = _premium_order_str(current_doc.get('status')) or 'on_moderation'
+    old_ttn = _premium_order_str(current_doc.get('ttn'))
+    update_fields = {}
+    has_explicit_status = 'status' in data
+
+    if 'ttn' in data:
+        next_ttn = _premium_order_str(data.get('ttn'))
+        update_fields['ttn'] = next_ttn
+        if next_ttn != old_ttn:
+            update_fields['npStatusRaw'] = ''
+            update_fields['npStatusCode'] = ''
+            update_fields['npCheckError'] = ''
+            update_fields['npLastCheckedAt'] = None
+            update_fields['npNextCheckAt'] = None
+            if not next_ttn:
+                update_fields['npDeliveredAt'] = None
+                update_fields['npRefusedAt'] = None
+
+        if next_ttn and not has_explicit_status and not _premium_status_is_terminal(current_status):
+            update_fields['status'] = 'sent'
+        if not next_ttn and not has_explicit_status and not _premium_status_is_terminal(current_status):
+            update_fields['status'] = 'on_moderation'
+
+    if 'generatedPassword' in data:
+        next_password = _premium_order_str(data.get('generatedPassword'))
+        if not next_password:
+            abort(400, description='`generatedPassword` cannot be empty')
+        update_fields['generatedPassword'] = next_password
+    if 'adminNotes' in data:
+        update_fields['adminNotes'] = _premium_order_str(data.get('adminNotes'))
+    if 'status' in data:
+        next_status = _premium_order_str(data.get('status'))
+        if next_status not in PREMIUM_ORDER_ALLOWED_STATUSES:
+            abort(400, description='Invalid status')
+        update_fields['status'] = next_status
+
+    if not update_fields:
+        abort(400, description='No fields to update')
+
+    update_fields['updatedAt'] = datetime.utcnow()
+    premium_orders_collection.update_one({'_id': oid}, {'$set': update_fields})
+
+    doc = premium_orders_collection.find_one({'_id': oid})
+    return jsonify(_premium_order_projection(doc))
+
+
+@application.route('/api/admin/premium-orders/<string:order_id>/refresh-tracking', methods=['POST'])
+def admin_refresh_single_premium_order_tracking(order_id):
+    try:
+        oid = ObjectId(order_id)
+    except Exception:
+        abort(400, description='Invalid order id')
+
+    body = request.get_json(silent=True) or {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        abort(400, description='Request must be a JSON object')
+
+    force = _premium_parse_bool(body.get('force'))
+    order_doc = premium_orders_collection.find_one({'_id': oid})
+    if not order_doc:
+        abort(404, description='Order not found')
+
+    outcome = _premium_refresh_tracking_for_order(order_doc, force=force)
+    latest = premium_orders_collection.find_one({'_id': oid}) or order_doc
+    return jsonify({
+        'item': _premium_order_projection(latest),
+        'tracking': outcome,
+    })
+
+
+@application.route('/api/admin/premium-orders/refresh-tracking', methods=['POST'])
+def admin_refresh_premium_orders_tracking():
+    body = request.get_json(silent=True) or {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        abort(400, description='Request must be a JSON object')
+
+    force = _premium_parse_bool(body.get('force'))
+    requested_limit = body.get('limit')
+    try:
+        limit = int(requested_limit) if requested_limit is not None else NP_TRACKING_BATCH_LIMIT_DEFAULT
+    except (TypeError, ValueError):
+        abort(400, description='`limit` must be a number')
+
+    limit = max(1, min(limit, NP_TRACKING_BATCH_LIMIT_MAX))
+    now = datetime.utcnow()
+
+    query = {
+        'ttn': {'$nin': ['', None]},
+        'status': {'$nin': list(PREMIUM_ORDER_TERMINAL_STATUSES)},
+    }
+    if not force:
+        query['$or'] = [
+            {'npNextCheckAt': {'$exists': False}},
+            {'npNextCheckAt': None},
+            {'npNextCheckAt': {'$lte': now}},
+        ]
+
+    docs = list(
+        premium_orders_collection
+        .find(query)
+        .sort([('npLastCheckedAt', 1), ('createdAt', 1), ('_id', 1)])
+        .limit(limit)
+    )
+
+    if not docs:
+        return jsonify({
+            'processed': 0,
+            'checked': 0,
+            'updated': 0,
+            'received': 0,
+            'refused': 0,
+            'errors': 0,
+            'cooldown': 0,
+            'terminal': 0,
+            'missingTtn': 0,
+            'items': [],
+        })
+
+    max_workers = max(1, min(NP_TRACKING_BATCH_CONCURRENCY, len(docs)))
+    outcomes = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_premium_refresh_tracking_for_order, doc, force=force) for doc in docs]
+        for future in as_completed(futures):
+            try:
+                outcomes.append(future.result())
+            except Exception as exc:
+                outcomes.append({
+                    'id': '',
+                    'checked': False,
+                    'updated': False,
+                    'status': '',
+                    'reason': 'error',
+                    'ok': False,
+                    'error': str(exc),
+                })
+
+    checked_count = sum(1 for item in outcomes if item.get('checked'))
+    updated_count = sum(1 for item in outcomes if item.get('updated'))
+    received_count = sum(1 for item in outcomes if item.get('status') == 'received')
+    refused_count = sum(1 for item in outcomes if item.get('status') == 'refused')
+    errors_count = sum(1 for item in outcomes if item.get('checked') and not item.get('ok'))
+    cooldown_count = sum(1 for item in outcomes if item.get('reason') == 'cooldown')
+    terminal_count = sum(1 for item in outcomes if item.get('reason') == 'terminal')
+    missing_ttn_count = sum(1 for item in outcomes if item.get('reason') == 'missing_ttn')
+
+    return jsonify({
+        'processed': len(outcomes),
+        'checked': checked_count,
+        'updated': updated_count,
+        'received': received_count,
+        'refused': refused_count,
+        'errors': errors_count,
+        'cooldown': cooldown_count,
+        'terminal': terminal_count,
+        'missingTtn': missing_ttn_count,
+        'items': outcomes,
+    })
+
+
+@application.route('/api/admin/premium-orders/<string:order_id>/activate', methods=['POST'])
+def admin_activate_premium_order(order_id):
+    try:
+        oid = ObjectId(order_id)
+    except Exception:
+        abort(400, description='Invalid order id')
+
+    order_doc = premium_orders_collection.find_one({'_id': oid})
+    if not order_doc:
+        abort(404, description='Order not found')
+
+    raw_password = _premium_order_str(order_doc.get('generatedPassword'))
+    if not raw_password:
+        abort(400, description='Missing generatedPassword for activation')
+
+    person_ids = order_doc.get('personIds')
+    if not isinstance(person_ids, list) or not person_ids:
+        abort(400, description='Order has no personIds')
+
+    hashed = hash_password(raw_password)
+    now = datetime.utcnow()
+
+    for person_id in person_ids:
+        cleaned = _premium_order_str(person_id)
+        if not cleaned:
+            continue
+        try:
+            pid = ObjectId(cleaned)
+        except Exception:
+            continue
+        people_collection.update_one(
+            {'_id': pid},
+            {
+                '$set': {
+                    'premium.password': hashed,
+                    'premium.updatedAt': now,
+                }
+            }
+        )
+
+    premium_orders_collection.update_one(
+        {'_id': oid},
+        {
+            '$set': {
+                'status': 'received',
+                'activatedAt': now,
+                'updatedAt': now,
+            }
+        }
+    )
+
+    updated = premium_orders_collection.find_one({'_id': oid})
+    return jsonify(_premium_order_projection(updated))
+
+
 @application.route('/api/merchant/invoice/create', methods=['POST'])
 def create_invoice():
     data = request.get_json() or {}
@@ -4397,6 +5983,17 @@ def monopay_webhook():
             }
         },
         upsert=True
+    )
+
+    premium_orders_collection.update_one(
+        {'invoiceId': invoice_id},
+        {
+            '$set': {
+                'paymentStatus': status,
+                'webhookData': data,
+                'updatedAt': datetime.utcnow(),
+            }
+        }
     )
 
     liturgies_collection.update_one(

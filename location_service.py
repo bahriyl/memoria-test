@@ -582,6 +582,57 @@ def _nominatim_search(query, nominatim_base_url, user_agent, language, country_c
     return items
 
 
+def _parse_bounding_box(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        south = float(value[0])
+        north = float(value[1])
+        west = float(value[2])
+        east = float(value[3])
+    except Exception:
+        return None
+    if south > north:
+        south, north = north, south
+    if west > east:
+        west, east = east, west
+    return (south, north, west, east)
+
+
+def _geo_within_bbox(geo, bbox, pad=0.01):
+    parsed_geo = parse_geo_point(geo)
+    if not parsed_geo or not bbox:
+        return False
+    lng, lat = parsed_geo.get("coordinates", [None, None])
+    if lat is None or lng is None:
+        return False
+    south, north, west, east = bbox
+    return (south - pad) <= lat <= (north + pad) and (west - pad) <= lng <= (east + pad)
+
+
+def _lookup_area_bbox(area_id, nominatim_base_url, user_agent, language, timeout_seconds, retries):
+    area_id_clean = clean_str(area_id)
+    if not area_id_clean or not clean_str(nominatim_base_url):
+        return None
+
+    cache_key = f"nominatim:area-bbox:{area_id_clean}:{clean_str(language).lower()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    item = _lookup_nominatim_by_place(
+        area_id_clean,
+        nominatim_base_url=nominatim_base_url,
+        user_agent=user_agent,
+        language=language,
+        timeout_seconds=timeout_seconds,
+        retries=retries,
+    )
+    bbox = _parse_bounding_box(item.get("boundingbox") if isinstance(item, dict) else None)
+    _cache_set(cache_key, bbox, ttl_seconds=3600)
+    return bbox
+
+
 def _extract_address_parts_from_nominatim(item):
     address = item.get("address") if isinstance(item, dict) and isinstance(item.get("address"), dict) else {}
     road = _extract_road(address)
@@ -731,12 +782,15 @@ def search_area_suggestions(search, photon_base_url, user_agent="", language="uk
 def search_address_suggestions(
     search,
     photon_base_url,
+    nominatim_base_url="",
     user_agent="",
     language="uk",
     country_codes="UA",
     max_rows=10,
     area_id="",
     city="",
+    bias_lat=None,
+    bias_lng=None,
     timeout_seconds=5,
     retries=1,
 ):
@@ -754,14 +808,20 @@ def search_address_suggestions(
     queries, parsed_query = _build_address_query_variants(search_clean, city=city_clean)
     feature_pool = []
     request_limit = max(int(max_rows), 1)
+    bias_lat_val = parse_float(bias_lat)
+    bias_lng_val = parse_float(bias_lng)
     for query_variant in queries[:6]:
+        photon_params = {
+            "q": query_variant,
+            "limit": max(request_limit, 10),
+            "lang": clean_str(language) or "uk",
+        }
+        if bias_lat_val is not None and bias_lng_val is not None:
+            photon_params["lat"] = bias_lat_val
+            photon_params["lon"] = bias_lng_val
         payload = _photon_request(
             photon_base_url,
-            {
-                "q": query_variant,
-                "limit": max(request_limit, 10),
-                "lang": clean_str(language) or "uk",
-            },
+            photon_params,
             user_agent=user_agent,
             timeout=timeout_seconds,
             retries=retries,
@@ -773,6 +833,19 @@ def search_address_suggestions(
     allowed = set(_to_country_codes(country_codes))
     city_norm = _normalize_text_for_match(city_clean)
     query_for_score = clean_str(parsed_query.get("query") or search_clean)
+    street_query_norm = _normalize_text_for_match(parsed_query.get("street") or "")
+    street_tokens = [token for token in street_query_norm.split(" ") if token and not _is_house_token(token)]
+    area_bbox = None
+    should_use_bbox = bool(area_id_clean and not city_norm and (bias_lat_val is None or bias_lng_val is None))
+    if should_use_bbox:
+        area_bbox = _lookup_area_bbox(
+            area_id_clean,
+            nominatim_base_url=nominatim_base_url,
+            user_agent=user_agent,
+            language=language,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+        )
 
     for feature in feature_pool:
         if not isinstance(feature, dict):
@@ -785,6 +858,8 @@ def search_address_suggestions(
 
         geo = _feature_geo(feature)
         if not geo:
+            continue
+        if area_bbox and not _geo_within_bbox(geo, area_bbox):
             continue
 
         address_parts = _extract_photon_address_parts(feature)
@@ -814,6 +889,12 @@ def search_address_suggestions(
             clean_str(address_parts.get("region")) or clean_str(area.get("region")),
             _display_country_name(country_code),
         ) or clean_str(props.get("name")) or clean_str(area.get("display"))
+        if street_tokens:
+            candidate_text = _normalize_text_for_match(
+                " ".join([road, clean_str(props.get("name")), display])
+            )
+            if not any(token in candidate_text for token in street_tokens):
+                continue
 
         has_street_and_house = bool(road and house_number)
         candidate_city = clean_str(address_parts.get("city")) or clean_str(area.get("city"))
@@ -826,6 +907,8 @@ def search_address_suggestions(
                 or (display_norm and city_norm in display_norm)
             )
         )
+        if city_norm and not city_match:
+            continue
         similarity = _similarity_score(query_for_score, display, road=road, house_number=house_number)
 
         out.append({
@@ -923,21 +1006,26 @@ def search_location_addresses(
     max_rows=10,
     area_id="",
     city="",
+    bias_lat=None,
+    bias_lng=None,
     timeout_ms=5000,
     retries=1,
     **_,
 ):
-    del provider, nominatim_base_url
+    del provider
     timeout_seconds = max(parse_float(timeout_ms) or 5000, 1000) / 1000.0
     return search_address_suggestions(
         search,
         photon_base_url=photon_base_url,
+        nominatim_base_url=nominatim_base_url,
         user_agent=user_agent,
         language=language,
         country_codes=country_codes,
         max_rows=max_rows,
         area_id=area_id,
         city=city,
+        bias_lat=bias_lat,
+        bias_lng=bias_lng,
         timeout_seconds=timeout_seconds,
         retries=retries,
     )

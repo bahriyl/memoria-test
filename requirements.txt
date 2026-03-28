@@ -11,3 +11,4 @@ PyJWT
 boto3
 bcrypt
 Pillow
+segno

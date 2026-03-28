@@ -16,6 +16,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 import jwt
 try:
     from zoneinfo import ZoneInfo
@@ -71,6 +72,11 @@ except Exception:
     Image = None
     ImageOps = None
 
+try:
+    import segno
+except Exception:
+    segno = None
+
 
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
@@ -83,6 +89,12 @@ NP_TRACKING_COOLDOWN_SECONDS = max(int(os.getenv('NP_TRACKING_COOLDOWN_SECONDS',
 NP_TRACKING_BATCH_LIMIT_DEFAULT = max(int(os.getenv('NP_TRACKING_BATCH_LIMIT_DEFAULT', '25') or '25'), 1)
 NP_TRACKING_BATCH_LIMIT_MAX = max(int(os.getenv('NP_TRACKING_BATCH_LIMIT_MAX', '50') or '50'), NP_TRACKING_BATCH_LIMIT_DEFAULT)
 NP_TRACKING_BATCH_CONCURRENCY = max(int(os.getenv('NP_TRACKING_BATCH_CONCURRENCY', '4') or '4'), 1)
+PUBLIC_WEB_BASE_URL = (
+    os.getenv('PUBLIC_WEB_BASE_URL')
+    or os.getenv('FRONTEND_BASE_URL')
+    or os.getenv('APP_BASE_URL')
+    or ''
+).strip()
 
 application = Flask(__name__)
 CORS(application)
@@ -165,6 +177,8 @@ areas_collection = db['areas']
 people_moderation_collection = db['people_moderation']
 orders_collection = db['orders']
 premium_orders_collection = db['premium_orders']
+admin_qr_batches_collection = db['admin_qr_batches']
+admin_qr_codes_collection = db['admin_qr_codes']
 chat_collection = db['chats']
 message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
@@ -391,6 +405,31 @@ except Exception:
 
 try:
     ritual_services_collection.create_index([("hqLocation.geo", "2dsphere")])
+except Exception:
+    pass
+
+try:
+    admin_qr_codes_collection.create_index([("qrNumber", ASCENDING)], unique=True)
+except Exception:
+    pass
+
+try:
+    admin_qr_codes_collection.create_index([("pathKey", ASCENDING), ("createdAt", -1)])
+except Exception:
+    pass
+
+try:
+    admin_qr_codes_collection.create_index([("batchId", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    admin_qr_codes_collection.create_index([("qrToken", ASCENDING)], unique=True, sparse=True)
+except Exception:
+    pass
+
+try:
+    admin_qr_batches_collection.create_index([("pathKey", ASCENDING), ("createdAt", -1)])
 except Exception:
     pass
 
@@ -5166,6 +5205,508 @@ PREMIUM_ORDER_ALLOWED_STATUSES = {
     'refused',
 }
 
+QR_PATH_LABELS = {
+    'premium_qr': 'Преміум QR',
+    'premium_qr_firma': 'Преміум QR | Фірма',
+    'plaques': 'Таблички',
+}
+QR_ALLOWED_PATH_KEYS = set(QR_PATH_LABELS.keys())
+
+
+def _qr_str(value):
+    if value is None:
+        return ''
+    return str(value).strip()
+
+
+def _qr_parse_path_key(value, *, field_name='pathKey'):
+    cleaned = _qr_str(value)
+    if cleaned not in QR_ALLOWED_PATH_KEYS:
+        abort(400, description=f'`{field_name}` must be one of: {", ".join(sorted(QR_ALLOWED_PATH_KEYS))}')
+    return cleaned
+
+
+def _qr_parse_positive_int(value, *, field_name='quantity', minimum=1, maximum=500):
+    try:
+        parsed = int(value)
+    except Exception:
+        abort(400, description=f'`{field_name}` must be a number')
+    if parsed < minimum or parsed > maximum:
+        abort(400, description=f'`{field_name}` must be between {minimum} and {maximum}')
+    return parsed
+
+
+def _qr_parse_bool(value):
+    cleaned = _qr_str(value).lower()
+    if cleaned in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if cleaned in {'0', 'false', 'no', 'n', 'off'}:
+        return False
+    return bool(value)
+
+
+def _qr_ua_date_from_dt(value):
+    if not isinstance(value, datetime):
+        return ''
+    return value.strftime('%d.%m.%Y')
+
+
+def _qr_parse_ua_date(value):
+    raw = _qr_str(value)
+    if not raw:
+        return None
+    try:
+        parsed = datetime.strptime(raw, '%d.%m.%Y')
+    except Exception:
+        abort(400, description='`date` must be in DD.MM.YYYY format')
+    return parsed.date()
+
+
+def _qr_seed_next():
+    latest = admin_qr_codes_collection.find_one({}, {'qrNumber': 1}, sort=[('qrNumber', -1)])
+    max_number = int(latest.get('qrNumber') or 0) if latest else 0
+    return max_number + 1
+
+
+def _qr_public_base_url():
+    if PUBLIC_WEB_BASE_URL:
+        return PUBLIC_WEB_BASE_URL.rstrip('/')
+    try:
+        host = _qr_str(request.host_url)
+    except RuntimeError:
+        host = ''
+    return host.rstrip('/')
+
+
+def _qr_build_scan_path(token):
+    return f"/qr/{quote(_qr_str(token), safe='')}"
+
+
+def _qr_build_scan_url(token):
+    path = _qr_build_scan_path(token)
+    base = _qr_public_base_url()
+    return f'{base}{path}' if base else path
+
+
+def _qr_build_image_url(scan_url):
+    cleaned = _qr_str(scan_url)
+    if not cleaned:
+        return ''
+    if segno is None:
+        return ''
+
+    out = io.BytesIO()
+    qr = segno.make(cleaned, error='m')
+    qr.save(out, kind='svg', scale=6, border=2, dark='#111111', light='#ffffff')
+    svg_bytes = out.getvalue()
+    encoded = base64.b64encode(svg_bytes).decode('ascii')
+    return f'data:image/svg+xml;base64,{encoded}'
+
+
+def _qr_generate_unique_token():
+    for _ in range(12):
+        token = secrets.token_urlsafe(9).rstrip('=')
+        if not admin_qr_codes_collection.find_one({'qrToken': token}, {'_id': 1}):
+            return token
+    abort(500, description='Failed to allocate unique QR token')
+
+
+def _qr_ensure_doc_runtime_fields(doc, *, persist=False):
+    if not isinstance(doc, dict):
+        return doc
+
+    update_fields = {}
+    token = _qr_str(doc.get('qrToken'))
+    if not token:
+        token = _qr_generate_unique_token()
+        update_fields['qrToken'] = token
+
+    scan_url = _qr_str(doc.get('scanUrl'))
+    if not scan_url:
+        scan_url = _qr_build_scan_url(token)
+        update_fields['scanUrl'] = scan_url
+
+    qr_image_url = _qr_str(doc.get('qrImageUrl'))
+    if not qr_image_url:
+        qr_image_url = _qr_build_image_url(scan_url)
+        update_fields['qrImageUrl'] = qr_image_url
+
+    wired_qr_code_id = _qr_str(doc.get('wiredQrCodeId'))
+    if not wired_qr_code_id and doc.get('qrNumber') is not None:
+        wired_qr_code_id = _qr_str(doc.get('qrNumber'))
+        if wired_qr_code_id:
+            update_fields['wiredQrCodeId'] = wired_qr_code_id
+
+    if update_fields:
+        update_fields['updatedAt'] = datetime.utcnow()
+        doc.update(update_fields)
+        if persist and doc.get('_id'):
+            admin_qr_codes_collection.update_one({'_id': doc['_id']}, {'$set': update_fields})
+
+    return doc
+
+
+def _qr_summary_payload():
+    summary_new = {
+        key: {
+            'pathKey': key,
+            'pathLabel': QR_PATH_LABELS[key],
+            'totalCount': 0,
+            # TEMP_BACKEND_FALLBACK: UI shows green action by this field; mirror total for active rows.
+            'printedCount': 0,
+            'exported': False,
+        }
+        for key in QR_PATH_LABELS
+    }
+    summary_printed = {
+        key: {
+            'pathKey': key,
+            'pathLabel': QR_PATH_LABELS[key],
+            'totalCount': 0,
+            'connectedCount': 0,
+        }
+        for key in QR_PATH_LABELS
+    }
+
+    for row in admin_qr_codes_collection.aggregate([
+        {'$match': {'isPrinted': {'$ne': True}}},
+        {'$group': {'_id': '$pathKey', 'total': {'$sum': 1}}},
+    ]):
+        path_key = _qr_str(row.get('_id'))
+        if path_key not in summary_new:
+            continue
+        total = int(row.get('total') or 0)
+        summary_new[path_key]['totalCount'] = total
+        summary_new[path_key]['printedCount'] = total
+
+    for row in admin_qr_codes_collection.aggregate([
+        {'$match': {'isPrinted': True}},
+        {
+            '$group': {
+                '_id': '$pathKey',
+                'total': {'$sum': 1},
+                'connected': {'$sum': {'$cond': [{'$eq': ['$isConnected', True]}, 1, 0]}},
+            }
+        },
+    ]):
+        path_key = _qr_str(row.get('_id'))
+        if path_key not in summary_printed:
+            continue
+        summary_printed[path_key]['totalCount'] = int(row.get('total') or 0)
+        summary_printed[path_key]['connectedCount'] = int(row.get('connected') or 0)
+
+    exported_cursor = admin_qr_batches_collection.aggregate([
+        {'$match': {'printedAt': None, 'exportedAt': {'$ne': None}}},
+        {'$group': {'_id': '$pathKey'}},
+    ])
+    for row in exported_cursor:
+        path_key = _qr_str(row.get('_id'))
+        if path_key in summary_new:
+            summary_new[path_key]['exported'] = True
+
+    return {
+        'new': [summary_new[key] for key in QR_PATH_LABELS],
+        'printed': [summary_printed[key] for key in QR_PATH_LABELS],
+        'seedNext': _qr_seed_next(),
+    }
+
+
+def _qr_detail_item_projection(doc, *, is_batch_main=False, batch_comment_text=''):
+    doc = _qr_ensure_doc_runtime_fields(doc, persist=True)
+    path_key = _qr_str(doc.get('pathKey'))
+    is_connected = bool(doc.get('isConnected'))
+    created_at = doc.get('createdAt')
+    return {
+        'id': str(doc.get('_id')),
+        'batchId': str(doc.get('batchId')) if doc.get('batchId') else '',
+        'pathKey': path_key,
+        'pathLabel': QR_PATH_LABELS.get(path_key, ''),
+        'qrNumber': int(doc.get('qrNumber') or 0),
+        'status': 'Підключений' if is_connected else 'Не підключений',
+        'isConnected': is_connected,
+        'wiredPersonId': _qr_str(doc.get('wiredPersonId')),
+        'wiredQrCodeId': _qr_str(doc.get('wiredQrCodeId')),
+        'createdAt': _qr_ua_date_from_dt(created_at),
+        'scanUrl': _qr_str(doc.get('scanUrl')),
+        'qrImageUrl': _qr_str(doc.get('qrImageUrl')),
+        'isPrinted': bool(doc.get('isPrinted')),
+        'isBatchMain': bool(is_batch_main),
+        'hasComment': bool(is_batch_main and _qr_str(batch_comment_text)),
+        'commentText': _qr_str(batch_comment_text) if is_batch_main else '',
+    }
+
+
+@application.route('/api/admin/qr/summary', methods=['GET'])
+def admin_qr_summary():
+    return jsonify(_qr_summary_payload())
+
+
+@application.route('/api/admin/qr/detail', methods=['GET'])
+def admin_qr_detail():
+    path_key = _qr_parse_path_key(request.args.get('pathKey'))
+    subtab = _qr_str(request.args.get('subtab')).lower() or 'new'
+    if subtab not in {'new', 'printed'}:
+        abort(400, description='`subtab` must be `new` or `printed`')
+    search = _qr_str(request.args.get('search')).lower()
+    selected_date = _qr_parse_ua_date(request.args.get('date'))
+
+    query = {'pathKey': path_key}
+    if subtab == 'printed':
+        query['isPrinted'] = True
+
+    docs = list(admin_qr_codes_collection.find(query).sort([('createdAt', -1), ('qrNumber', -1)]))
+
+    batch_max_qr = {}
+    batch_ids = []
+    for doc in docs:
+        batch_id = doc.get('batchId')
+        qr_number = int(doc.get('qrNumber') or 0)
+        if not batch_id:
+            continue
+        if batch_id not in batch_max_qr or qr_number > batch_max_qr[batch_id]:
+            batch_max_qr[batch_id] = qr_number
+        batch_ids.append(batch_id)
+
+    batch_comment_map = {}
+    if batch_ids:
+        unique_batch_ids = list({bid for bid in batch_ids if bid})
+        batch_docs = admin_qr_batches_collection.find(
+            {'_id': {'$in': unique_batch_ids}},
+            {'commentText': 1},
+        )
+        for batch_doc in batch_docs:
+            batch_comment_map[batch_doc.get('_id')] = _qr_str(batch_doc.get('commentText'))
+
+    items = []
+    for doc in docs:
+        batch_id = doc.get('batchId')
+        qr_number = int(doc.get('qrNumber') or 0)
+        is_batch_main = True if not batch_id else qr_number == int(batch_max_qr.get(batch_id, qr_number))
+        batch_comment_text = ''
+        if batch_id:
+            batch_comment_text = _qr_str(batch_comment_map.get(batch_id))
+        items.append(
+            _qr_detail_item_projection(
+                doc,
+                is_batch_main=is_batch_main,
+                batch_comment_text=batch_comment_text,
+            )
+        )
+
+    if selected_date is not None:
+        selected_date_str = selected_date.strftime('%d.%m.%Y')
+        items = [item for item in items if _qr_str(item.get('createdAt')) == selected_date_str]
+
+    if search:
+        def _match(item):
+            return (
+                search in _qr_str(item.get('qrNumber')).lower()
+                or search in _qr_str(item.get('createdAt')).lower()
+                or search in _qr_str(item.get('status')).lower()
+                or search in _qr_str(item.get('pathLabel')).lower()
+                or search in _qr_str(item.get('commentText')).lower()
+            )
+        items = [item for item in items if _match(item)]
+
+    return jsonify({'total': len(items), 'items': items})
+
+
+@application.route('/api/qr/resolve/<string:code>', methods=['GET'])
+def public_qr_resolve(code):
+    token = _qr_str(code)
+    if not token:
+        return jsonify({
+            'found': False,
+            'status': 'not_found',
+            'pathKey': '',
+            'isWired': False,
+            'wiredPersonId': '',
+            'wiredQrCodeId': '',
+        })
+
+    doc = admin_qr_codes_collection.find_one({'qrToken': token})
+    if not doc:
+        return jsonify({
+            'found': False,
+            'status': 'not_found',
+            'pathKey': '',
+            'isWired': False,
+            'wiredPersonId': '',
+            'wiredQrCodeId': '',
+        })
+
+    doc = _qr_ensure_doc_runtime_fields(doc, persist=True)
+    wired_person_id = _qr_str(doc.get('wiredPersonId'))
+    is_wired = bool(doc.get('isConnected') and wired_person_id)
+    return jsonify({
+        'found': True,
+        'status': 'wired' if is_wired else 'not_wired',
+        'pathKey': _qr_str(doc.get('pathKey')),
+        'isWired': is_wired,
+        'wiredPersonId': wired_person_id,
+        'wiredQrCodeId': _qr_str(doc.get('wiredQrCodeId')),
+        'scanUrl': _qr_str(doc.get('scanUrl')),
+        'qrImageUrl': _qr_str(doc.get('qrImageUrl')),
+    })
+
+
+@application.route('/api/admin/qr/create', methods=['POST'])
+def admin_qr_create():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    path_key = _qr_parse_path_key(data.get('pathKey'))
+    quantity = _qr_parse_positive_int(data.get('quantity'), field_name='quantity')
+    now = datetime.utcnow()
+    seed_start = _qr_seed_next()
+    range_end = seed_start + quantity - 1
+
+    batch_doc = {
+        'pathKey': path_key,
+        'pathLabel': QR_PATH_LABELS[path_key],
+        'quantity': quantity,
+        'rangeStart': seed_start,
+        'rangeEnd': range_end,
+        'commentText': '',
+        'hasComment': False,
+        'exportedAt': None,
+        'printedAt': None,
+        'createdAt': now,
+        'updatedAt': now,
+    }
+    batch_result = admin_qr_batches_collection.insert_one(batch_doc)
+    batch_id = batch_result.inserted_id
+
+    codes = []
+    for idx in range(quantity):
+        qr_number = seed_start + idx
+        qr_token = _qr_generate_unique_token()
+        scan_url = _qr_build_scan_url(qr_token)
+        codes.append({
+            'batchId': batch_id,
+            'pathKey': path_key,
+            'pathLabel': QR_PATH_LABELS[path_key],
+            'qrNumber': qr_number,
+            'qrToken': qr_token,
+            'scanUrl': scan_url,
+            'qrImageUrl': _qr_build_image_url(scan_url),
+            'status': 'disconnected',
+            'isConnected': False,
+            'wiredPersonId': '',
+            'wiredQrCodeId': str(qr_number),
+            'isPrinted': False,
+            'printedAt': None,
+            'exportedAt': None,
+            'commentText': '',
+            'hasComment': False,
+            'createdAt': now,
+            'updatedAt': now,
+        })
+    if codes:
+        admin_qr_codes_collection.insert_many(codes)
+
+    return jsonify({
+        'batchId': str(batch_id),
+        'createdCount': quantity,
+        'rangeStart': seed_start,
+        'rangeEnd': range_end,
+        'seedNext': range_end + 1,
+    }), 201
+
+
+@application.route('/api/admin/qr/export', methods=['POST'])
+def admin_qr_export():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    path_key = _qr_parse_path_key(data.get('pathKey'))
+    scope = _qr_str(data.get('scope')).lower() or 'new'
+    if scope not in {'new', 'detail'}:
+        abort(400, description='`scope` must be `new` or `detail`')
+    force = _qr_parse_bool(data.get('force'))
+
+    active_batches = list(
+        admin_qr_batches_collection.find({'pathKey': path_key, 'printedAt': None}).sort([('createdAt', -1), ('_id', -1)])
+    )
+    if not active_batches:
+        return jsonify({'ok': True, 'alreadyExported': False, 'exportedAt': None})
+
+    already_exported = any(isinstance(item.get('exportedAt'), datetime) for item in active_batches)
+    if already_exported and not force:
+        latest_export = max((item.get('exportedAt') for item in active_batches if isinstance(item.get('exportedAt'), datetime)), default=None)
+        return jsonify({
+            'ok': False,
+            'alreadyExported': True,
+            'exportedAt': latest_export.isoformat() if latest_export else None,
+        })
+
+    now = datetime.utcnow()
+    batch_ids = [item.get('_id') for item in active_batches if item.get('_id')]
+    admin_qr_batches_collection.update_many(
+        {'_id': {'$in': batch_ids}},
+        {'$set': {'exportedAt': now, 'updatedAt': now}},
+    )
+    admin_qr_codes_collection.update_many(
+        {'batchId': {'$in': batch_ids}, 'isPrinted': {'$ne': True}},
+        {'$set': {'exportedAt': now, 'updatedAt': now}},
+    )
+    return jsonify({
+        'ok': True,
+        'alreadyExported': already_exported,
+        'exportedAt': now.isoformat(),
+    })
+
+
+@application.route('/api/admin/qr/mark-printed', methods=['POST'])
+def admin_qr_mark_printed():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+    path_key = _qr_parse_path_key(data.get('pathKey'))
+    now = datetime.utcnow()
+
+    result = admin_qr_codes_collection.update_many(
+        {'pathKey': path_key, 'isPrinted': {'$ne': True}},
+        {'$set': {'isPrinted': True, 'printedAt': now, 'updatedAt': now}},
+    )
+    admin_qr_batches_collection.update_many(
+        {'pathKey': path_key, 'printedAt': None},
+        {'$set': {'printedAt': now, 'updatedAt': now}},
+    )
+    return jsonify({'updatedCount': int(result.modified_count or 0)})
+
+
+@application.route('/api/admin/qr/batches/<string:batch_id>/comment', methods=['PATCH'])
+def admin_qr_batch_comment(batch_id):
+    try:
+        oid = ObjectId(batch_id)
+    except Exception:
+        abort(400, description='Invalid batch id')
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    comment_text = _qr_str(data.get('commentText'))
+    if not comment_text:
+        abort(400, description='`commentText` is required')
+
+    now = datetime.utcnow()
+    batch_result = admin_qr_batches_collection.update_one(
+        {'_id': oid},
+        {'$set': {'commentText': comment_text, 'hasComment': True, 'updatedAt': now}},
+    )
+    if batch_result.matched_count == 0:
+        abort(404, description='Batch not found')
+
+    return jsonify({
+        'batchId': str(oid),
+        'commentText': comment_text,
+        'updatedAt': now.isoformat(),
+    })
+
 PREMIUM_ORDER_TERMINAL_STATUSES = {'received', 'rejected', 'refused'}
 
 
@@ -5447,8 +5988,11 @@ def _premium_order_projection(doc):
         person_names = []
     person_names = [_premium_order_str(name) for name in person_names if _premium_order_str(name)]
 
+    ttn = _premium_order_str(doc.get('ttn'))
     status = _premium_order_str(doc.get('status')) or 'on_moderation'
     if status not in PREMIUM_ORDER_ALLOWED_STATUSES:
+        status = 'on_moderation'
+    if status == 'sent' and not ttn:
         status = 'on_moderation'
 
     certificates = doc.get('certificates')
@@ -5488,10 +6032,13 @@ def _premium_order_projection(doc):
         'deliveryCityName': _premium_order_str(doc.get('deliveryCityName')),
         'deliveryBranchRef': _premium_order_str(doc.get('deliveryBranchRef')),
         'deliveryBranchDesc': _premium_order_str(doc.get('deliveryBranchDesc')),
-        'ttn': _premium_order_str(doc.get('ttn')),
+        'ttn': ttn,
         'generatedPassword': _premium_order_str(doc.get('generatedPassword')),
         'adminNotes': _premium_order_str(doc.get('adminNotes')),
         'orderNumber': _premium_order_str(doc.get('orderNumber')),
+        'wiredQrCodeId': _premium_order_str(doc.get('wiredQrCodeId')),
+        'wiredQrCodeDocId': _premium_order_str(doc.get('wiredQrCodeDocId')),
+        'wiredPersonId': _premium_order_str(doc.get('wiredPersonId')),
         'npStatusRaw': _premium_order_str(doc.get('npStatusRaw')),
         'npStatusCode': _premium_order_str(doc.get('npStatusCode')),
         'npCheckError': _premium_order_str(doc.get('npCheckError')),
@@ -5748,6 +6295,11 @@ def admin_update_premium_order(order_id):
             abort(400, description='Invalid status')
         update_fields['status'] = next_status
 
+    resulting_ttn = _premium_order_str(update_fields.get('ttn')) if 'ttn' in update_fields else old_ttn
+    resulting_status = _premium_order_str(update_fields.get('status')) if 'status' in update_fields else current_status
+    if resulting_status == 'sent' and not resulting_ttn:
+        update_fields['status'] = 'on_moderation'
+
     if not update_fields:
         abort(400, description='No fields to update')
 
@@ -5875,6 +6427,19 @@ def admin_refresh_premium_orders_tracking():
     })
 
 
+def _premium_pick_qr_code_for_activation():
+    preferred_doc = admin_qr_codes_collection.find_one(
+        {'pathKey': 'premium_qr', 'isConnected': {'$ne': True}, 'isPrinted': True},
+        sort=[('qrNumber', ASCENDING), ('_id', ASCENDING)],
+    )
+    if preferred_doc:
+        return preferred_doc
+    return admin_qr_codes_collection.find_one(
+        {'pathKey': 'premium_qr', 'isConnected': {'$ne': True}},
+        sort=[('qrNumber', ASCENDING), ('_id', ASCENDING)],
+    )
+
+
 @application.route('/api/admin/premium-orders/<string:order_id>/activate', methods=['POST'])
 def admin_activate_premium_order(order_id):
     try:
@@ -5894,8 +6459,29 @@ def admin_activate_premium_order(order_id):
     if not isinstance(person_ids, list) or not person_ids:
         abort(400, description='Order has no personIds')
 
+    primary_person_id = _premium_order_str(order_doc.get('personId')) or _premium_order_str(person_ids[0])
+    if not primary_person_id:
+        abort(400, description='Order has no primary personId')
+
     hashed = hash_password(raw_password)
     now = datetime.utcnow()
+
+    qr_doc = None
+    wired_qr_doc_id = _premium_order_str(order_doc.get('wiredQrCodeDocId'))
+    if wired_qr_doc_id:
+        try:
+            qr_doc = admin_qr_codes_collection.find_one({'_id': ObjectId(wired_qr_doc_id)})
+        except Exception:
+            qr_doc = None
+
+    if not qr_doc:
+        qr_doc = _premium_pick_qr_code_for_activation()
+    if not qr_doc:
+        abort(409, description='No available Premium QR code to wire')
+
+    qr_doc = _qr_ensure_doc_runtime_fields(qr_doc, persist=True)
+    qr_doc_id = qr_doc.get('_id')
+    wired_qr_code_id = _qr_str(qr_doc.get('wiredQrCodeId')) or _qr_str(qr_doc.get('qrNumber'))
 
     for person_id in person_ids:
         cleaned = _premium_order_str(person_id)
@@ -5919,12 +6505,30 @@ def admin_activate_premium_order(order_id):
         {'_id': oid},
         {
             '$set': {
-                'status': 'received',
                 'activatedAt': now,
+                'wiredQrCodeId': wired_qr_code_id,
+                'wiredQrCodeDocId': str(qr_doc_id) if qr_doc_id else '',
+                'wiredPersonId': primary_person_id,
                 'updatedAt': now,
             }
         }
     )
+
+    if qr_doc_id:
+        admin_qr_codes_collection.update_one(
+            {'_id': qr_doc_id},
+            {
+                '$set': {
+                    'status': 'connected',
+                    'isConnected': True,
+                    'wiredPersonId': primary_person_id,
+                    'wiredQrCodeId': wired_qr_code_id,
+                    'wiredOrderId': str(oid),
+                    'wiredAt': now,
+                    'updatedAt': now,
+                }
+            }
+        )
 
     updated = premium_orders_collection.find_one({'_id': oid})
     return jsonify(_premium_order_projection(updated))

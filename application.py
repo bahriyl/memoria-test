@@ -177,6 +177,7 @@ areas_collection = db['areas']
 people_moderation_collection = db['people_moderation']
 orders_collection = db['orders']
 premium_orders_collection = db['premium_orders']
+plaques_moderation_collection = db['plaques_moderation']
 admin_qr_batches_collection = db['admin_qr_batches']
 admin_qr_codes_collection = db['admin_qr_codes']
 chat_collection = db['chats']
@@ -185,6 +186,7 @@ cemeteries_collection = db['cemeteries']
 churches_collection = db['churches']
 ritual_services_collection = db['ritual_services']
 ritual_service_categories_collection = db['ritual_service_categories']
+premium_qr_firmas_collection = db['premium_qr_firmas']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 chat_templates_collection = db['chat_templates']
@@ -409,6 +411,16 @@ except Exception:
     pass
 
 try:
+    premium_qr_firmas_collection.create_index([("name", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    premium_qr_firmas_collection.create_index([("updatedAt", DESCENDING), ("createdAt", DESCENDING)])
+except Exception:
+    pass
+
+try:
     admin_qr_codes_collection.create_index([("qrNumber", ASCENDING)], unique=True)
 except Exception:
     pass
@@ -430,6 +442,16 @@ except Exception:
 
 try:
     admin_qr_batches_collection.create_index([("pathKey", ASCENDING), ("createdAt", -1)])
+except Exception:
+    pass
+
+try:
+    plaques_moderation_collection.create_index([("createdAt", -1)])
+except Exception:
+    pass
+
+try:
+    plaques_moderation_collection.create_index([("status", ASCENDING), ("createdAt", -1)])
 except Exception:
     pass
 
@@ -1282,6 +1304,403 @@ def admin_reject_person_moderation(moderation_id):
     return jsonify({'success': True})
 
 
+def _admin_plaques_path_label(item):
+    source_type = loc_clean_str(item.get('sourceType')).lower()
+    activation_type = loc_clean_str(item.get('activationType')).lower()
+    company_name = loc_clean_str(item.get('companyName'))
+    website_url = loc_clean_str(item.get('websiteUrl'))
+    if (
+        'firma' in source_type
+        or 'firma' in activation_type
+        or bool(company_name)
+        or bool(website_url)
+    ):
+        return 'Фірма'
+    return 'Сайт'
+
+
+def _admin_plaques_life_range_text(item):
+    birth_date = _admin_moderation_parse_iso_date(item.get('birthDate'))
+    death_date = _admin_moderation_parse_iso_date(item.get('deathDate'))
+    birth_year = _admin_moderation_parse_year(item.get('birthYear'))
+    death_year = _admin_moderation_parse_year(item.get('deathYear'))
+    if birth_year is None and birth_date:
+        birth_year = int(birth_date[:4])
+    if death_year is None and death_date:
+        death_year = int(death_date[:4])
+
+    birth_date_ua = _admin_pages_ua_date(birth_date)
+    death_date_ua = _admin_pages_ua_date(death_date)
+    if birth_date_ua and death_date_ua:
+        return f'{birth_date_ua} - {death_date_ua}'
+
+    if birth_year and death_year:
+        return f'{birth_year}-{death_year}'
+    if birth_year:
+        return f'{birth_year}-'
+    if death_year:
+        return f'-{death_year}'
+    return ''
+
+
+def _admin_plaques_projection(raw_doc):
+    item = raw_doc if isinstance(raw_doc, dict) else {}
+    burial = normalize_person_burial(item)
+    location = burial.get('location') if isinstance(burial.get('location'), dict) else {}
+    address = location.get('address') if isinstance(location.get('address'), dict) else {}
+    cemetery_ref = burial.get('cemeteryRef') if isinstance(burial.get('cemeteryRef'), dict) else {}
+    burial_photo_urls = loc_clean_str_list(
+        item.get('burialSitePhotoUrls') or ((burial.get('photos') if isinstance(burial, dict) else []) or [])
+    )
+    if not burial_photo_urls:
+        single_photo = loc_clean_str(item.get('burialSitePhotoUrl'))
+        if single_photo:
+            burial_photo_urls = [single_photo]
+
+    cemetery_name = loc_clean_str(cemetery_ref.get('name')) or loc_clean_str(item.get('cemetery'))
+    area = loc_clean_str(item.get('area')) or loc_clean_str(address.get('display'))
+    cemetery_exists = _admin_moderation_cemetery_exists(cemetery_name, area)
+    link = loc_clean_str(item.get('link') or item.get('internetLinks'))
+    achievements = loc_clean_str(item.get('bio') or item.get('achievements'))
+    occupation = loc_clean_str(item.get('occupation'))
+    notable = bool(item.get('notable')) or bool(link) or bool(achievements) or bool(occupation)
+    birth_date = _admin_moderation_parse_iso_date(item.get('birthDate'))
+    death_date = _admin_moderation_parse_iso_date(item.get('deathDate'))
+
+    return {
+        'id': str(item.get('_id')),
+        'name': loc_clean_str(item.get('name')),
+        'birthDate': birth_date,
+        'deathDate': death_date,
+        'lifeRangeText': _admin_plaques_life_range_text(item),
+        'area': area,
+        'areaId': loc_clean_str(item.get('areaId')),
+        'cemetery': cemetery_name,
+        'cemeteryExists': cemetery_exists,
+        'cemeteryStatusLabel': 'Додане' if cemetery_exists else 'Не додане',
+        'notable': notable,
+        'notableLabel': 'Так' if notable else 'Ні',
+        'phone': loc_clean_str(item.get('phone')),
+        'internetLinks': link,
+        'achievements': achievements,
+        'link': link,
+        'bio': achievements,
+        'occupation': occupation,
+        'burialSiteCoords': loc_clean_str(item.get('burialSiteCoords')),
+        'burialSitePhotoUrls': burial_photo_urls,
+        'burialSitePhotoUrl': burial_photo_urls[0] if burial_photo_urls else '',
+        'qrCode': loc_clean_str(item.get('qrCode')),
+        'qrDocId': loc_clean_str(item.get('qrDocId')),
+        'qrNumber': loc_clean_str(item.get('qrNumber')),
+        'wiredQrCodeId': loc_clean_str(item.get('wiredQrCodeId')),
+        'pathLabel': _admin_plaques_path_label(item),
+        'sourceType': loc_clean_str(item.get('sourceType')),
+        'activationType': loc_clean_str(item.get('activationType')),
+        'createdAt': item.get('createdAt'),
+        'updatedAt': item.get('updatedAt'),
+    }
+
+
+def _admin_plaques_build_updated_document(current_doc, payload):
+    source = current_doc if isinstance(current_doc, dict) else {}
+    incoming = payload if isinstance(payload, dict) else {}
+
+    name = loc_clean_str(incoming.get('name') if 'name' in incoming else source.get('name'))
+    if not name:
+        abort(400, description='`name` is required')
+
+    birth_date = _admin_moderation_parse_iso_date(
+        incoming.get('birthDate') if 'birthDate' in incoming else source.get('birthDate')
+    )
+    death_date = _admin_moderation_parse_iso_date(
+        incoming.get('deathDate') if 'deathDate' in incoming else source.get('deathDate')
+    )
+    birth_year = _admin_moderation_parse_year(
+        incoming.get('birthYear') if 'birthYear' in incoming else source.get('birthYear')
+    )
+    death_year = _admin_moderation_parse_year(
+        incoming.get('deathYear') if 'deathYear' in incoming else source.get('deathYear')
+    )
+    if birth_year is None and birth_date:
+        birth_year = int(birth_date[:4])
+    if death_year is None and death_date:
+        death_year = int(death_date[:4])
+
+    area = loc_clean_str(incoming.get('area') if 'area' in incoming else source.get('area'))
+    area_id = loc_clean_str(incoming.get('areaId') if 'areaId' in incoming else source.get('areaId'))
+    cemetery = loc_clean_str(incoming.get('cemetery') if 'cemetery' in incoming else source.get('cemetery'))
+
+    incoming_burial = incoming.get('burial') if isinstance(incoming.get('burial'), dict) else None
+    source_burial = source.get('burial') if isinstance(source.get('burial'), dict) else None
+    burial_source = incoming_burial if incoming_burial is not None else source_burial
+
+    burial_site_coords = loc_clean_str(
+        incoming.get('burialSiteCoords') if 'burialSiteCoords' in incoming else source.get('burialSiteCoords')
+    )
+    burial_photo_urls = loc_clean_str_list(
+        incoming.get('burialSitePhotoUrls')
+        if 'burialSitePhotoUrls' in incoming
+        else source.get('burialSitePhotoUrls') or (source_burial.get('photos') if isinstance(source_burial, dict) else [])
+    )
+    if not burial_photo_urls:
+        one_photo = loc_clean_str(
+            incoming.get('burialSitePhotoUrl')
+            if 'burialSitePhotoUrl' in incoming
+            else source.get('burialSitePhotoUrl')
+        )
+        if one_photo:
+            burial_photo_urls = [one_photo]
+
+    burial = normalize_person_burial({
+        'burial': burial_source,
+        'area': area,
+        'areaId': area_id,
+        'cemetery': cemetery,
+        'location': source.get('location'),
+        'burialSiteCoords': burial_site_coords,
+        'burialSitePhotoUrls': burial_photo_urls,
+    })
+    legacy = person_burial_to_legacy_fields(burial)
+
+    internet_links = loc_clean_str(
+        incoming.get('internetLinks')
+        if 'internetLinks' in incoming
+        else incoming.get('link')
+        if 'link' in incoming
+        else source.get('internetLinks')
+        if 'internetLinks' in source
+        else source.get('link')
+    )
+    achievements = loc_clean_str(
+        incoming.get('achievements')
+        if 'achievements' in incoming
+        else incoming.get('bio')
+        if 'bio' in incoming
+        else source.get('achievements')
+        if 'achievements' in source
+        else source.get('bio')
+    )
+    occupation = loc_clean_str(incoming.get('occupation') if 'occupation' in incoming else source.get('occupation'))
+    notable_flag = incoming.get('notable') if 'notable' in incoming else source.get('notable')
+    notable = bool(notable_flag) or bool(internet_links) or bool(achievements) or bool(occupation)
+    phone = loc_clean_str(incoming.get('phone') if 'phone' in incoming else source.get('phone'))
+
+    set_fields = {
+        'name': name,
+        'notable': notable,
+        'bio': achievements,
+        'link': internet_links,
+        'internetLinks': internet_links,
+        'achievements': achievements,
+        'occupation': occupation,
+        'phone': phone,
+        'burialSiteCoords': burial_site_coords,
+        'burialSitePhotoUrls': burial_photo_urls,
+        'burialSitePhotoUrl': burial_photo_urls[0] if burial_photo_urls else '',
+        'burialSitePhotoCount': len(burial_photo_urls),
+        'updatedAt': datetime.utcnow(),
+    }
+
+    if _location_write_is_canonical() or _location_write_is_dual():
+        set_fields['burial'] = burial
+    if _location_write_is_legacy() or _location_write_is_dual():
+        set_fields['areaId'] = legacy.get('areaId', '')
+        set_fields['area'] = legacy.get('area', '')
+        set_fields['cemetery'] = legacy.get('cemetery', '')
+        set_fields['location'] = legacy.get('location', [])
+
+    unset_fields = {}
+    if birth_year is not None:
+        set_fields['birthYear'] = birth_year
+    else:
+        unset_fields['birthYear'] = ''
+    if death_year is not None:
+        set_fields['deathYear'] = death_year
+    else:
+        unset_fields['deathYear'] = ''
+    if birth_date:
+        set_fields['birthDate'] = birth_date
+    else:
+        unset_fields['birthDate'] = ''
+    if death_date:
+        set_fields['deathDate'] = death_date
+    else:
+        unset_fields['deathDate'] = ''
+
+    return set_fields, unset_fields
+
+
+def _admin_plaques_pick_qr_for_activation(moderation_doc):
+    doc = moderation_doc if isinstance(moderation_doc, dict) else {}
+    qr_doc = None
+    raw_qr_doc_id = loc_clean_str(doc.get('qrDocId'))
+    if raw_qr_doc_id:
+        try:
+            qr_doc = admin_qr_codes_collection.find_one({'_id': ObjectId(raw_qr_doc_id)})
+        except Exception:
+            qr_doc = None
+
+    if not qr_doc:
+        qr_token = loc_clean_str(doc.get('qrCode'))
+        if qr_token:
+            qr_doc = admin_qr_codes_collection.find_one({'qrToken': qr_token})
+
+    if not qr_doc:
+        wired_qr_code_id = loc_clean_str(doc.get('wiredQrCodeId')) or loc_clean_str(doc.get('qrNumber'))
+        if wired_qr_code_id:
+            qr_doc = admin_qr_codes_collection.find_one(
+                {'pathKey': 'plaques', 'wiredQrCodeId': wired_qr_code_id},
+                sort=[('createdAt', ASCENDING), ('_id', ASCENDING)],
+            )
+
+    if not qr_doc:
+        abort(409, description='No QR code available for activation')
+
+    qr_doc = _qr_ensure_doc_runtime_fields(qr_doc, persist=True)
+    if loc_clean_str(qr_doc.get('pathKey')) != 'plaques':
+        abort(409, description='QR path does not match plaques flow')
+    if bool(qr_doc.get('isConnected') and loc_clean_str(qr_doc.get('wiredPersonId'))):
+        abort(409, description='QR code is already activated')
+
+    return qr_doc
+
+
+@application.route('/api/admin/pages/moderation/plaques', methods=['GET'])
+def admin_list_plaques_moderation():
+    search = loc_clean_str(request.args.get('search'))
+    query = {}
+    if search:
+        pattern = {'$regex': re.escape(search), '$options': 'i'}
+        query = {
+            '$or': [
+                {'name': pattern},
+                {'cemetery': pattern},
+                {'area': pattern},
+                {'phone': pattern},
+                {'link': pattern},
+                {'bio': pattern},
+                {'internetLinks': pattern},
+                {'achievements': pattern},
+                {'companyName': pattern},
+                {'websiteUrl': pattern},
+            ]
+        }
+
+    docs = list(plaques_moderation_collection.find(query).sort([('createdAt', -1), ('_id', -1)]))
+    items = [_admin_plaques_projection(doc) for doc in docs]
+    return jsonify({
+        'total': len(items),
+        'items': items,
+    })
+
+
+@application.route('/api/admin/pages/moderation/plaques/<string:moderation_id>', methods=['GET'])
+def admin_get_plaques_moderation(moderation_id):
+    try:
+        oid = ObjectId(moderation_id)
+    except Exception:
+        abort(400, description='Invalid moderation id')
+
+    doc = plaques_moderation_collection.find_one({'_id': oid})
+    if not doc:
+        abort(404, description='Moderation record not found')
+    return jsonify(_admin_plaques_projection(doc))
+
+
+@application.route('/api/admin/pages/moderation/plaques/<string:moderation_id>', methods=['PATCH'])
+def admin_update_plaques_moderation(moderation_id):
+    try:
+        oid = ObjectId(moderation_id)
+    except Exception:
+        abort(400, description='Invalid moderation id')
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Request must be a JSON object')
+
+    current_doc = plaques_moderation_collection.find_one({'_id': oid})
+    if not current_doc:
+        abort(404, description='Moderation record not found')
+
+    set_fields, unset_fields = _admin_plaques_build_updated_document(current_doc, data)
+    update_query = {'$set': set_fields}
+    if unset_fields:
+        update_query['$unset'] = unset_fields
+    plaques_moderation_collection.update_one({'_id': oid}, update_query)
+
+    updated = plaques_moderation_collection.find_one({'_id': oid}) or {}
+    return jsonify(_admin_plaques_projection(updated))
+
+
+@application.route('/api/admin/pages/moderation/plaques/<string:moderation_id>/reject', methods=['POST'])
+def admin_reject_plaques_moderation(moderation_id):
+    try:
+        oid = ObjectId(moderation_id)
+    except Exception:
+        abort(400, description='Invalid moderation id')
+
+    deleted = plaques_moderation_collection.delete_one({'_id': oid})
+    if deleted.deleted_count == 0:
+        abort(404, description='Moderation record not found')
+    return jsonify({'success': True})
+
+
+@application.route('/api/admin/pages/moderation/plaques/<string:moderation_id>/activate', methods=['POST'])
+def admin_activate_plaques_moderation(moderation_id):
+    try:
+        oid = ObjectId(moderation_id)
+    except Exception:
+        abort(400, description='Invalid moderation id')
+
+    moderation_doc = plaques_moderation_collection.find_one({'_id': oid})
+    if not moderation_doc:
+        abort(404, description='Moderation record not found')
+
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        abort(400, description='Request must be a JSON object')
+
+    person_doc = _admin_build_person_from_moderation(moderation_doc, payload)
+    qr_doc = _admin_plaques_pick_qr_for_activation(moderation_doc)
+    qr_doc_id = qr_doc.get('_id')
+    wired_qr_code_id = _qr_str(qr_doc.get('wiredQrCodeId')) or _qr_str(qr_doc.get('qrNumber'))
+    if not wired_qr_code_id:
+        abort(409, description='QR code cannot be activated')
+
+    admin_page_payload = person_doc.get('adminPage') if isinstance(person_doc.get('adminPage'), dict) else {}
+    admin_page_payload['qrCode'] = wired_qr_code_id
+    admin_page_payload['updatedAt'] = datetime.utcnow()
+    person_doc['adminPage'] = admin_page_payload
+
+    created = people_collection.insert_one(person_doc)
+    person_id = str(created.inserted_id)
+    now = datetime.utcnow()
+
+    if qr_doc_id:
+        admin_qr_codes_collection.update_one(
+            {'_id': qr_doc_id},
+            {
+                '$set': {
+                    'status': 'connected',
+                    'isConnected': True,
+                    'wiredPersonId': person_id,
+                    'wiredQrCodeId': wired_qr_code_id,
+                    'wiredAt': now,
+                    'updatedAt': now,
+                }
+            }
+        )
+
+    plaques_moderation_collection.delete_one({'_id': oid})
+    return jsonify({
+        'success': True,
+        'personId': person_id,
+        'wiredQrCodeId': wired_qr_code_id,
+        'qrCode': _qr_str(moderation_doc.get('qrCode')),
+        'qrDocId': str(qr_doc_id) if qr_doc_id else '',
+    })
+
+
 @application.route('/api/admin/cemeteries/exists', methods=['GET'])
 def admin_cemetery_exists():
     name = loc_clean_str(request.args.get('name'))
@@ -1395,6 +1814,28 @@ def _resolve_premium_partner_by_id(raw_ritual_service_id):
     return partner_payload, partner_link
 
 
+def _resolve_premium_partner_by_firma_id(raw_firma_id):
+    firma_id = _clean_nonempty_string(raw_firma_id)
+    if not firma_id:
+        return None, ""
+
+    try:
+        oid = ObjectId(firma_id)
+    except Exception:
+        return None, ""
+
+    firma = premium_qr_firmas_collection.find_one(
+        {"_id": oid},
+        {"name": 1, "address": 1, "logo": 1, "website": 1}
+    )
+    if not firma:
+        return None, ""
+
+    partner_payload = _build_premium_partner_payload(firma)
+    partner_link = _clean_nonempty_string(firma.get("website"))
+    return partner_payload, partner_link
+
+
 def _attach_premium_partner_to_response(response, person_doc):
     if 'premium' not in person_doc:
         return
@@ -1410,7 +1851,12 @@ def _attach_premium_partner_to_response(response, person_doc):
     partner_service_id = _clean_nonempty_string(person_doc.get('premiumPartnerRitualServiceId'))
     if partner_service_id:
         response['premiumPartnerRitualServiceId'] = partner_service_id
-        partner_payload, partner_link = _resolve_premium_partner_by_id(partner_service_id)
+        if partner_service_id.startswith('firma:'):
+            partner_payload, partner_link = _resolve_premium_partner_by_firma_id(
+                partner_service_id.split(':', 1)[1]
+            )
+        else:
+            partner_payload, partner_link = _resolve_premium_partner_by_id(partner_service_id)
 
     if partner_link:
         response['premiumPartnerLink'] = partner_link
@@ -4177,6 +4623,177 @@ def _normalize_ritual_service_category(doc):
     }
 
 
+ADMIN_PREMIUM_QR_FIRMA_ALLOWED_FIELDS = {
+    'name',
+    'logo',
+    'address',
+    'website',
+    'contacts',
+    'notes',
+    'status',
+}
+
+
+def _normalize_premium_qr_firma_status(value):
+    normalized = _clean_str(value).lower()
+    return 'inactive' if normalized in {'inactive', 'disabled', 'archived'} else 'active'
+
+
+def _clean_premium_qr_firma_contacts(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description='`contacts` must be an array')
+
+    contacts = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_str(item.get('name'))
+        phone = _clean_str(item.get('phone'))
+        if not name and not phone:
+            continue
+        contacts.append({
+            'name': name,
+            'phone': phone,
+        })
+    return contacts
+
+
+def _build_admin_premium_qr_firma_payload(data, partial=False):
+    if not isinstance(data, dict):
+        abort(400, description='Body must be a JSON object')
+
+    unknown = set(data.keys()) - ADMIN_PREMIUM_QR_FIRMA_ALLOWED_FIELDS
+    if unknown:
+        unknown_list = ', '.join(sorted(unknown))
+        abort(400, description=f'Unsupported fields: {unknown_list}')
+
+    payload = {}
+    if not partial:
+        name = _clean_str(data.get('name'))
+        if not name:
+            abort(400, description='`name` is required')
+
+    if 'name' in data:
+        name = _clean_str(data.get('name'))
+        if not name:
+            abort(400, description='`name` is required')
+        payload['name'] = name
+
+    if 'logo' in data:
+        payload['logo'] = _clean_str(data.get('logo'))
+    if 'address' in data:
+        payload['address'] = _clean_str(data.get('address'))
+    if 'website' in data:
+        payload['website'] = _clean_str(data.get('website'))
+    if 'notes' in data:
+        payload['notes'] = _clean_str(data.get('notes'))
+    if 'contacts' in data:
+        payload['contacts'] = _clean_premium_qr_firma_contacts(data.get('contacts'))
+    if 'status' in data:
+        payload['status'] = _normalize_premium_qr_firma_status(data.get('status'))
+
+    if not partial:
+        payload.setdefault('logo', '')
+        payload.setdefault('address', '')
+        payload.setdefault('website', '')
+        payload.setdefault('notes', '')
+        payload.setdefault('contacts', [])
+        payload.setdefault('status', 'active')
+
+    return payload
+
+
+def _normalize_admin_premium_qr_firma(doc):
+    contacts_raw = doc.get('contacts')
+    contacts = _clean_premium_qr_firma_contacts(contacts_raw if isinstance(contacts_raw, list) else [])
+    return {
+        'id': str(doc.get('_id')),
+        'name': _clean_str(doc.get('name')),
+        'logo': _clean_str(doc.get('logo')),
+        'address': _clean_str(doc.get('address')),
+        'website': _clean_str(doc.get('website')),
+        'notes': _clean_str(doc.get('notes')),
+        'status': _normalize_premium_qr_firma_status(doc.get('status')),
+        'contacts': contacts,
+        'createdAt': doc.get('createdAt').isoformat() if isinstance(doc.get('createdAt'), datetime) else None,
+        'updatedAt': doc.get('updatedAt').isoformat() if isinstance(doc.get('updatedAt'), datetime) else None,
+    }
+
+
+@application.route('/api/admin/premium-qr-firmas', methods=['GET'])
+def admin_list_premium_qr_firmas():
+    search = _clean_str(request.args.get('search', ''))
+    query_filter = {}
+    if search:
+        regex = {'$regex': re.escape(search), '$options': 'i'}
+        query_filter = {
+            '$or': [
+                {'name': regex},
+                {'address': regex},
+                {'website': regex},
+                {'contacts.name': regex},
+                {'contacts.phone': regex},
+            ]
+        }
+
+    cursor = premium_qr_firmas_collection.find(query_filter).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
+    items = [_normalize_admin_premium_qr_firma(item) for item in cursor]
+    return jsonify({
+        'total': len(items),
+        'items': items,
+    })
+
+
+@application.route('/api/admin/premium-qr-firmas', methods=['POST'])
+def admin_create_premium_qr_firma():
+    data = request.get_json(silent=True) or {}
+    payload = _build_admin_premium_qr_firma_payload(data, partial=False)
+    now = datetime.utcnow()
+    payload['createdAt'] = now
+    payload['updatedAt'] = now
+
+    inserted = premium_qr_firmas_collection.insert_one(payload)
+    created = premium_qr_firmas_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify(_normalize_admin_premium_qr_firma(created)), 201
+
+
+@application.route('/api/admin/premium-qr-firmas/<string:firma_id>', methods=['PATCH'])
+def admin_update_premium_qr_firma(firma_id):
+    try:
+        oid = ObjectId(firma_id)
+    except Exception:
+        abort(400, description='Invalid premium qr firma id')
+
+    existing = premium_qr_firmas_collection.find_one({'_id': oid})
+    if not existing:
+        abort(404, description='Premium QR firma not found')
+
+    data = request.get_json(silent=True) or {}
+    update_fields = _build_admin_premium_qr_firma_payload(data, partial=True)
+    if not update_fields:
+        abort(400, description='Nothing to update')
+
+    update_fields['updatedAt'] = datetime.utcnow()
+    premium_qr_firmas_collection.update_one({'_id': oid}, {'$set': update_fields})
+    updated = premium_qr_firmas_collection.find_one({'_id': oid})
+    return jsonify(_normalize_admin_premium_qr_firma(updated))
+
+
+@application.route('/api/admin/premium-qr-firmas/<string:firma_id>', methods=['DELETE'])
+def admin_delete_premium_qr_firma(firma_id):
+    try:
+        oid = ObjectId(firma_id)
+    except Exception:
+        abort(400, description='Invalid premium qr firma id')
+
+    result = premium_qr_firmas_collection.delete_one({'_id': oid})
+    if result.deleted_count == 0:
+        abort(404, description='Premium QR firma not found')
+    return jsonify({'ok': True})
+
+
 @application.route('/api/admin/ritual-services/categories', methods=['GET'])
 def admin_list_ritual_service_categories():
     _ensure_default_ritual_service_categories()
@@ -4964,11 +5581,9 @@ def verify_code():
     })
 
 
-@application.route('/api/people/add_moderation', methods=['POST'])
-def people_add_moderation():
-    data = request.get_json(silent=True)
+def _build_person_moderation_base_document(data):
     if not isinstance(data, dict):
-        return jsonify({'error': 'invalid_payload', 'message': 'JSON object expected'}), 400
+        abort(400, description='JSON object expected')
 
     def _parse_iso_date(value, field_name):
         if not isinstance(value, str):
@@ -4979,7 +5594,7 @@ def people_add_moderation():
         try:
             dt = datetime.strptime(raw, '%Y-%m-%d')
         except ValueError:
-            raise ValueError(f'{field_name} must be a valid date in YYYY-MM-DD format')
+            abort(400, description=f'{field_name} must be a valid date in YYYY-MM-DD format')
         return dt.strftime('%Y-%m-%d')
 
     def _normalize_year(value):
@@ -4996,11 +5611,8 @@ def people_add_moderation():
             return int(raw) if raw.isdigit() else None
         return None
 
-    try:
-        birth_date = _parse_iso_date(data.get('birthDate'), 'birthDate')
-        death_date = _parse_iso_date(data.get('deathDate'), 'deathDate')
-    except ValueError as exc:
-        return jsonify({'error': 'validation_error', 'message': str(exc)}), 400
+    birth_date = _parse_iso_date(data.get('birthDate'), 'birthDate')
+    death_date = _parse_iso_date(data.get('deathDate'), 'deathDate')
 
     birth_year = _normalize_year(data.get('birthYear'))
     death_year = _normalize_year(data.get('deathYear'))
@@ -5044,7 +5656,7 @@ def people_add_moderation():
     notable = bool(data.get('notable')) or bool(link) or bool(bio)
 
     document = {
-        'name': data.get('name'),
+        'name': loc_clean_str(data.get('name')),
         'areaId': area_id or legacy.get('areaId', ''),
         'area': area or legacy.get('area', ''),
         'cemetery': cemetery or legacy.get('cemetery', ''),
@@ -5069,8 +5681,188 @@ def people_add_moderation():
     if death_date:
         document['deathDate'] = death_date
 
+    return document
+
+
+def _qr_activation_find_doc_or_404(code, expected_path_key=''):
+    token = _qr_str(code)
+    if not token:
+        abort(404, description='QR code not found')
+
+    doc = admin_qr_codes_collection.find_one({'qrToken': token})
+    if not doc:
+        abort(404, description='QR code not found')
+
+    doc = _qr_ensure_doc_runtime_fields(doc, persist=True)
+    path_key = _qr_str(doc.get('pathKey'))
+    if expected_path_key and path_key != expected_path_key:
+        abort(409, description='QR code path does not match activation page')
+
+    wired_person_id = _qr_str(doc.get('wiredPersonId'))
+    if bool(doc.get('isConnected') and wired_person_id):
+        abort(409, description='QR code is already activated')
+
+    return doc
+
+
+@application.route('/api/people/add_moderation', methods=['POST'])
+def people_add_moderation():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'invalid_payload', 'message': 'JSON object expected'}), 400
+    document = _build_person_moderation_base_document(data)
+
     people_moderation_collection.insert_one(document)
 
+    return jsonify({'success': True})
+
+
+@application.route('/api/qr/activation/<string:code>', methods=['GET'])
+def public_qr_activation_meta(code):
+    token = _qr_str(code)
+    if not token:
+        return jsonify({
+            'found': False,
+            'pathKey': '',
+            'isWired': False,
+            'wiredPersonId': '',
+            'wiredQrCodeId': '',
+            'qrDocId': '',
+            'qrNumber': '',
+            'scanUrl': '',
+        })
+
+    doc = admin_qr_codes_collection.find_one({'qrToken': token})
+    if not doc:
+        return jsonify({
+            'found': False,
+            'pathKey': '',
+            'isWired': False,
+            'wiredPersonId': '',
+            'wiredQrCodeId': '',
+            'qrDocId': '',
+            'qrNumber': '',
+            'scanUrl': '',
+        })
+
+    doc = _qr_ensure_doc_runtime_fields(doc, persist=True)
+    wired_person_id = _qr_str(doc.get('wiredPersonId'))
+    is_wired = bool(doc.get('isConnected') and wired_person_id)
+    return jsonify({
+        'found': True,
+        'pathKey': _qr_str(doc.get('pathKey')),
+        'isWired': is_wired,
+        'wiredPersonId': wired_person_id,
+        'wiredQrCodeId': _qr_str(doc.get('wiredQrCodeId')),
+        'qrDocId': str(doc.get('_id')) if doc.get('_id') else '',
+        'qrNumber': _qr_str(doc.get('qrNumber')),
+        'scanUrl': _qr_str(doc.get('scanUrl')),
+    })
+
+
+@application.route('/api/qr/activation/premium_qr_firma', methods=['POST'])
+def public_qr_activation_premium_qr_firma():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='JSON object expected')
+
+    qr_code = _qr_str(data.get('qrCode'))
+    qr_doc = _qr_activation_find_doc_or_404(qr_code, 'premium_qr_firma')
+
+    base_document = _build_person_moderation_base_document(data)
+    company_name = loc_clean_str(data.get('companyName'))
+    website_url = loc_clean_str(data.get('websiteUrl'))
+    phone = loc_clean_str(data.get('phone'))
+
+    if not company_name:
+        abort(400, description='`companyName` is required')
+    if not website_url:
+        abort(400, description='`websiteUrl` is required')
+    if not phone:
+        abort(400, description='`phone` is required')
+
+    now = datetime.utcnow()
+    generated_password = _generate_premium_order_password()
+    birth_year = base_document.get('birthYear')
+    death_year = base_document.get('deathYear')
+    life_range = ''
+    if birth_year and death_year:
+        life_range = f'{birth_year}-{death_year}'
+    elif birth_year:
+        life_range = f'{birth_year}-'
+    elif death_year:
+        life_range = f'-{death_year}'
+
+    order_doc = {
+        'personId': '',
+        'personIds': [],
+        'personName': _qr_str(base_document.get('name')),
+        'personNames': [_qr_str(base_document.get('name'))] if _qr_str(base_document.get('name')) else [],
+        'lifeRange': life_range,
+        'cemetery': _qr_str(base_document.get('cemetery')),
+        'cemeteryAddress': _qr_str(base_document.get('area')),
+        'avatarUrl': '',
+        'pathType': QR_PATH_LABELS.get('premium_qr_firma', 'Преміум QR | Фірма'),
+        'status': 'on_moderation',
+        'customerName': company_name,
+        'customerPhone': phone,
+        'customerEmail': '',
+        'companyName': company_name,
+        'websiteUrl': website_url,
+        'paymentMethod': 'moderation',
+        'paymentStatus': 'pending',
+        'invoiceId': '',
+        'certificates': [],
+        'ttn': '',
+        'generatedPassword': generated_password,
+        'adminNotes': '',
+        'sourceType': 'qr_activation_premium_qr_firma',
+        'activationType': 'premium_qr_firma',
+        'qrCode': qr_code,
+        'qrPathKey': 'premium_qr_firma',
+        'qrDocId': str(qr_doc.get('_id')) if qr_doc.get('_id') else '',
+        'qrNumber': _qr_str(qr_doc.get('qrNumber')),
+        'wiredQrCodeId': _qr_str(qr_doc.get('wiredQrCodeId')),
+        'moderationPayload': base_document,
+        'createdAt': now,
+        'updatedAt': now,
+    }
+
+    premium_orders_collection.insert_one(order_doc)
+    return jsonify({'success': True})
+
+
+@application.route('/api/qr/activation/plaques', methods=['POST'])
+def public_qr_activation_plaques():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='JSON object expected')
+
+    qr_code = _qr_str(data.get('qrCode'))
+    qr_doc = _qr_activation_find_doc_or_404(qr_code, 'plaques')
+
+    base_document = _build_person_moderation_base_document(data)
+    phone = loc_clean_str(data.get('phone'))
+    if not phone:
+        abort(400, description='`phone` is required')
+
+    now = datetime.utcnow()
+    document = {
+        **base_document,
+        'status': 'on_moderation',
+        'sourceType': 'qr_activation_plaques',
+        'activationType': 'plaques',
+        'phone': phone,
+        'qrCode': qr_code,
+        'qrPathKey': 'plaques',
+        'qrDocId': str(qr_doc.get('_id')) if qr_doc.get('_id') else '',
+        'qrNumber': _qr_str(qr_doc.get('qrNumber')),
+        'wiredQrCodeId': _qr_str(qr_doc.get('wiredQrCodeId')),
+        'updatedAt': now,
+        'createdAt': now,
+    }
+
+    plaques_moderation_collection.insert_one(document)
     return jsonify({'success': True})
 
 
@@ -5558,6 +6350,20 @@ def admin_qr_create():
 
     path_key = _qr_parse_path_key(data.get('pathKey'))
     quantity = _qr_parse_positive_int(data.get('quantity'), field_name='quantity')
+
+    # Business rule: do not allow creating a new batch for the same path
+    # while there are still "new" (not printed) QR codes for that path.
+    has_unprinted_for_path = admin_qr_codes_collection.count_documents({
+        'pathKey': path_key,
+        'isPrinted': {'$ne': True},
+    }, limit=1) > 0
+    if has_unprinted_for_path:
+        return jsonify({
+            'error': 'path_has_unprinted_qr',
+            'message': 'Для цього шляху вже є нові QR-коди. Спочатку позначте їх як "Надруковані".',
+            'pathKey': path_key,
+        }), 409
+
     now = datetime.utcnow()
     seed_start = _qr_seed_next()
     range_end = seed_start + quantity - 1
@@ -5972,6 +6778,138 @@ def _premium_order_status_label(status):
     return mapping.get(cleaned, mapping['on_moderation'])
 
 
+def _premium_normalize_match_text(value):
+    cleaned = _premium_order_str(value).lower()
+    if not cleaned:
+        return ''
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def _premium_extract_years_from_life_range(value):
+    cleaned = _premium_order_str(value)
+    if not cleaned:
+        return None, None
+    years = re.findall(r'(\d{4})', cleaned)
+    if len(years) >= 2:
+        try:
+            return int(years[0]), int(years[1])
+        except Exception:
+            return None, None
+    return None, None
+
+
+def _premium_build_life_range_from_years(birth_year, death_year):
+    if birth_year is not None and death_year is not None:
+        return f'{birth_year}-{death_year}'
+    if birth_year is not None:
+        return f'{birth_year}-'
+    if death_year is not None:
+        return f'-{death_year}'
+    return ''
+
+
+def _premium_order_extract_match_target(doc):
+    moderation_payload = doc.get('moderationPayload') if isinstance(doc.get('moderationPayload'), dict) else {}
+    name = _premium_order_str(moderation_payload.get('name') or doc.get('personName'))
+    area = _premium_order_str(moderation_payload.get('area') or doc.get('cemeteryAddress'))
+    cemetery = _premium_order_str(moderation_payload.get('cemetery') or doc.get('cemetery'))
+    birth_year = _admin_moderation_parse_year(moderation_payload.get('birthYear'))
+    death_year = _admin_moderation_parse_year(moderation_payload.get('deathYear'))
+    if birth_year is None or death_year is None:
+        parsed_birth_year, parsed_death_year = _premium_extract_years_from_life_range(
+            moderation_payload.get('lifeRange') or doc.get('lifeRange')
+        )
+        if birth_year is None:
+            birth_year = parsed_birth_year
+        if death_year is None:
+            death_year = parsed_death_year
+    return {
+        'name': name,
+        'area': area,
+        'cemetery': cemetery,
+        'birthYear': birth_year,
+        'deathYear': death_year,
+    }
+
+
+def _premium_existing_person_candidate_projection(person_doc):
+    item = _person_with_location_projection(person_doc)
+    burial = normalize_person_burial(item)
+    area = _premium_order_str(item.get('area') or (burial.get('location') or {}).get('display'))
+    cemetery = _premium_order_str(item.get('cemetery') or (burial.get('cemeteryRef') or {}).get('name'))
+    birth_year = _admin_moderation_parse_year(item.get('birthYear'))
+    death_year = _admin_moderation_parse_year(item.get('deathYear'))
+    life_range = ''
+    if birth_year is not None and death_year is not None:
+        life_range = f'{birth_year}-{death_year}'
+    elif birth_year is not None:
+        life_range = f'{birth_year}-'
+    elif death_year is not None:
+        life_range = f'-{death_year}'
+
+    return {
+        'id': str(item.get('_id')),
+        'name': _premium_order_str(item.get('name')),
+        'birthYear': birth_year,
+        'deathYear': death_year,
+        'lifeRange': life_range,
+        'area': area,
+        'cemetery': cemetery,
+        'avatarUrl': _premium_order_str(item.get('avatarUrl') or item.get('portraitUrl')),
+    }
+
+
+def _premium_find_existing_person_candidate(order_doc):
+    target = _premium_order_extract_match_target(order_doc)
+    if (
+        not target.get('name')
+        or target.get('birthYear') is None
+        or target.get('deathYear') is None
+        or not target.get('area')
+        or not target.get('cemetery')
+    ):
+        return None
+
+    target_name = _premium_normalize_match_text(target.get('name'))
+    target_area = _premium_normalize_match_text(target.get('area'))
+    target_cemetery = _premium_normalize_match_text(target.get('cemetery'))
+    if not target_name or not target_area or not target_cemetery:
+        return None
+
+    cursor = people_collection.find(
+        {
+            'birthYear': target.get('birthYear'),
+            'deathYear': target.get('deathYear'),
+        },
+        {
+            'name': 1,
+            'birthYear': 1,
+            'deathYear': 1,
+            'area': 1,
+            'cemetery': 1,
+            'burial': 1,
+            'avatarUrl': 1,
+            'portraitUrl': 1,
+            'createdAt': 1,
+        },
+    ).sort([('createdAt', -1), ('_id', -1)]).limit(60)
+
+    for person_doc in cursor:
+        item = _person_with_location_projection(person_doc)
+        burial = normalize_person_burial(item)
+        person_name = _premium_normalize_match_text(item.get('name'))
+        person_area = _premium_normalize_match_text(
+            item.get('area') or (burial.get('location') or {}).get('display')
+        )
+        person_cemetery = _premium_normalize_match_text(
+            item.get('cemetery') or (burial.get('cemeteryRef') or {}).get('name')
+        )
+        if person_name == target_name and person_area == target_area and person_cemetery == target_cemetery:
+            return _premium_existing_person_candidate_projection(person_doc)
+
+    return None
+
+
 def _generate_premium_order_password(length=8):
     alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%'
     if length < 8:
@@ -5979,7 +6917,7 @@ def _generate_premium_order_password(length=8):
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
-def _premium_order_projection(doc):
+def _premium_order_projection(doc, include_existing_person_candidate=False):
     if not isinstance(doc, dict):
         return {}
 
@@ -6008,6 +6946,29 @@ def _premium_order_projection(doc):
         doc.get('cemetery'),
         doc.get('cemeteryAddress'),
     )
+    activation_type = _premium_order_str(doc.get('activationType'))
+    company_name = _premium_order_str(doc.get('companyName'))
+    website_url = _premium_order_str(doc.get('websiteUrl'))
+    premium_qr_firma_id = _premium_order_str(doc.get('premiumQrFirmaId'))
+    merge_person_id = _premium_order_str(doc.get('mergePersonId'))
+    moderation_payload = doc.get('moderationPayload') if isinstance(doc.get('moderationPayload'), dict) else None
+    moderation_birth_date = _premium_order_str((moderation_payload or {}).get('birthDate'))
+    moderation_death_date = _premium_order_str((moderation_payload or {}).get('deathDate'))
+    moderation_birth_year = _admin_moderation_parse_year((moderation_payload or {}).get('birthYear'))
+    moderation_death_year = _admin_moderation_parse_year((moderation_payload or {}).get('deathYear'))
+    moderation_area = _premium_order_str((moderation_payload or {}).get('area')) or _premium_order_str(doc.get('cemeteryAddress'))
+    moderation_area_id = _premium_order_str((moderation_payload or {}).get('areaId'))
+    moderation_cemetery = _premium_order_str((moderation_payload or {}).get('cemetery')) or cemetery_name
+    is_firma_activation = (
+        activation_type == 'premium_qr_firma'
+        or _premium_order_str(doc.get('qrPathKey')) == 'premium_qr_firma'
+        or _premium_order_str(doc.get('pathType')).lower() == 'преміум qr | фірма'
+    )
+    existing_person_candidate = (
+        _premium_find_existing_person_candidate(doc)
+        if is_firma_activation and include_existing_person_candidate
+        else None
+    )
 
     return {
         'id': str(doc.get('_id')),
@@ -6016,10 +6977,18 @@ def _premium_order_projection(doc):
         'personName': _premium_order_str(doc.get('personName')),
         'personNames': person_names,
         'lifeRange': _premium_order_str(doc.get('lifeRange')),
+        'birthDate': moderation_birth_date,
+        'deathDate': moderation_death_date,
+        'birthYear': moderation_birth_year,
+        'deathYear': moderation_death_year,
+        'area': moderation_area,
+        'areaId': moderation_area_id,
         'cemetery': cemetery_name,
+        'cemeteryModeration': moderation_cemetery,
         'address': cemetery_address,
         'avatarUrl': _premium_order_str(doc.get('avatarUrl') or doc.get('portraitUrl')),
         'pathType': _premium_order_str(doc.get('pathType')) or 'Сайт',
+        'activationType': activation_type,
         'status': status,
         'statusLabel': _premium_order_status_label(status),
         'paymentMethod': _premium_order_str(doc.get('paymentMethod')),
@@ -6028,6 +6997,12 @@ def _premium_order_projection(doc):
         'customerName': _premium_order_str(doc.get('customerName')),
         'customerPhone': _premium_order_str(doc.get('customerPhone')),
         'customerEmail': _premium_order_str(doc.get('customerEmail')),
+        'companyName': company_name,
+        'websiteUrl': website_url,
+        'premiumQrFirmaId': premium_qr_firma_id,
+        'mergePersonId': merge_person_id,
+        'mergeState': 'selected' if merge_person_id else 'none',
+        'existingPersonCandidate': existing_person_candidate,
         'deliveryCityRef': _premium_order_str(doc.get('deliveryCityRef')),
         'deliveryCityName': _premium_order_str(doc.get('deliveryCityName')),
         'deliveryBranchRef': _premium_order_str(doc.get('deliveryBranchRef')),
@@ -6048,6 +7023,7 @@ def _premium_order_projection(doc):
         'npRefusedAt': doc.get('npRefusedAt'),
         'certificates': normalized_certificates,
         'documentImageUrl': normalized_certificates[0] if normalized_certificates else '',
+        'moderationPayload': moderation_payload,
         'createdAt': doc.get('createdAt'),
         'updatedAt': doc.get('updatedAt'),
         'activatedAt': doc.get('activatedAt'),
@@ -6223,7 +7199,7 @@ def admin_get_premium_order(order_id):
     if not doc:
         abort(404, description='Order not found')
 
-    payload = _premium_order_projection(doc)
+    payload = _premium_order_projection(doc, include_existing_person_candidate=True)
     if not _premium_order_str(payload.get('avatarUrl')):
         person_id = _premium_order_str(doc.get('personId'))
         if not person_id:
@@ -6263,6 +7239,13 @@ def admin_update_premium_order(order_id):
     old_ttn = _premium_order_str(current_doc.get('ttn'))
     update_fields = {}
     has_explicit_status = 'status' in data
+    current_moderation_payload = (
+        dict(current_doc.get('moderationPayload'))
+        if isinstance(current_doc.get('moderationPayload'), dict)
+        else {}
+    )
+    next_moderation_payload = dict(current_moderation_payload)
+    moderation_payload_touched = False
 
     if 'ttn' in data:
         next_ttn = _premium_order_str(data.get('ttn'))
@@ -6287,6 +7270,137 @@ def admin_update_premium_order(order_id):
         if not next_password:
             abort(400, description='`generatedPassword` cannot be empty')
         update_fields['generatedPassword'] = next_password
+
+    if 'personName' in data:
+        next_person_name = _premium_order_str(data.get('personName'))
+        update_fields['personName'] = next_person_name
+        update_fields['personNames'] = [next_person_name] if next_person_name else []
+        next_moderation_payload['name'] = next_person_name
+        moderation_payload_touched = True
+
+    if 'birthDate' in data:
+        raw_birth_date = _premium_order_str(data.get('birthDate'))
+        next_birth_date = _admin_moderation_parse_iso_date(raw_birth_date)
+        if raw_birth_date and not next_birth_date:
+            abort(400, description='Invalid birthDate, expected YYYY-MM-DD')
+        next_moderation_payload['birthDate'] = next_birth_date
+        if 'birthYear' not in data:
+            next_moderation_payload['birthYear'] = int(next_birth_date[:4]) if next_birth_date else None
+        moderation_payload_touched = True
+
+    if 'deathDate' in data:
+        raw_death_date = _premium_order_str(data.get('deathDate'))
+        next_death_date = _admin_moderation_parse_iso_date(raw_death_date)
+        if raw_death_date and not next_death_date:
+            abort(400, description='Invalid deathDate, expected YYYY-MM-DD')
+        next_moderation_payload['deathDate'] = next_death_date
+        if 'deathYear' not in data:
+            next_moderation_payload['deathYear'] = int(next_death_date[:4]) if next_death_date else None
+        moderation_payload_touched = True
+
+    if 'birthYear' in data:
+        parsed_birth_year = _admin_moderation_parse_year(data.get('birthYear'))
+        raw_birth_year = _premium_order_str(data.get('birthYear'))
+        if raw_birth_year and parsed_birth_year is None:
+            abort(400, description='Invalid birthYear')
+        next_moderation_payload['birthYear'] = parsed_birth_year
+        moderation_payload_touched = True
+
+    if 'deathYear' in data:
+        parsed_death_year = _admin_moderation_parse_year(data.get('deathYear'))
+        raw_death_year = _premium_order_str(data.get('deathYear'))
+        if raw_death_year and parsed_death_year is None:
+            abort(400, description='Invalid deathYear')
+        next_moderation_payload['deathYear'] = parsed_death_year
+        moderation_payload_touched = True
+
+    if 'area' in data:
+        next_area = _premium_order_str(data.get('area'))
+        next_moderation_payload['area'] = next_area
+        update_fields['cemeteryAddress'] = next_area
+        moderation_payload_touched = True
+
+    if 'areaId' in data:
+        next_area_id = _premium_order_str(data.get('areaId'))
+        next_moderation_payload['areaId'] = next_area_id
+        moderation_payload_touched = True
+
+    if 'cemetery' in data:
+        next_cemetery = _premium_order_str(data.get('cemetery'))
+        next_moderation_payload['cemetery'] = next_cemetery
+        update_fields['cemetery'] = next_cemetery
+        moderation_payload_touched = True
+
+    if 'customerPhone' in data:
+        next_customer_phone = _premium_order_str(data.get('customerPhone'))
+        update_fields['customerPhone'] = next_customer_phone
+        next_moderation_payload['phone'] = next_customer_phone
+        moderation_payload_touched = True
+
+    if 'companyName' in data:
+        update_fields['companyName'] = _premium_order_str(data.get('companyName'))
+
+    if 'websiteUrl' in data:
+        update_fields['websiteUrl'] = _premium_order_str(data.get('websiteUrl'))
+
+    if 'premiumQrFirmaId' in data:
+        premium_qr_firma_id = _premium_order_str(data.get('premiumQrFirmaId'))
+        if premium_qr_firma_id:
+            try:
+                premium_qr_firma_oid = ObjectId(premium_qr_firma_id)
+            except Exception:
+                abort(400, description='Invalid premiumQrFirmaId')
+            premium_qr_firma = premium_qr_firmas_collection.find_one({'_id': premium_qr_firma_oid})
+            if not premium_qr_firma:
+                abort(404, description='Premium QR firma not found')
+            update_fields['premiumQrFirmaId'] = premium_qr_firma_id
+            update_fields['companyName'] = _clean_str(premium_qr_firma.get('name'))
+            update_fields['websiteUrl'] = _clean_str(premium_qr_firma.get('website'))
+        else:
+            update_fields['premiumQrFirmaId'] = ''
+            update_fields['companyName'] = ''
+            update_fields['websiteUrl'] = ''
+    if 'mergePersonId' in data:
+        merge_person_id = _premium_order_str(data.get('mergePersonId'))
+        if merge_person_id:
+            try:
+                merge_person_oid = ObjectId(merge_person_id)
+            except Exception:
+                abort(400, description='Invalid mergePersonId')
+            merge_person_doc = people_collection.find_one({'_id': merge_person_oid}, {'_id': 1})
+            if not merge_person_doc:
+                abort(404, description='Merge person not found')
+            update_fields['mergePersonId'] = merge_person_id
+            update_fields['personId'] = merge_person_id
+            update_fields['personIds'] = [merge_person_id]
+        else:
+            update_fields['mergePersonId'] = ''
+
+    if moderation_payload_touched:
+        merged_birth_date = _admin_moderation_parse_iso_date(next_moderation_payload.get('birthDate'))
+        merged_death_date = _admin_moderation_parse_iso_date(next_moderation_payload.get('deathDate'))
+        merged_birth_year = _admin_moderation_parse_year(next_moderation_payload.get('birthYear'))
+        merged_death_year = _admin_moderation_parse_year(next_moderation_payload.get('deathYear'))
+
+        if merged_birth_year is None and merged_birth_date:
+            merged_birth_year = int(merged_birth_date[:4])
+        if merged_death_year is None and merged_death_date:
+            merged_death_year = int(merged_death_date[:4])
+
+        next_moderation_payload['birthDate'] = merged_birth_date
+        next_moderation_payload['deathDate'] = merged_death_date
+        next_moderation_payload['birthYear'] = merged_birth_year
+        next_moderation_payload['deathYear'] = merged_death_year
+        next_moderation_payload['lifeRange'] = _premium_build_life_range_from_years(
+            merged_birth_year,
+            merged_death_year,
+        )
+        update_fields['lifeRange'] = next_moderation_payload.get('lifeRange') or ''
+        if 'cemeteryAddress' not in update_fields:
+            update_fields['cemeteryAddress'] = _premium_order_str(next_moderation_payload.get('area'))
+        if 'cemetery' not in update_fields:
+            update_fields['cemetery'] = _premium_order_str(next_moderation_payload.get('cemetery'))
+        update_fields['moderationPayload'] = next_moderation_payload
     if 'adminNotes' in data:
         update_fields['adminNotes'] = _premium_order_str(data.get('adminNotes'))
     if 'status' in data:
@@ -6307,7 +7421,7 @@ def admin_update_premium_order(order_id):
     premium_orders_collection.update_one({'_id': oid}, {'$set': update_fields})
 
     doc = premium_orders_collection.find_one({'_id': oid})
-    return jsonify(_premium_order_projection(doc))
+    return jsonify(_premium_order_projection(doc, include_existing_person_candidate=True))
 
 
 @application.route('/api/admin/premium-orders/<string:order_id>/refresh-tracking', methods=['POST'])
@@ -6427,15 +7541,16 @@ def admin_refresh_premium_orders_tracking():
     })
 
 
-def _premium_pick_qr_code_for_activation():
+def _premium_pick_qr_code_for_activation(path_key='premium_qr'):
+    target_path_key = _premium_order_str(path_key) or 'premium_qr'
     preferred_doc = admin_qr_codes_collection.find_one(
-        {'pathKey': 'premium_qr', 'isConnected': {'$ne': True}, 'isPrinted': True},
+        {'pathKey': target_path_key, 'isConnected': {'$ne': True}, 'isPrinted': True},
         sort=[('qrNumber', ASCENDING), ('_id', ASCENDING)],
     )
     if preferred_doc:
         return preferred_doc
     return admin_qr_codes_collection.find_one(
-        {'pathKey': 'premium_qr', 'isConnected': {'$ne': True}},
+        {'pathKey': target_path_key, 'isConnected': {'$ne': True}},
         sort=[('qrNumber', ASCENDING), ('_id', ASCENDING)],
     )
 
@@ -6455,19 +7570,57 @@ def admin_activate_premium_order(order_id):
     if not raw_password:
         abort(400, description='Missing generatedPassword for activation')
 
-    person_ids = order_doc.get('personIds')
-    if not isinstance(person_ids, list) or not person_ids:
-        abort(400, description='Order has no personIds')
-
-    primary_person_id = _premium_order_str(order_doc.get('personId')) or _premium_order_str(person_ids[0])
-    if not primary_person_id:
-        abort(400, description='Order has no primary personId')
-
     hashed = hash_password(raw_password)
     now = datetime.utcnow()
+    activation_type = _premium_order_str(order_doc.get('activationType'))
+    qr_path_key = _premium_order_str(order_doc.get('qrPathKey')) or 'premium_qr'
+    is_premium_qr_firma = activation_type == 'premium_qr_firma' or qr_path_key == 'premium_qr_firma'
+
+    person_ids = order_doc.get('personIds') if isinstance(order_doc.get('personIds'), list) else []
+    primary_person_id = _premium_order_str(order_doc.get('personId')) or _premium_order_str(person_ids[0] if person_ids else '')
+
+    premium_partner_ref = ''
+    premium_qr_firma_id = _premium_order_str(order_doc.get('premiumQrFirmaId'))
+    if is_premium_qr_firma and premium_qr_firma_id:
+        try:
+            premium_qr_firma_oid = ObjectId(premium_qr_firma_id)
+        except Exception:
+            abort(400, description='Invalid premiumQrFirmaId')
+        premium_qr_firma = premium_qr_firmas_collection.find_one({'_id': premium_qr_firma_oid}, {'_id': 1})
+        if not premium_qr_firma:
+            abort(404, description='Premium QR firma not found')
+        premium_partner_ref = f'firma:{premium_qr_firma_id}'
+
+    if is_premium_qr_firma:
+        merge_person_id = _premium_order_str(order_doc.get('mergePersonId'))
+        if merge_person_id:
+            try:
+                merge_person_oid = ObjectId(merge_person_id)
+            except Exception:
+                abort(400, description='Invalid mergePersonId')
+            merge_person = people_collection.find_one({'_id': merge_person_oid}, {'_id': 1})
+            if not merge_person:
+                abort(404, description='Merge person not found')
+            primary_person_id = merge_person_id
+            person_ids = [merge_person_id]
+        else:
+            moderation_payload = order_doc.get('moderationPayload') if isinstance(order_doc.get('moderationPayload'), dict) else None
+            if not moderation_payload:
+                abort(400, description='Missing moderationPayload for premium_qr_firma activation')
+            person_doc = _admin_build_person_from_moderation(moderation_payload, {})
+            if premium_partner_ref:
+                person_doc['premiumPartnerRitualServiceId'] = premium_partner_ref
+            created_person = people_collection.insert_one(person_doc)
+            primary_person_id = str(created_person.inserted_id)
+            person_ids = [primary_person_id]
+    else:
+        if not person_ids:
+            abort(400, description='Order has no personIds')
+        if not primary_person_id:
+            abort(400, description='Order has no primary personId')
 
     qr_doc = None
-    wired_qr_doc_id = _premium_order_str(order_doc.get('wiredQrCodeDocId'))
+    wired_qr_doc_id = _premium_order_str(order_doc.get('qrDocId') or order_doc.get('wiredQrCodeDocId'))
     if wired_qr_doc_id:
         try:
             qr_doc = admin_qr_codes_collection.find_one({'_id': ObjectId(wired_qr_doc_id)})
@@ -6475,7 +7628,7 @@ def admin_activate_premium_order(order_id):
             qr_doc = None
 
     if not qr_doc:
-        qr_doc = _premium_pick_qr_code_for_activation()
+        qr_doc = _premium_pick_qr_code_for_activation(qr_path_key)
     if not qr_doc:
         abort(409, description='No available Premium QR code to wire')
 
@@ -6497,6 +7650,7 @@ def admin_activate_premium_order(order_id):
                 '$set': {
                     'premium.password': hashed,
                     'premium.updatedAt': now,
+                    **({'premiumPartnerRitualServiceId': premium_partner_ref} if premium_partner_ref else {}),
                 }
             }
         )
@@ -6505,6 +7659,8 @@ def admin_activate_premium_order(order_id):
         {'_id': oid},
         {
             '$set': {
+                'personId': primary_person_id,
+                'personIds': person_ids,
                 'activatedAt': now,
                 'wiredQrCodeId': wired_qr_code_id,
                 'wiredQrCodeDocId': str(qr_doc_id) if qr_doc_id else '',
@@ -6531,7 +7687,7 @@ def admin_activate_premium_order(order_id):
         )
 
     updated = premium_orders_collection.find_one({'_id': oid})
-    return jsonify(_premium_order_projection(updated))
+    return jsonify(_premium_order_projection(updated, include_existing_person_candidate=True))
 
 
 @application.route('/api/merchant/invoice/create', methods=['POST'])

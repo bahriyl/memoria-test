@@ -10,6 +10,7 @@ import boto3
 import requests
 import base64
 import io
+import zipfile
 import tempfile
 import shutil
 import subprocess
@@ -731,17 +732,43 @@ def _admin_pages_has_premium(person):
     return isinstance(premium, dict) and bool(premium)
 
 
-def _admin_pages_status_tags(person):
+def _admin_pages_is_premium_firma(person):
+    partner_ref = _admin_pages_str(person.get('premiumPartnerRitualServiceId')).lower()
+    if partner_ref.startswith('firma:'):
+        return True
+
+    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
+    path_key = _admin_pages_str(admin_page.get('pathKey')).lower()
+    path_label = _admin_pages_str(admin_page.get('pathLabel')).lower()
+    return path_key == 'premium_qr_firma' or path_label == 'преміум qr | фірма'
+
+
+def _admin_pages_has_plaques_tag(person, extra_ctx=None):
+    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
+    path_key = _admin_pages_str(admin_page.get('pathKey')).lower()
+    path_label = _admin_pages_str(admin_page.get('pathLabel')).lower()
+    if path_key == 'plaques' or path_label == 'табличка':
+        return True
+
+    if isinstance(extra_ctx, dict):
+        plaques_person_ids = extra_ctx.get('plaquesPersonIds')
+        if isinstance(plaques_person_ids, set):
+            person_id = str(person.get('_id') or '')
+            if person_id and person_id in plaques_person_ids:
+                return True
+    return False
+
+
+def _admin_pages_status_tags(person, extra_ctx=None):
     tags = []
-    if _admin_pages_has_premium(person):
+    if _admin_pages_is_premium_firma(person):
+        tags.append('Преміум QR | Фірма')
+    elif _admin_pages_has_premium(person):
         tags.append('Преміум QR')
     if bool(person.get('notable')):
         tags.append('видатна особа')
-
-    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
-    path_label = _admin_pages_str(admin_page.get('pathLabel'))
-    if path_label:
-        tags.append(path_label)
+    if _admin_pages_has_plaques_tag(person, extra_ctx=extra_ctx):
+        tags.append('табличка')
 
     if not tags:
         tags.append('Стандарт')
@@ -758,7 +785,7 @@ def _admin_pages_build_burial_from_fields(area_id, area, cemetery):
     return burial, legacy
 
 
-def _admin_pages_projection(person, index):
+def _admin_pages_projection(person, index, extra_ctx=None):
     item = _person_with_location_projection(person)
     admin_page = item.get('adminPage') if isinstance(item.get('adminPage'), dict) else {}
     burial = normalize_person_burial(item)
@@ -787,7 +814,7 @@ def _admin_pages_projection(person, index):
     else:
         life_range_text = years_label
 
-    status_tags = _admin_pages_status_tags(item)
+    status_tags = _admin_pages_status_tags(item, extra_ctx=extra_ctx)
     qr_code = _admin_pages_str(admin_page.get('qrCode'))
 
     return {
@@ -832,7 +859,28 @@ def admin_list_pages():
         }
 
     docs = list(people_collection.find(query_filter).sort([('createdAt', -1), ('_id', -1)]))
-    pages = [_admin_pages_projection(person, index + 1) for index, person in enumerate(docs)]
+
+    person_ids = [str(doc.get('_id') or '') for doc in docs if doc.get('_id')]
+    plaques_person_ids = set()
+    if person_ids:
+        wired_cursor = admin_qr_codes_collection.find(
+            {
+                'pathKey': 'plaques',
+                'wiredPersonId': {'$in': person_ids},
+            },
+            {'wiredPersonId': 1},
+        )
+        for qr_doc in wired_cursor:
+            raw_person_id = qr_doc.get('wiredPersonId')
+            if isinstance(raw_person_id, ObjectId):
+                plaques_person_ids.add(str(raw_person_id))
+                continue
+            cleaned_person_id = _admin_pages_str(raw_person_id)
+            if cleaned_person_id:
+                plaques_person_ids.add(cleaned_person_id)
+
+    extra_ctx = {'plaquesPersonIds': plaques_person_ids}
+    pages = [_admin_pages_projection(person, index + 1, extra_ctx=extra_ctx) for index, person in enumerate(docs)]
     return jsonify({
         'total': len(pages),
         'pages': pages,
@@ -1669,6 +1717,8 @@ def admin_activate_plaques_moderation(moderation_id):
 
     admin_page_payload = person_doc.get('adminPage') if isinstance(person_doc.get('adminPage'), dict) else {}
     admin_page_payload['qrCode'] = wired_qr_code_id
+    admin_page_payload['pathKey'] = 'plaques'
+    admin_page_payload['pathLabel'] = 'табличка'
     admin_page_payload['updatedAt'] = datetime.utcnow()
     person_doc['adminPage'] = admin_page_payload
 
@@ -6003,6 +6053,9 @@ QR_PATH_LABELS = {
     'plaques': 'Таблички',
 }
 QR_ALLOWED_PATH_KEYS = set(QR_PATH_LABELS.keys())
+QR_EXPORT_TOKEN_TTL_SECONDS = 15 * 60
+_qr_export_files = {}
+_qr_export_files_lock = threading.Lock()
 
 
 def _qr_str(value):
@@ -6093,6 +6146,39 @@ def _qr_build_image_url(scan_url):
     svg_bytes = out.getvalue()
     encoded = base64.b64encode(svg_bytes).decode('ascii')
     return f'data:image/svg+xml;base64,{encoded}'
+
+
+def _qr_build_svg_bytes(scan_url):
+    cleaned = _qr_str(scan_url)
+    if not cleaned or segno is None:
+        return b''
+    out = io.BytesIO()
+    qr = segno.make(cleaned, error='m')
+    qr.save(out, kind='svg', scale=6, border=2, dark='#111111', light='#ffffff')
+    return out.getvalue()
+
+
+def _qr_export_cleanup_expired_tokens(now_ts=None):
+    ts = float(now_ts if now_ts is not None else time.time())
+    with _qr_export_files_lock:
+        stale = [token for token, payload in _qr_export_files.items() if float(payload.get('expiresAt') or 0) <= ts]
+        for token in stale:
+            _qr_export_files.pop(token, None)
+
+
+def _qr_export_register_download(payload_bytes, file_name):
+    _qr_export_cleanup_expired_tokens()
+    token = secrets.token_urlsafe(24)
+    expires_at = time.time() + QR_EXPORT_TOKEN_TTL_SECONDS
+    with _qr_export_files_lock:
+        _qr_export_files[token] = {
+            'bytes': payload_bytes,
+            'fileName': _qr_str(file_name) or 'qr-export.zip',
+            'expiresAt': expires_at,
+        }
+    base = _qr_public_base_url()
+    path = f"/api/admin/qr/export/download/{quote(token, safe='')}"
+    return f'{base}{path}' if base else path
 
 
 def _qr_generate_unique_token():
@@ -6437,7 +6523,7 @@ def admin_qr_export():
         admin_qr_batches_collection.find({'pathKey': path_key, 'printedAt': None}).sort([('createdAt', -1), ('_id', -1)])
     )
     if not active_batches:
-        return jsonify({'ok': True, 'alreadyExported': False, 'exportedAt': None})
+        return jsonify({'ok': True, 'alreadyExported': False, 'exportedAt': None, 'downloadUrl': '', 'fileName': ''})
 
     already_exported = any(isinstance(item.get('exportedAt'), datetime) for item in active_batches)
     if already_exported and not force:
@@ -6446,7 +6532,36 @@ def admin_qr_export():
             'ok': False,
             'alreadyExported': True,
             'exportedAt': latest_export.isoformat() if latest_export else None,
+            'downloadUrl': '',
+            'fileName': '',
         })
+
+    codes_to_export = list(
+        admin_qr_codes_collection.find(
+            {'pathKey': path_key, 'isPrinted': {'$ne': True}},
+            {'qrNumber': 1, 'scanUrl': 1, 'qrToken': 1},
+        ).sort([('qrNumber', ASCENDING), ('_id', ASCENDING)])
+    )
+    zip_bytes = b''
+    file_name = ''
+    download_url = ''
+    if codes_to_export:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for doc in codes_to_export:
+                prepared = _qr_ensure_doc_runtime_fields(doc, persist=True)
+                qr_number = int(prepared.get('qrNumber') or 0)
+                scan_url = _qr_str(prepared.get('scanUrl'))
+                if not scan_url:
+                    scan_url = _qr_build_scan_url(prepared.get('qrToken'))
+                svg_payload = _qr_build_svg_bytes(scan_url)
+                if not svg_payload:
+                    continue
+                archive.writestr(f'qr-{qr_number}.svg', svg_payload)
+        zip_bytes = zip_buffer.getvalue()
+        file_name = f"qr-export-{path_key}-{datetime.utcnow().strftime('%d-%m-%Y')}.zip"
+        if zip_bytes:
+            download_url = _qr_export_register_download(zip_bytes, file_name)
 
     now = datetime.utcnow()
     batch_ids = [item.get('_id') for item in active_batches if item.get('_id')]
@@ -6462,7 +6577,39 @@ def admin_qr_export():
         'ok': True,
         'alreadyExported': already_exported,
         'exportedAt': now.isoformat(),
+        'downloadUrl': download_url,
+        'fileName': file_name,
     })
+
+
+@application.route('/api/admin/qr/export/download/<string:token>', methods=['GET'])
+def admin_qr_export_download(token):
+    cleaned_token = _qr_str(token)
+    if not cleaned_token:
+        abort(404, description='Export file not found')
+
+    _qr_export_cleanup_expired_tokens()
+    with _qr_export_files_lock:
+        payload = _qr_export_files.pop(cleaned_token, None)
+
+    if not payload:
+        abort(404, description='Export file expired or not found')
+
+    content = payload.get('bytes') if isinstance(payload, dict) else b''
+    if not isinstance(content, (bytes, bytearray)) or not content:
+        abort(404, description='Export file is empty')
+
+    filename = _qr_str(payload.get('fileName')) if isinstance(payload, dict) else ''
+    if not filename:
+        filename = 'qr-export.zip'
+
+    return send_file(
+        io.BytesIO(bytes(content)),
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
 
 
 @application.route('/api/admin/qr/mark-printed', methods=['POST'])
@@ -6811,7 +6958,6 @@ def _premium_build_life_range_from_years(birth_year, death_year):
 def _premium_order_extract_match_target(doc):
     moderation_payload = doc.get('moderationPayload') if isinstance(doc.get('moderationPayload'), dict) else {}
     name = _premium_order_str(moderation_payload.get('name') or doc.get('personName'))
-    area = _premium_order_str(moderation_payload.get('area') or doc.get('cemeteryAddress'))
     cemetery = _premium_order_str(moderation_payload.get('cemetery') or doc.get('cemetery'))
     birth_year = _admin_moderation_parse_year(moderation_payload.get('birthYear'))
     death_year = _admin_moderation_parse_year(moderation_payload.get('deathYear'))
@@ -6825,7 +6971,6 @@ def _premium_order_extract_match_target(doc):
             death_year = parsed_death_year
     return {
         'name': name,
-        'area': area,
         'cemetery': cemetery,
         'birthYear': birth_year,
         'deathYear': death_year,
@@ -6865,15 +7010,13 @@ def _premium_find_existing_person_candidate(order_doc):
         not target.get('name')
         or target.get('birthYear') is None
         or target.get('deathYear') is None
-        or not target.get('area')
         or not target.get('cemetery')
     ):
         return None
 
     target_name = _premium_normalize_match_text(target.get('name'))
-    target_area = _premium_normalize_match_text(target.get('area'))
     target_cemetery = _premium_normalize_match_text(target.get('cemetery'))
-    if not target_name or not target_area or not target_cemetery:
+    if not target_name or not target_cemetery:
         return None
 
     cursor = people_collection.find(
@@ -6898,16 +7041,53 @@ def _premium_find_existing_person_candidate(order_doc):
         item = _person_with_location_projection(person_doc)
         burial = normalize_person_burial(item)
         person_name = _premium_normalize_match_text(item.get('name'))
-        person_area = _premium_normalize_match_text(
-            item.get('area') or (burial.get('location') or {}).get('display')
-        )
         person_cemetery = _premium_normalize_match_text(
             item.get('cemetery') or (burial.get('cemeteryRef') or {}).get('name')
         )
-        if person_name == target_name and person_area == target_area and person_cemetery == target_cemetery:
+        if person_name == target_name and person_cemetery == target_cemetery:
             return _premium_existing_person_candidate_projection(person_doc)
 
     return None
+
+
+def _premium_has_existing_person_match(order_doc):
+    target = _premium_order_extract_match_target(order_doc)
+    if (
+        not target.get('name')
+        or target.get('birthYear') is None
+        or target.get('deathYear') is None
+        or not target.get('cemetery')
+    ):
+        return False
+
+    target_name = _premium_normalize_match_text(target.get('name'))
+    target_cemetery = _premium_normalize_match_text(target.get('cemetery'))
+    if not target_name or not target_cemetery:
+        return False
+
+    cursor = people_collection.find(
+        {
+            'birthYear': target.get('birthYear'),
+            'deathYear': target.get('deathYear'),
+        },
+        {
+            'name': 1,
+            'cemetery': 1,
+            'burial': 1,
+        },
+    ).sort([('createdAt', -1), ('_id', -1)]).limit(60)
+
+    for person_doc in cursor:
+        item = _person_with_location_projection(person_doc)
+        burial = normalize_person_burial(item)
+        person_name = _premium_normalize_match_text(item.get('name'))
+        person_cemetery = _premium_normalize_match_text(
+            item.get('cemetery') or (burial.get('cemeteryRef') or {}).get('name')
+        )
+        if person_name == target_name and person_cemetery == target_cemetery:
+            return True
+
+    return False
 
 
 def _generate_premium_order_password(length=8):
@@ -6969,6 +7149,11 @@ def _premium_order_projection(doc, include_existing_person_candidate=False):
         if is_firma_activation and include_existing_person_candidate
         else None
     )
+    has_existing_person_match = (
+        bool(existing_person_candidate)
+        if include_existing_person_candidate
+        else (_premium_has_existing_person_match(doc) if is_firma_activation else False)
+    )
 
     return {
         'id': str(doc.get('_id')),
@@ -7002,6 +7187,7 @@ def _premium_order_projection(doc, include_existing_person_candidate=False):
         'premiumQrFirmaId': premium_qr_firma_id,
         'mergePersonId': merge_person_id,
         'mergeState': 'selected' if merge_person_id else 'none',
+        'hasExistingPersonMatch': has_existing_person_match,
         'existingPersonCandidate': existing_person_candidate,
         'deliveryCityRef': _premium_order_str(doc.get('deliveryCityRef')),
         'deliveryCityName': _premium_order_str(doc.get('deliveryCityName')),
@@ -7647,11 +7833,22 @@ def admin_activate_premium_order(order_id):
         people_collection.update_one(
             {'_id': pid},
             {
-                '$set': {
-                    'premium.password': hashed,
-                    'premium.updatedAt': now,
-                    **({'premiumPartnerRitualServiceId': premium_partner_ref} if premium_partner_ref else {}),
-                }
+                '$set': (
+                    {
+                        'premium.password': hashed,
+                        'premium.updatedAt': now,
+                        **({'premiumPartnerRitualServiceId': premium_partner_ref} if premium_partner_ref else {}),
+                    }
+                    if not is_premium_qr_firma
+                    else {
+                        'premium.password': hashed,
+                        'premium.updatedAt': now,
+                        'adminPage.pathKey': 'premium_qr_firma',
+                        'adminPage.pathLabel': 'Преміум QR | Фірма',
+                        'adminPage.updatedAt': now,
+                        **({'premiumPartnerRitualServiceId': premium_partner_ref} if premium_partner_ref else {}),
+                    }
+                )
             }
         )
 

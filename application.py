@@ -90,6 +90,10 @@ NP_TRACKING_COOLDOWN_SECONDS = max(int(os.getenv('NP_TRACKING_COOLDOWN_SECONDS',
 NP_TRACKING_BATCH_LIMIT_DEFAULT = max(int(os.getenv('NP_TRACKING_BATCH_LIMIT_DEFAULT', '25') or '25'), 1)
 NP_TRACKING_BATCH_LIMIT_MAX = max(int(os.getenv('NP_TRACKING_BATCH_LIMIT_MAX', '50') or '50'), NP_TRACKING_BATCH_LIMIT_DEFAULT)
 NP_TRACKING_BATCH_CONCURRENCY = max(int(os.getenv('NP_TRACKING_BATCH_CONCURRENCY', '4') or '4'), 1)
+FINANCE_FALLBACK_PLAQUE_UAH = max(int(os.getenv('FINANCE_FALLBACK_PLAQUE_UAH', '200') or '200'), 0)
+FINANCE_FALLBACK_RITUAL_PAYMENT_UAH = max(int(os.getenv('FINANCE_FALLBACK_RITUAL_PAYMENT_UAH', '0') or '0'), 0)
+FINANCE_NOTES_DEVELOPMENT_PERCENT = max(int(os.getenv('FINANCE_NOTES_DEVELOPMENT_PERCENT', '10') or '10'), 0)
+DEFAULT_FINANCE_TIMEZONE = os.getenv('DEFAULT_FINANCE_TIMEZONE', 'Europe/Kyiv') or 'Europe/Kyiv'
 PUBLIC_WEB_BASE_URL = (
     os.getenv('PUBLIC_WEB_BASE_URL')
     or os.getenv('FRONTEND_BASE_URL')
@@ -184,6 +188,9 @@ admin_qr_codes_collection = db['admin_qr_codes']
 chat_collection = db['chats']
 message_collection = db['messages']
 cemeteries_collection = db['cemeteries']
+ads_columns_meta_collection = db['ads_columns_meta']
+ads_campaigns_collection = db['ads_campaigns']
+ads_applications_collection = db['ads_applications']
 churches_collection = db['churches']
 ritual_services_collection = db['ritual_services']
 ritual_service_categories_collection = db['ritual_service_categories']
@@ -191,6 +198,7 @@ premium_qr_firmas_collection = db['premium_qr_firmas']
 location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 chat_templates_collection = db['chat_templates']
+admin_note_payments_collection = db['admin_note_payments']
 
 ALLOWED_CHAT_CATEGORIES = {'Реклама', 'Ритуальні послуги', 'Електронна записка'}
 CHAT_TEMPLATE_TITLE_MAX_LEN = 120
@@ -422,6 +430,31 @@ except Exception:
     pass
 
 try:
+    ads_columns_meta_collection.create_index([("cemeteryId", ASCENDING)], unique=True)
+except Exception:
+    pass
+
+try:
+    ads_campaigns_collection.create_index([("cemeteryId", ASCENDING), ("status", ASCENDING), ("updatedAt", -1)])
+except Exception:
+    pass
+
+try:
+    ads_campaigns_collection.create_index([("surfaceType", ASCENDING), ("status", ASCENDING), ("cemeteryId", ASCENDING), ("updatedAt", -1)])
+except Exception:
+    pass
+
+try:
+    ads_applications_collection.create_index([("status", ASCENDING), ("cemeteryId", ASCENDING), ("createdAt", -1)])
+except Exception:
+    pass
+
+try:
+    ads_applications_collection.create_index([("surfaceType", ASCENDING), ("status", ASCENDING), ("cemeteryId", ASCENDING), ("createdAt", -1)])
+except Exception:
+    pass
+
+try:
     admin_qr_codes_collection.create_index([("qrNumber", ASCENDING)], unique=True)
 except Exception:
     pass
@@ -453,6 +486,16 @@ except Exception:
 
 try:
     plaques_moderation_collection.create_index([("status", ASCENDING), ("createdAt", -1)])
+except Exception:
+    pass
+
+try:
+    admin_note_payments_collection.create_index([("period.year", ASCENDING), ("period.month", ASCENDING)], unique=True)
+except Exception:
+    pass
+
+try:
+    admin_note_payments_collection.create_index([("status", ASCENDING), ("updatedAt", -1)])
 except Exception:
     pass
 
@@ -2935,6 +2978,813 @@ def admin_delete_cemetery(cemetery_id):
     return jsonify({'ok': True})
 
 
+ADS_APPLICATION_STATUSES = {'pending', 'verified', 'rejected'}
+ADS_CAMPAIGN_STATUSES = {'active', 'inactive'}
+ADS_SURFACE_TYPES = {'columns', 'pages', 'plaques'}
+ADS_ALLOWED_CAMPAIGN_FIELDS = {
+    'cemeteryId',
+    'companyName',
+    'websiteUrl',
+    'creativeUrl',
+    'address',
+    'phone',
+    'periodStart',
+    'periodEnd',
+    'daysTotal',
+    'displayOn',
+    'status',
+    'payments',
+    'plaques',
+    'surfaceType',
+}
+ADS_ALLOWED_APPLICATION_FIELDS = {
+    'cemeteryId',
+    'cemeteryName',
+    'companyName',
+    'websiteUrl',
+    'creativeUrl',
+    'address',
+    'phone',
+    'periodStart',
+    'periodEnd',
+    'daysTotal',
+    'displayOn',
+    'status',
+    'reason',
+    'plaques',
+    'surfaceType',
+}
+
+
+def _ads_parse_iso_date(value, field_name, required=False):
+    text = _clean_str(value)
+    if not text:
+        if required:
+            abort(400, description=f'`{field_name}` is required')
+        return ''
+    try:
+        return datetime.strptime(text, '%Y-%m-%d').strftime('%Y-%m-%d')
+    except ValueError:
+        abort(400, description=f'`{field_name}` must be in YYYY-MM-DD format')
+
+
+def _ads_days_between(start_iso, end_iso):
+    if not start_iso or not end_iso:
+        return 0
+    start_dt = datetime.strptime(start_iso, '%Y-%m-%d')
+    end_dt = datetime.strptime(end_iso, '%Y-%m-%d')
+    diff = (end_dt - start_dt).days
+    if diff < 0:
+        abort(400, description='`periodEnd` must be greater than or equal to `periodStart`')
+    return diff
+
+
+def _ads_clean_int(value, field_name, default=0):
+    if value is None or value == '':
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        abort(400, description=f'`{field_name}` must be an integer')
+    return parsed
+
+
+def _ads_parse_cemetery_object_id(value, required=False):
+    text = _clean_str(value)
+    if not text:
+        if required:
+            abort(400, description='`cemeteryId` is required')
+        return None
+    try:
+        return ObjectId(text)
+    except Exception:
+        abort(400, description='Invalid `cemeteryId`')
+
+
+def _ads_find_cemetery(cemetery_oid):
+    if not cemetery_oid:
+        return None
+    return cemeteries_collection.find_one({'_id': cemetery_oid}, {'name': 1, 'address': 1, 'addressLine': 1, 'locality': 1, 'location': 1})
+
+
+def _ads_extract_cemetery_address(cemetery):
+    if not isinstance(cemetery, dict):
+        return ''
+    location = normalize_cemetery_location(cemetery)
+    legacy_loc = cemetery_location_to_legacy(location)
+    return _clean_str(
+        cemetery.get('addressLine')
+        or legacy_loc.get('addressLine')
+        or cemetery.get('address')
+        or cemetery.get('locality')
+        or legacy_loc.get('locality')
+    )
+
+
+def _ads_normalize_campaign_status(value):
+    return 'inactive' if _clean_str(value).lower() in {'inactive', 'disabled', 'archived'} else 'active'
+
+
+def _ads_normalize_application_status(value):
+    normalized = _clean_str(value).lower()
+    if normalized in ADS_APPLICATION_STATUSES:
+        return normalized
+    return 'pending'
+
+
+def _ads_normalize_surface_type(value, default='columns'):
+    normalized = _clean_str(value).lower()
+    if normalized in ADS_SURFACE_TYPES:
+        return normalized
+    return default
+
+
+def _ads_mode_to_surface_type(mode):
+    normalized = _clean_str(mode).lower()
+    if normalized in ADS_SURFACE_TYPES:
+        return normalized
+    abort(400, description='`mode` must be one of: columns, pages, plaques')
+
+
+def _ads_surface_query_for_mode(mode):
+    surface_type = _ads_mode_to_surface_type(mode)
+    if surface_type == 'columns':
+        return {
+            '$or': [
+                {'surfaceType': 'columns'},
+                {'surfaceType': {'$exists': False}},
+                {'surfaceType': ''},
+                {'surfaceType': None},
+            ]
+        }
+    return {'surfaceType': surface_type}
+
+
+def _ads_campaign_status_label(status):
+    return 'Неактивний' if status == 'inactive' else 'Активний'
+
+
+def _ads_application_status_label(status):
+    if status == 'verified':
+        return 'Верифіковано'
+    if status == 'rejected':
+        return 'Відхилено'
+    return 'На модерації'
+
+
+def _ads_normalize_payments(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        abort(400, description='`payments` must be an array')
+
+    payments = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict):
+            abort(400, description=f'`payments[{idx}]` must be an object')
+        start = _ads_parse_iso_date(item.get('periodStart'), f'payments[{idx}].periodStart', required=False)
+        end = _ads_parse_iso_date(item.get('periodEnd'), f'payments[{idx}].periodEnd', required=False)
+        days = _ads_clean_int(item.get('daysTotal'), f'payments[{idx}].daysTotal', default=0)
+        if (start and end) and days <= 0:
+            days = _ads_days_between(start, end)
+        pdf_url = _clean_str(item.get('pdfUrl'))
+        status = _clean_str(item.get('status'))
+        if not start and not end and not pdf_url:
+            continue
+        payments.append({
+            'periodStart': start,
+            'periodEnd': end,
+            'daysTotal': max(days, 0),
+            'pdfUrl': pdf_url,
+            'status': status,
+        })
+    return payments
+
+
+def _ads_normalize_plaques(value, strict=False):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        if strict:
+            abort(400, description='`plaques` must be an array')
+        return []
+
+    plaques = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict):
+            if strict:
+                abort(400, description=f'`plaques[{idx}]` must be an object')
+            continue
+        person_id = _clean_str(item.get('personId') or item.get('id'))
+        name = _clean_str(item.get('name'))
+        life_range_text = _clean_str(item.get('lifeRangeText'))
+        avatar_url = _clean_str(item.get('avatarUrl'))
+        if not person_id and not name and not life_range_text and not avatar_url:
+            continue
+        plaques.append({
+            'personId': person_id,
+            'name': name,
+            'lifeRangeText': life_range_text,
+            'avatarUrl': avatar_url,
+        })
+    return plaques
+
+
+def _ads_columns_meta_for_cemetery(cemetery_oid):
+    if not cemetery_oid:
+        return None
+    return ads_columns_meta_collection.find_one({'cemeteryId': cemetery_oid}, {'totalColumns': 1, 'priceUah': 1, 'maxColumnsAds': 1, 'maxPagesAds': 1})
+
+
+def _ads_build_campaign_payload(data, partial=False, existing=None):
+    if not isinstance(data, dict):
+        abort(400, description='Body must be a JSON object')
+
+    unknown = set(data.keys()) - ADS_ALLOWED_CAMPAIGN_FIELDS
+    if unknown:
+        abort(400, description=f'Unsupported fields: {", ".join(sorted(unknown))}')
+
+    merged = dict(existing or {})
+    merged.update(data)
+
+    cemetery_oid = _ads_parse_cemetery_object_id(merged.get('cemeteryId'), required=True)
+    cemetery_doc = _ads_find_cemetery(cemetery_oid)
+    if not cemetery_doc:
+        abort(404, description='Cemetery not found')
+
+    company_name = _clean_str(merged.get('companyName'))
+    address = _clean_str(merged.get('address'))
+    phone = _clean_str(merged.get('phone'))
+    period_start = _ads_parse_iso_date(merged.get('periodStart'), 'periodStart', required=True)
+    period_end = _ads_parse_iso_date(merged.get('periodEnd'), 'periodEnd', required=True)
+    days_total = _ads_clean_int(merged.get('daysTotal'), 'daysTotal', default=0)
+    if days_total <= 0:
+        days_total = _ads_days_between(period_start, period_end)
+    if days_total <= 0:
+        abort(400, description='`daysTotal` must be greater than 0')
+
+    if not company_name:
+        abort(400, description='`companyName` is required')
+    if not address:
+        abort(400, description='`address` is required')
+    if not phone:
+        abort(400, description='`phone` is required')
+
+    meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    normalized = {
+        'cemeteryId': cemetery_oid,
+        'cemeteryName': _clean_str(cemetery_doc.get('name')),
+        'cemeteryAddress': _ads_extract_cemetery_address(cemetery_doc),
+        'surfaceType': _ads_normalize_surface_type(merged.get('surfaceType'), default='columns'),
+        'companyName': company_name,
+        'websiteUrl': _clean_str(merged.get('websiteUrl')),
+        'creativeUrl': _clean_str(merged.get('creativeUrl')),
+        'address': address,
+        'phone': phone,
+        'periodStart': period_start,
+        'periodEnd': period_end,
+        'daysTotal': days_total,
+        'displayOn': _clean_str(merged.get('displayOn')) or 'Головна сторінка, профіль',
+        'status': _ads_normalize_campaign_status(merged.get('status')),
+        'payments': _ads_normalize_payments(merged.get('payments')),
+        'plaques': _ads_normalize_plaques(merged.get('plaques'), strict=True),
+        'priceUah': _ads_clean_int(merged.get('priceUah') if isinstance(merged, dict) else None, 'priceUah', default=_ads_clean_int(meta.get('priceUah'), 'priceUah', default=0)),
+    }
+
+    if not partial:
+        return normalized
+
+    payload = {}
+    for key in data.keys():
+        if key == 'cemeteryId':
+            payload['cemeteryId'] = normalized['cemeteryId']
+            payload['cemeteryName'] = normalized['cemeteryName']
+            payload['cemeteryAddress'] = normalized['cemeteryAddress']
+            payload['priceUah'] = normalized['priceUah']
+            continue
+        if key in normalized:
+            payload[key] = normalized[key]
+
+    if {'periodStart', 'periodEnd', 'daysTotal'} & set(data.keys()):
+        payload['periodStart'] = normalized['periodStart']
+        payload['periodEnd'] = normalized['periodEnd']
+        payload['daysTotal'] = normalized['daysTotal']
+
+    return payload
+
+
+def _ads_build_application_payload(data):
+    if not isinstance(data, dict):
+        abort(400, description='Body must be a JSON object')
+
+    unknown = set(data.keys()) - ADS_ALLOWED_APPLICATION_FIELDS
+    if unknown:
+        abort(400, description=f'Unsupported fields: {", ".join(sorted(unknown))}')
+
+    cemetery_oid = _ads_parse_cemetery_object_id(data.get('cemeteryId'), required=False)
+    cemetery_doc = _ads_find_cemetery(cemetery_oid) if cemetery_oid else None
+    if cemetery_oid and not cemetery_doc:
+        abort(404, description='Cemetery not found')
+
+    company_name = _clean_str(data.get('companyName'))
+    address = _clean_str(data.get('address'))
+    phone = _clean_str(data.get('phone'))
+    period_start = _ads_parse_iso_date(data.get('periodStart'), 'periodStart', required=True)
+    period_end = _ads_parse_iso_date(data.get('periodEnd'), 'periodEnd', required=True)
+    days_total = _ads_clean_int(data.get('daysTotal'), 'daysTotal', default=0)
+    if days_total <= 0:
+        days_total = _ads_days_between(period_start, period_end)
+    if days_total <= 0:
+        abort(400, description='`daysTotal` must be greater than 0')
+
+    if not company_name:
+        abort(400, description='`companyName` is required')
+    if not address:
+        abort(400, description='`address` is required')
+    if not phone:
+        abort(400, description='`phone` is required')
+
+    return {
+        'cemeteryId': cemetery_oid,
+        'cemeteryName': _clean_str(data.get('cemeteryName')) or _clean_str(cemetery_doc.get('name') if cemetery_doc else ''),
+        'surfaceType': _ads_normalize_surface_type(data.get('surfaceType'), default='columns'),
+        'companyName': company_name,
+        'websiteUrl': _clean_str(data.get('websiteUrl')),
+        'creativeUrl': _clean_str(data.get('creativeUrl')),
+        'address': address,
+        'phone': phone,
+        'periodStart': period_start,
+        'periodEnd': period_end,
+        'daysTotal': days_total,
+        'displayOn': _clean_str(data.get('displayOn')) or 'Головна сторінка, профіль',
+        'status': _ads_normalize_application_status(data.get('status')),
+        'reason': _clean_str(data.get('reason')),
+        'plaques': _ads_normalize_plaques(data.get('plaques'), strict=True),
+    }
+
+
+def _ads_days_left(period_end):
+    try:
+        end_dt = datetime.strptime(_clean_str(period_end), '%Y-%m-%d')
+    except Exception:
+        return 0
+    return max((end_dt.date() - datetime.utcnow().date()).days, 0)
+
+
+def _ads_serialize_campaign(doc):
+    status = _ads_normalize_campaign_status(doc.get('status'))
+    created_at = doc.get('createdAt')
+    updated_at = doc.get('updatedAt')
+    plaques = _ads_normalize_plaques(doc.get('plaques'))
+    source_application_id = doc.get('sourceApplicationId')
+    if isinstance(source_application_id, ObjectId):
+        source_application_id = str(source_application_id)
+    return {
+        'id': str(doc.get('_id')),
+        'cemeteryId': str(doc.get('cemeteryId')) if isinstance(doc.get('cemeteryId'), ObjectId) else _clean_str(doc.get('cemeteryId')),
+        'cemeteryName': _clean_str(doc.get('cemeteryName')),
+        'surfaceType': _ads_normalize_surface_type(doc.get('surfaceType'), default='columns'),
+        'companyName': _clean_str(doc.get('companyName')),
+        'websiteUrl': _clean_str(doc.get('websiteUrl')),
+        'creativeUrl': _clean_str(doc.get('creativeUrl')),
+        'address': _clean_str(doc.get('address')),
+        'phone': _clean_str(doc.get('phone')),
+        'periodStart': _clean_str(doc.get('periodStart')),
+        'periodEnd': _clean_str(doc.get('periodEnd')),
+        'daysTotal': _ads_clean_int(doc.get('daysTotal'), 'daysTotal', default=0),
+        'daysLeft': _ads_days_left(doc.get('periodEnd')),
+        'priceUah': _ads_clean_int(doc.get('priceUah'), 'priceUah', default=0),
+        'status': status,
+        'statusLabel': _ads_campaign_status_label(status),
+        'displayOn': _clean_str(doc.get('displayOn')) or 'Головна сторінка, профіль',
+        'payments': _ads_normalize_payments(doc.get('payments')),
+        'plaques': plaques,
+        'plaquesCount': len(plaques),
+        'sourceApplicationId': _clean_str(source_application_id),
+        'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
+        'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
+    }
+
+
+def _ads_serialize_application(doc):
+    status = _ads_normalize_application_status(doc.get('status'))
+    created_at = doc.get('createdAt')
+    updated_at = doc.get('updatedAt')
+    plaques = _ads_normalize_plaques(doc.get('plaques'))
+    return {
+        'id': str(doc.get('_id')),
+        'cemeteryId': str(doc.get('cemeteryId')) if isinstance(doc.get('cemeteryId'), ObjectId) else _clean_str(doc.get('cemeteryId')),
+        'cemeteryName': _clean_str(doc.get('cemeteryName')),
+        'surfaceType': _ads_normalize_surface_type(doc.get('surfaceType'), default='columns'),
+        'companyName': _clean_str(doc.get('companyName')),
+        'websiteUrl': _clean_str(doc.get('websiteUrl')),
+        'creativeUrl': _clean_str(doc.get('creativeUrl')),
+        'address': _clean_str(doc.get('address')),
+        'phone': _clean_str(doc.get('phone')),
+        'periodStart': _clean_str(doc.get('periodStart')),
+        'periodEnd': _clean_str(doc.get('periodEnd')),
+        'daysTotal': _ads_clean_int(doc.get('daysTotal'), 'daysTotal', default=0),
+        'displayOn': _clean_str(doc.get('displayOn')) or 'Головна сторінка, профіль',
+        'status': status,
+        'statusLabel': _ads_application_status_label(status),
+        'reason': _clean_str(doc.get('reason')),
+        'plaques': plaques,
+        'plaquesCount': len(plaques),
+        'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
+        'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
+    }
+
+
+@application.route('/api/admin/ads/columns', methods=['GET'])
+def admin_ads_list_columns_cemeteries():
+    mode = _clean_str(request.args.get('mode', 'columns')).lower()
+    surface_filter = _ads_surface_query_for_mode(mode)
+    search = _clean_str(request.args.get('search', ''))
+    regex = {'$regex': re.escape(search), '$options': 'i'} if search else None
+
+    meta_docs = list(ads_columns_meta_collection.find({}, {'cemeteryId': 1, 'totalColumns': 1}))
+    meta_by_cemetery = {}
+    related_ids = set()
+    for meta in meta_docs:
+        cemetery_oid = meta.get('cemeteryId')
+        if not isinstance(cemetery_oid, ObjectId):
+            continue
+        related_ids.add(cemetery_oid)
+        meta_by_cemetery[cemetery_oid] = _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0)
+
+    campaigns_count = {}
+    campaigns_busy_count = {}
+    campaigns_query = {'status': 'active'}
+    campaigns_query.update(surface_filter)
+    for campaign in ads_campaigns_collection.find(campaigns_query, {'cemeteryId': 1, 'plaques': 1}):
+        cemetery_oid = campaign.get('cemeteryId')
+        if not isinstance(cemetery_oid, ObjectId):
+            continue
+        related_ids.add(cemetery_oid)
+        campaigns_count[cemetery_oid] = campaigns_count.get(cemetery_oid, 0) + 1
+        plaques_count = len(_ads_normalize_plaques(campaign.get('plaques')))
+        if plaques_count > 0:
+            campaigns_busy_count[cemetery_oid] = campaigns_busy_count.get(cemetery_oid, 0) + 1
+
+    applications_count = {}
+    plaques_applications_count = {}
+    applications_query = {'status': 'pending'}
+    applications_query.update(surface_filter)
+    for app in ads_applications_collection.find(applications_query, {'cemeteryId': 1, 'plaques': 1}):
+        cemetery_oid = app.get('cemeteryId')
+        if not isinstance(cemetery_oid, ObjectId):
+            continue
+        related_ids.add(cemetery_oid)
+        applications_count[cemetery_oid] = applications_count.get(cemetery_oid, 0) + 1
+        plaques_count = len(_ads_normalize_plaques(app.get('plaques')))
+        if plaques_count > 0:
+            plaques_applications_count[cemetery_oid] = plaques_applications_count.get(cemetery_oid, 0) + 1
+
+    query_filter = {}
+    if related_ids:
+        query_filter['_id'] = {'$in': list(related_ids)}
+    if regex:
+        query_filter['$or'] = [
+            {'name': regex},
+            {'address': regex},
+            {'addressLine': regex},
+            {'locality': regex},
+            {'location.area.display': regex},
+            {'location.display': regex},
+        ]
+
+    cemetery_docs = list(cemeteries_collection.find(query_filter, {'name': 1, 'address': 1, 'addressLine': 1, 'locality': 1, 'location': 1}).sort([('name', 1), ('_id', 1)]))
+    items = []
+    for cemetery in cemetery_docs:
+        cemetery_oid = cemetery.get('_id')
+        total_columns = meta_by_cemetery.get(cemetery_oid, 0)
+        busy_plaques = campaigns_busy_count.get(cemetery_oid, 0)
+        items.append({
+            'cemeteryId': str(cemetery_oid),
+            'name': _clean_str(cemetery.get('name')),
+            'address': _ads_extract_cemetery_address(cemetery),
+            'columnsCount': total_columns,
+            'adsCount': campaigns_count.get(cemetery_oid, 0),
+            'applicationsCount': applications_count.get(cemetery_oid, 0),
+            'plaquesCount': total_columns,
+            'busyPlaquesCount': busy_plaques,
+            'freePlaquesCount': max(total_columns - busy_plaques, 0),
+            'plaquesApplicationsCount': plaques_applications_count.get(cemetery_oid, 0),
+        })
+
+    return jsonify({
+        'total': len(items),
+        'items': items,
+    })
+
+
+@application.route('/api/admin/ads/columns/<string:cemetery_id>', methods=['GET'])
+def admin_ads_get_columns_cemetery(cemetery_id):
+    mode = _clean_str(request.args.get('mode', 'columns')).lower()
+    surface_filter = _ads_surface_query_for_mode(mode)
+    search = _clean_str(request.args.get('search', ''))
+    regex = {'$regex': re.escape(search), '$options': 'i'} if search else None
+    cemetery_oid = _ads_parse_cemetery_object_id(cemetery_id, required=True)
+    cemetery_doc = _ads_find_cemetery(cemetery_oid)
+    if not cemetery_doc:
+        abort(404, description='Cemetery not found')
+
+    applications_filter = {'cemeteryId': cemetery_oid, 'status': 'pending'}
+    campaigns_filter = {'cemeteryId': cemetery_oid, 'status': 'active'}
+    applications_filter.update(surface_filter)
+    campaigns_filter.update(surface_filter)
+    if regex:
+        search_or = [
+            {'companyName': regex},
+            {'address': regex},
+            {'phone': regex},
+            {'websiteUrl': regex},
+        ]
+        applications_filter['$or'] = search_or
+        campaigns_filter['$or'] = search_or
+
+    application_docs = list(ads_applications_collection.find(applications_filter).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)]))
+    campaign_docs = list(ads_campaigns_collection.find(campaigns_filter).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)]))
+    if mode == 'plaques':
+        application_docs = [doc for doc in application_docs if len(_ads_normalize_plaques(doc.get('plaques'))) > 0]
+        campaign_docs = [doc for doc in campaign_docs if len(_ads_normalize_plaques(doc.get('plaques'))) > 0]
+
+    meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    total_columns = _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0)
+    busy_columns = len(campaign_docs)
+    free_columns = max(total_columns - busy_columns, 0)
+
+    return jsonify({
+        'cemeteryId': str(cemetery_oid),
+        'cemeteryName': _clean_str(cemetery_doc.get('name')),
+        'address': _ads_extract_cemetery_address(cemetery_doc),
+        'totalColumns': total_columns,
+        'freeColumns': free_columns,
+        'busyColumns': busy_columns,
+        'priceUah': _ads_clean_int(meta.get('priceUah'), 'priceUah', default=0),
+        'applications': [_ads_serialize_application(doc) for doc in application_docs],
+        'activeCampaigns': [_ads_serialize_campaign(doc) for doc in campaign_docs],
+    })
+
+
+@application.route('/api/admin/ads/campaigns', methods=['POST'])
+def admin_ads_create_campaign():
+    data = request.get_json(silent=True) or {}
+    payload = _ads_build_campaign_payload(data, partial=False, existing=None)
+    now = datetime.utcnow()
+    payload['createdAt'] = now
+    payload['updatedAt'] = now
+
+    inserted = ads_campaigns_collection.insert_one(payload)
+    created = ads_campaigns_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify(_ads_serialize_campaign(created)), 201
+
+
+@application.route('/api/admin/ads/campaigns/<string:campaign_id>', methods=['PATCH'])
+def admin_ads_update_campaign(campaign_id):
+    try:
+        campaign_oid = ObjectId(campaign_id)
+    except Exception:
+        abort(400, description='Invalid campaign id')
+
+    existing = ads_campaigns_collection.find_one({'_id': campaign_oid})
+    if not existing:
+        abort(404, description='Campaign not found')
+
+    data = request.get_json(silent=True) or {}
+    update_fields = _ads_build_campaign_payload(data, partial=True, existing=existing)
+    if not update_fields:
+        abort(400, description='Nothing to update')
+    update_fields['updatedAt'] = datetime.utcnow()
+
+    ads_campaigns_collection.update_one({'_id': campaign_oid}, {'$set': update_fields})
+    updated = ads_campaigns_collection.find_one({'_id': campaign_oid})
+    return jsonify(_ads_serialize_campaign(updated))
+
+
+@application.route('/api/admin/ads/campaigns/<string:campaign_id>/status', methods=['POST'])
+def admin_ads_set_campaign_status(campaign_id):
+    try:
+        campaign_oid = ObjectId(campaign_id)
+    except Exception:
+        abort(400, description='Invalid campaign id')
+
+    existing = ads_campaigns_collection.find_one({'_id': campaign_oid})
+    if not existing:
+        abort(404, description='Campaign not found')
+
+    data = request.get_json(silent=True) or {}
+    status = _ads_normalize_campaign_status(data.get('status'))
+    ads_campaigns_collection.update_one(
+        {'_id': campaign_oid},
+        {'$set': {'status': status, 'updatedAt': datetime.utcnow()}}
+    )
+    updated = ads_campaigns_collection.find_one({'_id': campaign_oid})
+    return jsonify(_ads_serialize_campaign(updated))
+
+
+@application.route('/api/admin/ads/applications', methods=['GET'])
+def admin_ads_list_applications():
+    search = _clean_str(request.args.get('search', ''))
+    cemetery_id = _clean_str(request.args.get('cemeteryId', ''))
+    status_filter = _clean_str(request.args.get('status', '')).lower()
+    mode = _clean_str(request.args.get('mode', '')).lower()
+
+    query_filter = {}
+    if cemetery_id:
+        query_filter['cemeteryId'] = _ads_parse_cemetery_object_id(cemetery_id, required=True)
+    if status_filter:
+        if status_filter not in ADS_APPLICATION_STATUSES:
+            abort(400, description='`status` must be one of: pending, verified, rejected')
+        query_filter['status'] = status_filter
+    if mode:
+        query_filter.update(_ads_surface_query_for_mode(mode))
+    if search:
+        regex = {'$regex': re.escape(search), '$options': 'i'}
+        query_filter['$or'] = [
+            {'companyName': regex},
+            {'cemeteryName': regex},
+            {'address': regex},
+            {'phone': regex},
+            {'websiteUrl': regex},
+        ]
+
+    docs = list(ads_applications_collection.find(query_filter).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)]))
+    items = [_ads_serialize_application(doc) for doc in docs]
+    return jsonify({
+        'total': len(items),
+        'items': items,
+    })
+
+
+@application.route('/api/admin/ads/applications/<string:application_id>/verify', methods=['POST'])
+def admin_ads_verify_application(application_id):
+    try:
+        application_oid = ObjectId(application_id)
+    except Exception:
+        abort(400, description='Invalid application id')
+
+    existing = ads_applications_collection.find_one({'_id': application_oid})
+    if not existing:
+        abort(404, description='Application not found')
+    if _ads_normalize_application_status(existing.get('status')) != 'pending':
+        abort(400, description='Only pending applications can be verified')
+
+    data = request.get_json(silent=True) or {}
+    source = {
+        'cemeteryId': str(existing.get('cemeteryId')) if isinstance(existing.get('cemeteryId'), ObjectId) else existing.get('cemeteryId'),
+        'surfaceType': _ads_normalize_surface_type(existing.get('surfaceType'), default='columns'),
+        'companyName': existing.get('companyName'),
+        'websiteUrl': existing.get('websiteUrl'),
+        'creativeUrl': existing.get('creativeUrl'),
+        'address': existing.get('address'),
+        'phone': existing.get('phone'),
+        'periodStart': existing.get('periodStart'),
+        'periodEnd': existing.get('periodEnd'),
+        'daysTotal': existing.get('daysTotal'),
+        'displayOn': existing.get('displayOn'),
+        'plaques': existing.get('plaques'),
+        'status': 'active',
+        'payments': [],
+    }
+    if isinstance(data, dict):
+        source.update(data)
+
+    campaign_payload = _ads_build_campaign_payload(source, partial=False, existing=None)
+    campaign_payload['sourceApplicationId'] = application_oid
+    now = datetime.utcnow()
+    campaign_payload['createdAt'] = now
+    campaign_payload['updatedAt'] = now
+    inserted = ads_campaigns_collection.insert_one(campaign_payload)
+    created_campaign = ads_campaigns_collection.find_one({'_id': inserted.inserted_id})
+
+    ads_applications_collection.update_one(
+        {'_id': application_oid},
+        {
+            '$set': {
+                'status': 'verified',
+                'reason': '',
+                'linkedCampaignId': inserted.inserted_id,
+                'updatedAt': now,
+                'verifiedAt': now,
+            }
+        }
+    )
+    updated_application = ads_applications_collection.find_one({'_id': application_oid})
+
+    return jsonify({
+        'success': True,
+        'campaign': _ads_serialize_campaign(created_campaign),
+        'application': _ads_serialize_application(updated_application),
+    })
+
+
+@application.route('/api/admin/ads/applications/<string:application_id>/reject', methods=['POST'])
+def admin_ads_reject_application(application_id):
+    try:
+        application_oid = ObjectId(application_id)
+    except Exception:
+        abort(400, description='Invalid application id')
+
+    existing = ads_applications_collection.find_one({'_id': application_oid})
+    if not existing:
+        abort(404, description='Application not found')
+    if _ads_normalize_application_status(existing.get('status')) != 'pending':
+        abort(400, description='Only pending applications can be rejected')
+
+    data = request.get_json(silent=True) or {}
+    reason = _clean_str(data.get('reason'))
+    now = datetime.utcnow()
+    ads_applications_collection.update_one(
+        {'_id': application_oid},
+        {'$set': {'status': 'rejected', 'reason': reason, 'updatedAt': now, 'rejectedAt': now}}
+    )
+    updated = ads_applications_collection.find_one({'_id': application_oid})
+    return jsonify({
+        'success': True,
+        'application': _ads_serialize_application(updated),
+    })
+
+
+@application.route('/api/ads/applications', methods=['POST'])
+def create_public_ads_application():
+    data = request.get_json(silent=True) or {}
+    payload = _ads_build_application_payload(data)
+    payload['status'] = 'pending'
+    now = datetime.utcnow()
+    payload['createdAt'] = now
+    payload['updatedAt'] = now
+
+    inserted = ads_applications_collection.insert_one(payload)
+    created = ads_applications_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify({
+        'success': True,
+        'application': _ads_serialize_application(created),
+    }), 201
+
+
+@application.route('/api/admin/ads/settings/<string:cemetery_id>', methods=['GET'])
+def admin_ads_get_settings(cemetery_id):
+    cemetery_oid = _ads_parse_cemetery_object_id(cemetery_id, required=True)
+    cemetery_doc = _ads_find_cemetery(cemetery_oid)
+    if not cemetery_doc:
+        abort(404, description='Cemetery not found')
+
+    meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    return jsonify({
+        'cemeteryId': str(cemetery_oid),
+        'cemeteryName': _clean_str(cemetery_doc.get('name')),
+        'address': _ads_extract_cemetery_address(cemetery_doc),
+        'totalColumns': _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0),
+        'priceUah': _ads_clean_int(meta.get('priceUah'), 'priceUah', default=0),
+        'maxColumnsAds': _ads_clean_int(meta.get('maxColumnsAds'), 'maxColumnsAds', default=0),
+        'maxPagesAds': _ads_clean_int(meta.get('maxPagesAds'), 'maxPagesAds', default=0),
+    })
+
+
+@application.route('/api/admin/ads/settings/<string:cemetery_id>', methods=['PUT'])
+def admin_ads_upsert_settings(cemetery_id):
+    cemetery_oid = _ads_parse_cemetery_object_id(cemetery_id, required=True)
+    cemetery_doc = _ads_find_cemetery(cemetery_oid)
+    if not cemetery_doc:
+        abort(404, description='Cemetery not found')
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        abort(400, description='Body must be a JSON object')
+
+    allowed_fields = {'maxColumnsAds', 'maxPagesAds'}
+    unknown = set(data.keys()) - allowed_fields
+    if unknown:
+        abort(400, description=f'Unsupported fields: {", ".join(sorted(unknown))}')
+
+    update_fields = {}
+    if 'maxColumnsAds' in data:
+        update_fields['maxColumnsAds'] = max(_ads_clean_int(data.get('maxColumnsAds'), 'maxColumnsAds', default=0), 0)
+    if 'maxPagesAds' in data:
+        update_fields['maxPagesAds'] = max(_ads_clean_int(data.get('maxPagesAds'), 'maxPagesAds', default=0), 0)
+    if not update_fields:
+        abort(400, description='Nothing to update')
+
+    update_fields['updatedAt'] = datetime.utcnow()
+    ads_columns_meta_collection.update_one(
+        {'cemeteryId': cemetery_oid},
+        {'$set': update_fields, '$setOnInsert': {'cemeteryId': cemetery_oid, 'createdAt': datetime.utcnow()}},
+        upsert=True
+    )
+
+    meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    return jsonify({
+        'cemeteryId': str(cemetery_oid),
+        'cemeteryName': _clean_str(cemetery_doc.get('name')),
+        'address': _ads_extract_cemetery_address(cemetery_doc),
+        'totalColumns': _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0),
+        'priceUah': _ads_clean_int(meta.get('priceUah'), 'priceUah', default=0),
+        'maxColumnsAds': _ads_clean_int(meta.get('maxColumnsAds'), 'maxColumnsAds', default=0),
+        'maxPagesAds': _ads_clean_int(meta.get('maxPagesAds'), 'maxPagesAds', default=0),
+    })
+
+
 ADMIN_CHURCH_STATUSES = {'Активний', 'Неактивний'}
 DAY_ID_TO_WEEKDAY = {
     'sun': 0,
@@ -2969,6 +3819,7 @@ ADMIN_CHURCH_ALLOWED_FIELDS = {
     'taxCode',
     'recipientName',
     'botCode',
+    'telegramChatId',
 }
 
 
@@ -3178,6 +4029,7 @@ def _normalize_admin_church(church):
         'taxCode': _clean_str(church.get('taxCode')),
         'recipientName': _clean_str(church.get('recipientName')),
         'botCode': _clean_str(church.get('botCode')),
+        'telegramChatId': _clean_str(church.get('telegramChatId')),
         'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
         'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
     }
@@ -3278,6 +4130,9 @@ def _build_admin_church_payload(data, partial=False):
     if 'botCode' in data:
         payload['botCode'] = _clean_str(data.get('botCode'))
 
+    if 'telegramChatId' in data:
+        payload['telegramChatId'] = _clean_str(data.get('telegramChatId'))
+
     if 'contacts' in payload and payload['contacts']:
         if not payload.get('contactPerson'):
             payload['contactPerson'] = payload['contacts'][0].get('person', '')
@@ -3339,6 +4194,7 @@ def _build_admin_church_payload(data, partial=False):
         payload.setdefault('taxCode', '')
         payload.setdefault('recipientName', '')
         payload.setdefault('botCode', '')
+        payload.setdefault('telegramChatId', '')
 
         if 'location' not in payload and (_location_write_is_canonical() or _location_write_is_dual()):
             payload['location'] = normalize_location_core({
@@ -4136,6 +4992,683 @@ def admin_notes_church_details():
             'fallbackReason': sorted(fallback_reasons),
         },
     })
+
+
+ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS = 'in_progress'
+ADMIN_NOTE_PAYMENTS_STATUS_AWAITING_CONFIRMATION = 'awaiting_confirmation'
+ADMIN_NOTE_PAYMENTS_STATUS_FINALIZABLE = 'finalizable'
+ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED = 'completed'
+ADMIN_NOTE_PAYMENTS_DEFAULT_BALANCE = 48500
+ADMIN_NOTE_PAYMENTS_MONTH_LABELS = {
+    1: 'Січень',
+    2: 'Лютий',
+    3: 'Березень',
+    4: 'Квітень',
+    5: 'Травень',
+    6: 'Червень',
+    7: 'Липень',
+    8: 'Серпень',
+    9: 'Вересень',
+    10: 'Жовтень',
+    11: 'Листопад',
+    12: 'Грудень',
+}
+TELEGRAM_BOT_TOKEN = _clean_str(os.environ.get('TELEGRAM_BOT_TOKEN'))
+
+
+def _admin_note_payments_month_range(year, month):
+    start = datetime(year, month, 1)
+    if month == 12:
+        end = datetime(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end = datetime(year, month + 1, 1) - timedelta(days=1)
+    return start.date(), end.date()
+
+
+def _admin_note_payments_label(year, month):
+    return f"{ADMIN_NOTE_PAYMENTS_MONTH_LABELS.get(month, str(month))} {year}"
+
+
+def _admin_note_payments_parse_amount(value):
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        num = float(value)
+        if num < 0:
+            return 0
+        return int(round(num))
+    cleaned = _clean_str(value).replace('грн', '').replace('ГРН', '').replace(' ', '').replace(',', '.')
+    if not cleaned:
+        return 0
+    match = re.search(r'-?\d+(\.\d+)?', cleaned)
+    if not match:
+        return 0
+    try:
+        parsed = float(match.group(0))
+    except Exception:
+        return 0
+    if parsed < 0:
+        return 0
+    return int(round(parsed))
+
+
+def _admin_note_payments_resolve_liturgy_month_date(liturgy_doc, tzinfo):
+    service_local = _admin_notes_to_local_datetime(liturgy_doc.get('serviceDate'), tzinfo)
+    if isinstance(service_local, datetime):
+        return service_local.date()
+    created_local = _admin_notes_to_local_datetime(liturgy_doc.get('createdAt'), tzinfo)
+    if isinstance(created_local, datetime):
+        return created_local.date()
+    return None
+
+
+def _admin_note_payments_build_church_maps_for_period(start_date, end_date, tzinfo):
+    church_projection = {'name': 1, 'address': 1, 'locality': 1, 'location': 1, 'telegramChatId': 1, 'status': 1}
+    church_docs = list(churches_collection.find({}, church_projection).sort([('name', 1), ('_id', 1)]))
+    church_by_id = {str(doc.get('_id')): doc for doc in church_docs}
+    church_by_name = {}
+    for doc in church_docs:
+        normalized_name = _clean_str(doc.get('name')).casefold()
+        if normalized_name and normalized_name not in church_by_name:
+            church_by_name[normalized_name] = doc
+
+    sums_by_church_id = {str(doc.get('_id')): 0 for doc in church_docs}
+    projection = {'churchId': 1, 'churchName': 1, 'paymentStatus': 1, 'serviceDate': 1, 'createdAt': 1, 'price': 1}
+    cursor = liturgies_collection.find({'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}}, projection)
+    for liturgy_doc in cursor:
+        if not _admin_notes_is_success_payment(liturgy_doc.get('paymentStatus')):
+            continue
+        liturgy_day = _admin_note_payments_resolve_liturgy_month_date(liturgy_doc, tzinfo)
+        if liturgy_day is None or liturgy_day < start_date or liturgy_day > end_date:
+            continue
+        church_doc = _admin_notes_resolve_church_for_liturgy(liturgy_doc, church_by_id, church_by_name)
+        if not church_doc:
+            continue
+        church_id = str(church_doc.get('_id'))
+        sums_by_church_id[church_id] = sums_by_church_id.get(church_id, 0) + _admin_note_payments_parse_amount(liturgy_doc.get('price'))
+
+    return church_docs, sums_by_church_id
+
+
+def _admin_note_payments_row_output(row):
+    confirmation = row.get('confirmation') if isinstance(row.get('confirmation'), dict) else {}
+    receipt_urls = []
+    raw_receipt_urls = row.get('receiptUrls')
+    if isinstance(raw_receipt_urls, list):
+        for item in raw_receipt_urls:
+            normalized_url = _clean_str(item)
+            if normalized_url and normalized_url not in receipt_urls:
+                receipt_urls.append(normalized_url)
+    legacy_receipt_url = _clean_str(row.get('receiptUrl'))
+    if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
+        receipt_urls.append(legacy_receipt_url)
+    return {
+        'id': _clean_str(row.get('id')),
+        'number': int(row.get('number') or 0),
+        'churchId': _clean_str(row.get('churchId')),
+        'churchName': _clean_str(row.get('churchName')),
+        'churchAddress': _clean_str(row.get('churchAddress')),
+        'telegramChatId': _clean_str(row.get('telegramChatId')),
+        'sumAmount': int(row.get('sumAmount') or 0),
+        'receiptUrls': receipt_urls,
+        'receiptUrl': receipt_urls[0] if receipt_urls else '',
+        'paid': bool(row.get('paid')),
+        'paidAt': _clean_str(row.get('paidAt')),
+        'unlocked': bool(row.get('unlocked')),
+        'alert': bool(row.get('alert')),
+        'alertMessage': _clean_str(row.get('alertMessage')),
+        'unlockRequired': bool(row.get('unlockRequired')),
+        'confirmation': {
+            'status': _clean_str(confirmation.get('status')) or 'pending',
+            'deadlineAt': _clean_str(confirmation.get('deadlineAt')),
+            'respondedAt': _clean_str(confirmation.get('respondedAt')),
+            'token': _clean_str(confirmation.get('token')),
+            'autoConfirmed': bool(confirmation.get('autoConfirmed')),
+        },
+    }
+
+
+def _admin_note_payments_recompute_status(doc):
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    if _clean_str(doc.get('status')) == ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED:
+        return ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED
+    if not rows:
+        return ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    if not all(bool(row.get('paid')) for row in rows):
+        return ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    paid_requested_at = _clean_str(doc.get('paidRequestedAt'))
+    if not paid_requested_at:
+        return ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    confirmations = [
+        _clean_str((row.get('confirmation') or {}).get('status')).lower()
+        for row in rows
+    ]
+    if confirmations and all(status == 'yes' for status in confirmations):
+        return ADMIN_NOTE_PAYMENTS_STATUS_FINALIZABLE
+    return ADMIN_NOTE_PAYMENTS_STATUS_AWAITING_CONFIRMATION
+
+
+def _admin_note_payments_apply_auto_confirm(doc):
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    now_utc = datetime.utcnow()
+    changed = False
+    for row in rows:
+        confirmation = row.get('confirmation')
+        if not isinstance(confirmation, dict):
+            continue
+        status = _clean_str(confirmation.get('status')).lower() or 'pending'
+        if status != 'pending':
+            continue
+        deadline = _admin_notes_parse_datetime(confirmation.get('deadlineAt'))
+        if not isinstance(deadline, datetime):
+            continue
+        if deadline <= now_utc:
+            confirmation['status'] = 'yes'
+            confirmation['respondedAt'] = now_utc.isoformat()
+            confirmation['autoConfirmed'] = True
+            changed = True
+    if changed:
+        doc['status'] = _admin_note_payments_recompute_status(doc)
+        doc['updatedAt'] = now_utc
+    return changed
+
+
+def _admin_note_payments_fetch_doc_or_404(payment_id):
+    try:
+        oid = ObjectId(payment_id)
+    except Exception:
+        abort(400, description='Invalid payment id')
+    doc = admin_note_payments_collection.find_one({'_id': oid})
+    if not doc:
+        abort(404, description='Payment month not found')
+    has_auto_confirm_changes = _admin_note_payments_apply_auto_confirm(doc)
+    current_status = _clean_str(doc.get('status')) or ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    recomputed_status = _admin_note_payments_recompute_status(doc)
+    has_status_changes = recomputed_status != current_status
+    if has_status_changes:
+        doc['status'] = recomputed_status
+        doc['updatedAt'] = datetime.utcnow()
+    if has_auto_confirm_changes or has_status_changes:
+        admin_note_payments_collection.update_one(
+            {'_id': oid},
+            {'$set': {'rows': doc.get('rows', []), 'status': doc.get('status'), 'updatedAt': doc.get('updatedAt')}}
+        )
+    return doc
+
+
+def _admin_note_payments_summary_output(doc):
+    period = doc.get('period') if isinstance(doc.get('period'), dict) else {}
+    status = _clean_str(doc.get('status')) or ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    has_alert = any(bool(row.get('alert')) for row in rows)
+    if status == ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED:
+        status_label = 'Завершено'
+    else:
+        status_label = 'В процесі'
+    return {
+        'id': str(doc.get('_id')),
+        'period': {
+            'year': int(period.get('year') or 0),
+            'month': int(period.get('month') or 0),
+            'label': _clean_str(period.get('label')),
+            'startDate': _clean_str(period.get('startDate')),
+            'endDate': _clean_str(period.get('endDate')),
+        },
+        'status': status,
+        'statusLabel': status_label,
+        'hasAlert': has_alert,
+        'rowsTotal': len(rows),
+    }
+
+
+def _admin_note_payments_detail_output(doc):
+    period = doc.get('period') if isinstance(doc.get('period'), dict) else {}
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    status = _clean_str(doc.get('status')) or ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    can_mark_paid = status == ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS and bool(rows) and all(bool(row.get('paid')) for row in rows)
+    can_finalize = status == ADMIN_NOTE_PAYMENTS_STATUS_FINALIZABLE and bool(rows)
+    fop_balance = doc.get('fopBalance') if isinstance(doc.get('fopBalance'), dict) else {}
+    return {
+        'id': str(doc.get('_id')),
+        'period': {
+            'year': int(period.get('year') or 0),
+            'month': int(period.get('month') or 0),
+            'label': _clean_str(period.get('label')),
+            'startDate': _clean_str(period.get('startDate')),
+            'endDate': _clean_str(period.get('endDate')),
+        },
+        'status': status,
+        'rows': [_admin_note_payments_row_output(row) for row in rows],
+        'fopBalance': {
+            'initial': int(fop_balance.get('initial') or 0),
+            'current': int(fop_balance.get('current') or 0),
+            'lastCheckedAt': _clean_str(fop_balance.get('lastCheckedAt')),
+        },
+        'canMarkPaid': can_mark_paid,
+        'canFinalize': can_finalize,
+        'paidRequestedAt': _clean_str(doc.get('paidRequestedAt')),
+        'completedAt': _clean_str(doc.get('completedAt')),
+    }
+
+
+def _admin_note_payments_refresh_rows_from_liturgies(doc, tzinfo):
+    period = doc.get('period') if isinstance(doc.get('period'), dict) else {}
+    year = int(period.get('year') or 0)
+    month = int(period.get('month') or 0)
+    if year < 1900 or month < 1 or month > 12:
+        return
+    start_date, end_date = _admin_note_payments_month_range(year, month)
+    church_docs, sums_by_church_id = _admin_note_payments_build_church_maps_for_period(start_date, end_date, tzinfo)
+    church_by_id = {str(doc_item.get('_id')): doc_item for doc_item in church_docs}
+
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    for row in rows:
+        church_id = _clean_str(row.get('churchId'))
+        row['sumAmount'] = int(sums_by_church_id.get(church_id, 0))
+        church_doc = church_by_id.get(church_id)
+        if church_doc:
+            display = _admin_notes_church_display(church_doc)
+            row['churchName'] = display.get('name', '')
+            row['churchAddress'] = display.get('address', '')
+            row['telegramChatId'] = _clean_str(church_doc.get('telegramChatId'))
+
+
+def _admin_note_payments_send_telegram_message(chat_id, text):
+    if not TELEGRAM_BOT_TOKEN:
+        return False, 'TELEGRAM_BOT_TOKEN is not configured'
+    if not chat_id:
+        return False, 'telegramChatId is empty'
+
+    endpoint = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
+    payload = {'chat_id': chat_id, 'text': text}
+    try:
+        response = requests.post(endpoint, json=payload, timeout=8)
+        if response.ok:
+            return True, ''
+        return False, f'Telegram API error ({response.status_code})'
+    except requests.RequestException as exc:
+        return False, str(exc)
+
+
+@application.route('/api/admin/notes/payments', methods=['GET'])
+def admin_note_payments_list():
+    year_raw = _clean_str(request.args.get('year'))
+    query = {}
+    if year_raw:
+        try:
+            year = int(year_raw)
+        except Exception:
+            abort(400, description='`year` must be an integer')
+        query['period.year'] = year
+
+    docs = list(admin_note_payments_collection.find(query).sort([('period.year', -1), ('period.month', -1)]))
+    out = []
+    for doc in docs:
+        if _admin_note_payments_apply_auto_confirm(doc):
+            admin_note_payments_collection.update_one(
+                {'_id': doc.get('_id')},
+                {'$set': {'rows': doc.get('rows', []), 'status': doc.get('status'), 'updatedAt': doc.get('updatedAt')}}
+            )
+        out.append(_admin_note_payments_summary_output(doc))
+    return jsonify({'months': out})
+
+
+@application.route('/api/admin/notes/payments/create-previous-month', methods=['POST'])
+def admin_note_payments_create_previous_month():
+    now = datetime.utcnow()
+    previous_month_anchor = now.replace(day=1) - timedelta(days=1)
+    year = previous_month_anchor.year
+    month = previous_month_anchor.month
+    start_date, end_date = _admin_note_payments_month_range(year, month)
+    if admin_note_payments_collection.find_one({'period.year': year, 'period.month': month}):
+        abort(409, description='Payment for this month already exists')
+
+    tzinfo = ZoneInfo('Europe/Kyiv') if ZoneInfo else timezone.utc
+    church_docs, sums_by_church_id = _admin_note_payments_build_church_maps_for_period(start_date, end_date, tzinfo)
+
+    rows = []
+    for index, church_doc in enumerate(church_docs, start=1):
+        display = _admin_notes_church_display(church_doc)
+        rows.append({
+            'id': secrets.token_hex(8),
+            'number': index,
+            'churchId': str(church_doc.get('_id')),
+            'churchName': display.get('name', ''),
+            'churchAddress': display.get('address', ''),
+            'telegramChatId': _clean_str(church_doc.get('telegramChatId')),
+            'sumAmount': int(sums_by_church_id.get(str(church_doc.get('_id')), 0)),
+            'receiptUrls': [],
+            'receiptUrl': '',
+            'paid': False,
+            'paidAt': None,
+            'unlocked': index == 1,
+            'alert': False,
+            'alertMessage': '',
+            'unlockRequired': False,
+            'confirmation': {
+                'status': 'pending',
+                'deadlineAt': None,
+                'respondedAt': None,
+                'token': '',
+                'autoConfirmed': False,
+            },
+        })
+
+    doc = {
+        'period': {
+            'year': year,
+            'month': month,
+            'label': _admin_note_payments_label(year, month),
+            'startDate': start_date.isoformat(),
+            'endDate': end_date.isoformat(),
+        },
+        'status': ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS,
+        'rows': rows,
+        'fopBalance': {
+            'initial': ADMIN_NOTE_PAYMENTS_DEFAULT_BALANCE,
+            'current': ADMIN_NOTE_PAYMENTS_DEFAULT_BALANCE,
+            'lastCheckedAt': now.isoformat(),
+        },
+        'paidRequestedAt': None,
+        'completedAt': None,
+        'createdAt': now,
+        'updatedAt': now,
+    }
+    inserted = admin_note_payments_collection.insert_one(doc)
+    created = admin_note_payments_collection.find_one({'_id': inserted.inserted_id})
+    return jsonify({'month': _admin_note_payments_summary_output(created)}), 201
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>', methods=['GET'])
+def admin_note_payments_get(payment_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    return jsonify({'month': _admin_note_payments_detail_output(doc)})
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/refresh-sums', methods=['POST'])
+def admin_note_payments_refresh_sums(payment_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    tzinfo = ZoneInfo('Europe/Kyiv') if ZoneInfo else timezone.utc
+    _admin_note_payments_refresh_rows_from_liturgies(doc, tzinfo)
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': doc.get('rows', []), 'updatedAt': doc.get('updatedAt')}}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc)})
+
+
+def _admin_note_payments_find_row(doc, row_id):
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    for index, row in enumerate(rows):
+        if _clean_str(row.get('id')) == row_id:
+            return rows, index, row
+    abort(404, description='Payment row not found')
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/rows/<string:row_id>/mark-paid', methods=['POST'])
+def admin_note_payments_mark_row_paid(payment_id, row_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    if _clean_str(doc.get('status')) == ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED:
+        abort(400, description='Completed month cannot be changed')
+
+    payload = request.get_json(silent=True) or {}
+    checked = payload.get('checked')
+    checked = True if checked is None else bool(checked)
+    if not checked:
+        abort(400, description='Unchecking is not supported')
+
+    rows, index, row = _admin_note_payments_find_row(doc, row_id)
+    if not bool(row.get('unlocked')):
+        abort(400, description='Row is locked')
+
+    balance = doc.get('fopBalance') if isinstance(doc.get('fopBalance'), dict) else {}
+    current_balance = int(balance.get('current') or 0)
+    expected_balance = current_balance - int(row.get('sumAmount') or 0)
+    provided_current_balance = payload.get('currentBalance')
+    has_mismatch = False
+
+    if provided_current_balance is not None and str(provided_current_balance).strip() != '':
+        try:
+            provided_numeric = int(round(float(provided_current_balance)))
+        except Exception:
+            abort(400, description='`currentBalance` must be numeric')
+        balance['current'] = provided_numeric
+        has_mismatch = provided_numeric != expected_balance
+    else:
+        balance['current'] = expected_balance
+
+    balance['lastCheckedAt'] = datetime.utcnow().isoformat()
+    row['paid'] = True
+    row['paidAt'] = datetime.utcnow().isoformat()
+
+    if has_mismatch:
+        row['alert'] = True
+        row['unlockRequired'] = True
+        row['alertMessage'] = 'Баланс не відповідає очікуваному списанню'
+    else:
+        row['alert'] = False
+        row['unlockRequired'] = False
+        row['alertMessage'] = ''
+        if index + 1 < len(rows):
+            rows[index + 1]['unlocked'] = True
+
+    doc['fopBalance'] = balance
+    doc['status'] = _admin_note_payments_recompute_status(doc)
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {
+            'rows': rows,
+            'fopBalance': doc.get('fopBalance'),
+            'status': doc.get('status'),
+            'updatedAt': doc.get('updatedAt'),
+        }}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc)})
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/rows/<string:row_id>/unlock', methods=['POST'])
+def admin_note_payments_unlock_row(payment_id, row_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    rows, index, row = _admin_note_payments_find_row(doc, row_id)
+    row['unlockRequired'] = False
+    row['alert'] = False
+    row['alertMessage'] = ''
+    if index + 1 < len(rows):
+        rows[index + 1]['unlocked'] = True
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': rows, 'updatedAt': doc.get('updatedAt')}}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc)})
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/rows/<string:row_id>/receipt', methods=['POST'])
+def admin_note_payments_set_receipt(payment_id, row_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    payload = request.get_json(silent=True) or {}
+    receipt_url = _clean_str(payload.get('receiptUrl'))
+    if not receipt_url:
+        abort(400, description='`receiptUrl` is required')
+    rows, _, row = _admin_note_payments_find_row(doc, row_id)
+    receipt_urls = []
+    raw_receipt_urls = row.get('receiptUrls')
+    if isinstance(raw_receipt_urls, list):
+        for item in raw_receipt_urls:
+            normalized_url = _clean_str(item)
+            if normalized_url and normalized_url not in receipt_urls:
+                receipt_urls.append(normalized_url)
+    legacy_receipt_url = _clean_str(row.get('receiptUrl'))
+    if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
+        receipt_urls.append(legacy_receipt_url)
+    if receipt_url not in receipt_urls:
+        receipt_urls.append(receipt_url)
+    row['receiptUrls'] = receipt_urls
+    row['receiptUrl'] = receipt_urls[0] if receipt_urls else ''
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': rows, 'updatedAt': doc.get('updatedAt')}}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc)})
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/rows/<string:row_id>/receipt', methods=['DELETE'])
+def admin_note_payments_delete_receipt(payment_id, row_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    payload = request.get_json(silent=True) or {}
+    receipt_url = _clean_str(payload.get('receiptUrl') or request.args.get('receiptUrl'))
+    if not receipt_url:
+        abort(400, description='`receiptUrl` is required')
+    rows, _, row = _admin_note_payments_find_row(doc, row_id)
+    receipt_urls = []
+    raw_receipt_urls = row.get('receiptUrls')
+    if isinstance(raw_receipt_urls, list):
+        for item in raw_receipt_urls:
+            normalized_url = _clean_str(item)
+            if normalized_url and normalized_url not in receipt_urls:
+                receipt_urls.append(normalized_url)
+    legacy_receipt_url = _clean_str(row.get('receiptUrl'))
+    if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
+        receipt_urls.append(legacy_receipt_url)
+
+    if receipt_url not in receipt_urls:
+        abort(404, description='Receipt file not found')
+
+    filtered_urls = [url for url in receipt_urls if url != receipt_url]
+    row['receiptUrls'] = filtered_urls
+    row['receiptUrl'] = filtered_urls[0] if filtered_urls else ''
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': rows, 'updatedAt': doc.get('updatedAt')}}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc)})
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/mark-paid', methods=['POST'])
+def admin_note_payments_mark_paid(payment_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    if _clean_str(doc.get('status')) != ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS:
+        abort(400, description='Month can be marked paid only in in_progress status')
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    if not rows or not all(bool(row.get('paid')) for row in rows):
+        abort(400, description='All rows must be marked as paid')
+
+    now = datetime.utcnow()
+    callback_base = _clean_str(PUBLIC_WEB_BASE_URL) or _clean_str(request.host_url).rstrip('/')
+    telegram_errors = []
+    for row in rows:
+        confirmation = row.get('confirmation')
+        if not isinstance(confirmation, dict):
+            confirmation = {}
+            row['confirmation'] = confirmation
+        if not _clean_str(confirmation.get('token')):
+            confirmation['token'] = secrets.token_urlsafe(20)
+        confirmation['status'] = _clean_str(confirmation.get('status')).lower() or 'pending'
+        confirmation['deadlineAt'] = (now + timedelta(days=7)).isoformat()
+        confirmation['respondedAt'] = None
+        confirmation['autoConfirmed'] = False
+
+        yes_url = f"{callback_base}/api/admin/notes/payments/confirm/{confirmation['token']}?answer=yes"
+        no_url = f"{callback_base}/api/admin/notes/payments/confirm/{confirmation['token']}?answer=no"
+        text = (
+            f"Проплата за {_clean_str((doc.get('period') or {}).get('label'))}: "
+            f"{int(row.get('sumAmount') or 0)} грн.\n"
+            f"Церква: {_clean_str(row.get('churchName'))}\n"
+            f"Підтвердити отримання: Так — {yes_url} | Ні — {no_url}"
+        )
+        ok, error = _admin_note_payments_send_telegram_message(_clean_str(row.get('telegramChatId')), text)
+        if not ok:
+            telegram_errors.append({
+                'rowId': _clean_str(row.get('id')),
+                'churchName': _clean_str(row.get('churchName')),
+                'error': error,
+            })
+
+    doc['paidRequestedAt'] = now.isoformat()
+    doc['status'] = _admin_note_payments_recompute_status(doc)
+    doc['updatedAt'] = now
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {
+            'rows': rows,
+            'paidRequestedAt': doc.get('paidRequestedAt'),
+            'status': doc.get('status'),
+            'updatedAt': doc.get('updatedAt'),
+            'telegramErrors': telegram_errors,
+        }}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc), 'telegramErrors': telegram_errors})
+
+
+@application.route('/api/admin/notes/payments/confirm/<string:token>', methods=['GET', 'POST'])
+def admin_note_payments_confirm(token):
+    cleaned_token = _clean_str(token)
+    if not cleaned_token:
+        abort(400, description='Invalid token')
+
+    answer = _clean_str(request.args.get('answer'))
+    if request.method == 'POST':
+        payload = request.get_json(silent=True) or {}
+        answer = _clean_str(payload.get('answer') or answer)
+    answer = answer.lower()
+    if answer not in {'yes', 'no'}:
+        abort(400, description='`answer` must be yes or no')
+
+    doc = admin_note_payments_collection.find_one({'rows.confirmation.token': cleaned_token})
+    if not doc:
+        abort(404, description='Confirmation token not found')
+
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    row_found = False
+    for row in rows:
+        confirmation = row.get('confirmation')
+        if not isinstance(confirmation, dict):
+            continue
+        if _clean_str(confirmation.get('token')) != cleaned_token:
+            continue
+        confirmation['status'] = answer
+        confirmation['respondedAt'] = datetime.utcnow().isoformat()
+        confirmation['autoConfirmed'] = False
+        row_found = True
+        break
+    if not row_found:
+        abort(404, description='Confirmation token not found')
+
+    doc['rows'] = rows
+    doc['status'] = _admin_note_payments_recompute_status(doc)
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': rows, 'status': doc.get('status'), 'updatedAt': doc.get('updatedAt')}}
+    )
+    return jsonify({'ok': True, 'status': doc.get('status')})
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/finalize', methods=['POST'])
+def admin_note_payments_finalize(payment_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    status = _admin_note_payments_recompute_status(doc)
+    if status != ADMIN_NOTE_PAYMENTS_STATUS_FINALIZABLE:
+        abort(400, description='Month cannot be finalized until all confirmations are "yes"')
+    now = datetime.utcnow()
+    doc['status'] = ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED
+    doc['completedAt'] = now.isoformat()
+    doc['updatedAt'] = now
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {
+            'status': doc.get('status'),
+            'completedAt': doc.get('completedAt'),
+            'updatedAt': doc.get('updatedAt'),
+        }}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc)})
 
 
 ADMIN_RITUAL_SERVICE_STATUSES = {'Активний', 'Не активний'}
@@ -7724,6 +9257,564 @@ def admin_refresh_premium_orders_tracking():
         'terminal': terminal_count,
         'missingTtn': missing_ttn_count,
         'items': outcomes,
+    })
+
+
+FINANCE_TABS = [
+    {'id': 'main', 'label': 'Головна'},
+    {'id': 'plaques', 'label': 'Таблички'},
+    {'id': 'ritual_services', 'label': 'Ритуальні послуги'},
+    {'id': 'notes', 'label': 'Електронні записки'},
+    {'id': 'ads', 'label': 'Реклама'},
+    {'id': 'premium_qr', 'label': 'Преміум QR'},
+]
+FINANCE_TAB_IDS = {item['id'] for item in FINANCE_TABS}
+FINANCE_ADS_SURFACE_LABELS = {
+    'columns': 'Стовпчики',
+    'plaques': 'Таблички',
+    'pages': 'Сторінка',
+}
+
+
+def _finance_tab_label(tab_id):
+    cleaned = _clean_str(tab_id)
+    for item in FINANCE_TABS:
+        if item['id'] == cleaned:
+            return item['label']
+    return ''
+
+
+def _finance_resolve_timezone():
+    timezone_name = _clean_str(DEFAULT_FINANCE_TIMEZONE) or 'Europe/Kyiv'
+    alias_map = {'Europe/Kiev': 'Europe/Kyiv'}
+    timezone_name = alias_map.get(timezone_name, timezone_name)
+    if ZoneInfo is None:
+        return timezone.utc, 'UTC'
+    try:
+        return ZoneInfo(timezone_name), timezone_name
+    except Exception:
+        return ZoneInfo('Europe/Kyiv'), 'Europe/Kyiv'
+
+
+def _finance_parse_bool(value):
+    normalized = _clean_str(value).lower()
+    return normalized in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _finance_parse_date_param(value, field_name):
+    cleaned = _clean_str(value)
+    if not cleaned:
+        return None
+    try:
+        return datetime.strptime(cleaned, '%Y-%m-%d').date()
+    except Exception:
+        abort(400, description=f'`{field_name}` must be YYYY-MM-DD')
+
+
+def _finance_parse_any_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            if cleaned.endswith('Z'):
+                return datetime.fromisoformat(cleaned.replace('Z', '+00:00'))
+            return datetime.fromisoformat(cleaned)
+        except Exception:
+            return None
+    return None
+
+
+def _finance_to_local_date(value, tzinfo):
+    dt = _finance_parse_any_datetime(value)
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        return dt.astimezone(tzinfo).date()
+    except Exception:
+        return dt.date()
+
+
+def _finance_is_in_period(local_date, date_from, date_to):
+    if local_date is None:
+        return False
+    if date_from and local_date < date_from:
+        return False
+    if date_to and local_date > date_to:
+        return False
+    return True
+
+
+def _finance_parse_webhook_amount_minor(raw_amount):
+    if raw_amount is None:
+        return None
+    if isinstance(raw_amount, bool):
+        return None
+    if isinstance(raw_amount, (int, float)):
+        try:
+            return int(round(float(raw_amount)))
+        except Exception:
+            return None
+    if isinstance(raw_amount, str):
+        cleaned = raw_amount.strip().replace(' ', '')
+        if not cleaned:
+            return None
+        cleaned = cleaned.replace(',', '.')
+        try:
+            return int(round(float(cleaned)))
+        except Exception:
+            return None
+    return None
+
+
+def _finance_extract_webhook_amount_uah(webhook_data):
+    if not isinstance(webhook_data, dict):
+        return None
+    amount_minor = _finance_parse_webhook_amount_minor(webhook_data.get('amount'))
+    if amount_minor is None:
+        return None
+    return int(round(amount_minor / 100.0))
+
+
+def _finance_extract_webhook_datetime(webhook_data):
+    if not isinstance(webhook_data, dict):
+        return None
+    for key in ('modifiedDate', 'createdDate', 'date'):
+        parsed = _finance_parse_any_datetime(webhook_data.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def _finance_datetime_sort_key(local_date, event_dt):
+    if local_date:
+        if event_dt and isinstance(event_dt, datetime):
+            dt = event_dt
+            if dt.tzinfo is not None:
+                try:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                except Exception:
+                    dt = dt.replace(tzinfo=None)
+            return datetime.combine(local_date, dt.time())
+        return datetime.combine(local_date, datetime.min.time())
+    return datetime.min
+
+
+def _finance_build_row(
+    *,
+    row_id='',
+    tab_id='',
+    category_label='',
+    amount_uah=0,
+    local_date=None,
+    event_dt=None,
+    source_name='',
+    source_details='',
+    source_avatar_url='',
+    contact='',
+    status='',
+    path_label='',
+    period_label='',
+):
+    safe_amount = max(int(amount_uah or 0), 0)
+    date_label = local_date.strftime('%d.%m.%Y') if local_date else ''
+    return {
+        'id': _clean_str(row_id),
+        'tab': _clean_str(tab_id),
+        'tabLabel': _finance_tab_label(tab_id),
+        'categoryLabel': _clean_str(category_label),
+        'amountUah': safe_amount,
+        'amountLabel': f'{safe_amount} грн',
+        'eventDate': date_label,
+        'sourceName': _clean_str(source_name),
+        'sourceDetails': _clean_str(source_details),
+        'sourceAvatarUrl': _clean_str(source_avatar_url),
+        'contact': _clean_str(contact),
+        'status': _clean_str(status),
+        'pathLabel': _clean_str(path_label),
+        'periodLabel': _clean_str(period_label),
+        'sortKey': _finance_datetime_sort_key(local_date, event_dt).isoformat(),
+    }
+
+
+def _finance_matches_search(row, search_query):
+    query = _clean_str(search_query).lower()
+    if not query:
+        return True
+    hay = ' '.join([
+        _clean_str(row.get('categoryLabel')).lower(),
+        _clean_str(row.get('sourceName')).lower(),
+        _clean_str(row.get('sourceDetails')).lower(),
+        _clean_str(row.get('contact')).lower(),
+        _clean_str(row.get('status')).lower(),
+        _clean_str(row.get('pathLabel')).lower(),
+        _clean_str(row.get('periodLabel')).lower(),
+        _clean_str(row.get('eventDate')).lower(),
+        _clean_str(row.get('amountLabel')).lower(),
+    ])
+    return query in hay
+
+
+def _finance_best_effort_refresh_premium_tracking():
+    now = datetime.utcnow()
+    query = {
+        'ttn': {'$nin': ['', None]},
+        'status': {'$nin': list(PREMIUM_ORDER_TERMINAL_STATUSES)},
+        '$or': [
+            {'npNextCheckAt': {'$exists': False}},
+            {'npNextCheckAt': None},
+            {'npNextCheckAt': {'$lte': now}},
+        ],
+    }
+    docs = list(
+        premium_orders_collection
+        .find(query)
+        .sort([('npLastCheckedAt', 1), ('createdAt', 1), ('_id', 1)])
+        .limit(NP_TRACKING_BATCH_LIMIT_DEFAULT)
+    )
+    if not docs:
+        return
+    max_workers = max(1, min(NP_TRACKING_BATCH_CONCURRENCY, len(docs)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_premium_refresh_tracking_for_order, doc, force=False) for doc in docs]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                # Tracking refresh is best-effort only.
+                pass
+
+
+def _finance_collect_premium_rows(tzinfo, date_from, date_to):
+    rows = []
+    docs = premium_orders_collection.find({'status': 'received'}).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
+    for doc in docs:
+        webhook_data = doc.get('webhookData') if isinstance(doc.get('webhookData'), dict) else {}
+        amount_uah = _finance_extract_webhook_amount_uah(webhook_data)
+        if amount_uah is None:
+            amount_uah = 0
+        event_dt = (
+            _finance_extract_webhook_datetime(webhook_data)
+            or _finance_parse_any_datetime(doc.get('npDeliveredAt'))
+            or _finance_parse_any_datetime(doc.get('updatedAt'))
+            or _finance_parse_any_datetime(doc.get('createdAt'))
+        )
+        local_date = _finance_to_local_date(event_dt, tzinfo)
+        if not _finance_is_in_period(local_date, date_from, date_to):
+            continue
+        path_label = _clean_str(doc.get('pathType')) or 'Сайт'
+        rows.append(
+            _finance_build_row(
+                row_id=f"premium:{doc.get('_id')}",
+                tab_id='premium_qr',
+                category_label=f'Преміум QR | {path_label}',
+                amount_uah=amount_uah,
+                local_date=local_date,
+                event_dt=event_dt,
+                source_name=_clean_str(doc.get('personName')) or _clean_str(doc.get('customerName')),
+                source_details=_clean_str(doc.get('cemetery')) or _clean_str(doc.get('cemeteryAddress')),
+                contact=_clean_str(doc.get('customerPhone')),
+                status='Отримано',
+                path_label=path_label,
+            )
+        )
+    return rows
+
+
+def _finance_collect_plaques_rows(tzinfo, date_from, date_to):
+    rows = []
+    docs = plaques_moderation_collection.find({}).sort([('createdAt', -1), ('_id', -1)])
+    for doc in docs:
+        webhook_data = doc.get('webhookData') if isinstance(doc.get('webhookData'), dict) else {}
+        amount_uah = _finance_extract_webhook_amount_uah(webhook_data)
+        if amount_uah is None:
+            amount_uah = FINANCE_FALLBACK_PLAQUE_UAH
+        event_dt = _finance_extract_webhook_datetime(webhook_data) or _finance_parse_any_datetime(doc.get('createdAt'))
+        local_date = _finance_to_local_date(event_dt, tzinfo)
+        if not _finance_is_in_period(local_date, date_from, date_to):
+            continue
+        path_label = _admin_plaques_path_label(doc)
+        rows.append(
+            _finance_build_row(
+                row_id=f"plaques:{doc.get('_id')}",
+                tab_id='plaques',
+                category_label='Таблички',
+                amount_uah=amount_uah,
+                local_date=local_date,
+                event_dt=event_dt,
+                source_name=_clean_str(doc.get('name')),
+                source_details=_clean_str(doc.get('cemetery')) or _clean_str(doc.get('area')),
+                contact=_clean_str(doc.get('phone')),
+                status='Заявка',
+                path_label=path_label,
+            )
+        )
+    return rows
+
+
+def _finance_collect_ritual_rows(tzinfo, date_from, date_to):
+    rows = []
+    services = ritual_services_collection.find({}).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
+    for service_doc in services:
+        service_name = _clean_str(service_doc.get('name'))
+        service_logo = _clean_str(service_doc.get('logo'))
+        status = _normalize_ritual_service_status(service_doc.get('status'))
+        contacts = _clean_ritual_contacts_loose(service_doc.get('contacts'))
+        contact_phone = ''
+        if contacts:
+            contact_phone = _clean_str(contacts[0].get('phone'))
+        payments = _clean_ritual_payments(service_doc.get('payments'))
+        for index, payment in enumerate(payments):
+            webhook_data = payment.get('webhookData') if isinstance(payment.get('webhookData'), dict) else {}
+            amount_uah = _finance_extract_webhook_amount_uah(webhook_data)
+            if amount_uah is None:
+                amount_uah = FINANCE_FALLBACK_RITUAL_PAYMENT_UAH
+            event_dt = (
+                _finance_extract_webhook_datetime(webhook_data)
+                or _finance_parse_any_datetime(payment.get('createdAt'))
+                or _finance_parse_any_datetime(service_doc.get('updatedAt'))
+                or _finance_parse_any_datetime(service_doc.get('createdAt'))
+            )
+            local_date = _finance_to_local_date(event_dt, tzinfo)
+            if not _finance_is_in_period(local_date, date_from, date_to):
+                continue
+            period_label = _clean_str(payment.get('period'))
+            rows.append(
+                _finance_build_row(
+                    row_id=f"ritual:{service_doc.get('_id')}:{index}",
+                    tab_id='ritual_services',
+                    category_label='Ритуальні послуги | Проплата',
+                    amount_uah=amount_uah,
+                    local_date=local_date,
+                    event_dt=event_dt,
+                    source_name=service_name,
+                    source_details=_clean_str(service_doc.get('address')),
+                    source_avatar_url=service_logo,
+                    contact=contact_phone,
+                    status=status,
+                    period_label=period_label,
+                )
+            )
+    return rows
+
+
+def _finance_collect_notes_rows(tzinfo, date_from, date_to):
+    rows = []
+    projection = {'churchName': 1, 'personName': 1, 'phone': 1, 'price': 1, 'paymentStatus': 1, 'createdAt': 1, 'serviceDate': 1, 'webhookData': 1}
+    docs = liturgies_collection.find({'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}}, projection).sort([('createdAt', -1), ('_id', -1)])
+    
+    # Build church mapping for address lookup
+    church_projection = {'name': 1, 'address': 1, 'locality': 1, 'location': 1, 'telegramChatId': 1, 'status': 1}
+    church_docs = list(churches_collection.find({}, church_projection).sort([('name', 1), ('_id', 1)]))
+    church_by_id = {str(doc.get('_id')): doc for doc in church_docs}
+    church_by_name = {}
+    for doc in church_docs:
+        normalized_name = _clean_str(doc.get('name')).casefold()
+        if normalized_name and normalized_name not in church_by_name:
+            church_by_name[normalized_name] = doc
+    
+    for doc in docs:
+        if not _admin_notes_is_success_payment(doc.get('paymentStatus')):
+            continue
+            
+        webhook_data = doc.get('webhookData') if isinstance(doc.get('webhookData'), dict) else {}
+        amount_uah = _finance_extract_webhook_amount_uah(webhook_data)
+        if amount_uah is None:
+            amount_uah = int(round(_admin_note_payments_parse_amount(doc.get('price'))))
+        event_dt = (
+            _finance_extract_webhook_datetime(webhook_data)
+            or _finance_parse_any_datetime(doc.get('createdAt'))
+            or _finance_parse_any_datetime(doc.get('serviceDate'))
+        )
+        local_date = _finance_to_local_date(event_dt, tzinfo)
+        if not _finance_is_in_period(local_date, date_from, date_to):
+            continue
+        
+        # Get church address instead of person name
+        church_address = ''
+        raw_church_id = _clean_str(doc.get('churchId'))
+        raw_church_name = _clean_str(doc.get('churchName'))
+        
+        if raw_church_id and raw_church_id in church_by_id:
+            church_address = church_by_id[raw_church_id].get('address', '')
+        elif raw_church_name:
+            church_doc = church_by_name.get(raw_church_name.casefold())
+            if church_doc:
+                church_address = church_doc.get('address', '')
+        
+        rows.append(
+            _finance_build_row(
+                row_id=f"notes:{doc.get('_id')}",
+                tab_id='notes',
+                category_label='Електронні записки',
+                amount_uah=amount_uah,
+                local_date=local_date,
+                event_dt=event_dt,
+                source_name=_clean_str(doc.get('churchName')) or 'Церква',
+                source_details=church_address,
+                contact=_clean_str(doc.get('phone')),
+                status='Оплачено',
+            )
+        )
+    return rows
+
+
+def _finance_collect_ads_rows(tzinfo, date_from, date_to):
+    rows = []
+    docs = ads_campaigns_collection.find({'status': 'active'}).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
+    for doc in docs:
+        webhook_data = doc.get('webhookData') if isinstance(doc.get('webhookData'), dict) else {}
+        amount_uah = _finance_extract_webhook_amount_uah(webhook_data)
+        if amount_uah is None:
+            amount_uah = _ads_clean_int(doc.get('priceUah'), 'priceUah', default=0)
+        event_dt = (
+            _finance_extract_webhook_datetime(webhook_data)
+            or _finance_parse_any_datetime(doc.get('verifiedAt'))
+            or _finance_parse_any_datetime(doc.get('updatedAt'))
+            or _finance_parse_any_datetime(doc.get('createdAt'))
+        )
+        local_date = _finance_to_local_date(event_dt, tzinfo)
+        if not _finance_is_in_period(local_date, date_from, date_to):
+            continue
+        surface_type = _ads_normalize_surface_type(doc.get('surfaceType'), default='columns')
+        surface_label = FINANCE_ADS_SURFACE_LABELS.get(surface_type, 'Стовпчики')
+        period_start = _clean_str(doc.get('periodStart'))
+        period_end = _clean_str(doc.get('periodEnd'))
+        period_label = ''
+        if period_start and period_end:
+            period_label = f'{period_start} - {period_end}'
+        rows.append(
+            _finance_build_row(
+                row_id=f"ads:{doc.get('_id')}",
+                tab_id='ads',
+                category_label=f'Реклама {surface_label} | Проплата',
+                amount_uah=amount_uah,
+                local_date=local_date,
+                event_dt=event_dt,
+                source_name=_clean_str(doc.get('companyName')),
+                source_details=_clean_str(doc.get('address')),
+                contact=_clean_str(doc.get('phone')),
+                status=_ads_campaign_status_label(_ads_normalize_campaign_status(doc.get('status'))),
+                path_label=surface_label,
+                period_label=period_label,
+            )
+        )
+    return rows
+
+
+def _finance_collect_rows(date_from=None, date_to=None):
+    tzinfo, timezone_name = _finance_resolve_timezone()
+    by_tab = {
+        'plaques': _finance_collect_plaques_rows(tzinfo, date_from, date_to),
+        'ritual_services': _finance_collect_ritual_rows(tzinfo, date_from, date_to),
+        'notes': _finance_collect_notes_rows(tzinfo, date_from, date_to),
+        'ads': _finance_collect_ads_rows(tzinfo, date_from, date_to),
+        'premium_qr': _finance_collect_premium_rows(tzinfo, date_from, date_to),
+    }
+    by_tab['main'] = []
+    for tab_id in ('plaques', 'ritual_services', 'notes', 'ads', 'premium_qr'):
+        by_tab['main'].extend(by_tab.get(tab_id, []))
+    for tab_id in by_tab:
+        by_tab[tab_id].sort(key=lambda row: row.get('sortKey') or '', reverse=True)
+    return by_tab, timezone_name
+
+
+def _finance_build_summary_payload(rows_by_tab):
+    tabs = []
+    grand_total = 0
+    grand_count = 0
+    for item in FINANCE_TABS:
+        tab_id = item['id']
+        rows = rows_by_tab.get(tab_id, [])
+        amount = int(sum(max(int(row.get('amountUah') or 0), 0) for row in rows))
+        count = len(rows)
+        if tab_id != 'main':
+            grand_total += amount
+            grand_count += count
+        tabs.append({
+            'id': tab_id,
+            'label': item['label'],
+            'amountUah': amount,
+            'amountLabel': f'{amount} грн',
+            'count': count,
+        })
+    return {
+        'totalAmountUah': grand_total,
+        'totalAmountLabel': f'{grand_total} грн',
+        'totalCount': grand_count,
+        'tabs': tabs,
+    }
+
+
+@application.route('/api/admin/finance/summary', methods=['GET'])
+def admin_finance_summary():
+    date_from = _finance_parse_date_param(request.args.get('from'), 'from')
+    date_to = _finance_parse_date_param(request.args.get('to'), 'to')
+    if date_from and date_to and date_from > date_to:
+        abort(400, description='`from` must be less than or equal to `to`')
+
+    run_refresh = _finance_parse_bool(request.args.get('refreshPremium', '1'))
+    if run_refresh:
+        _finance_best_effort_refresh_premium_tracking()
+
+    rows_by_tab, timezone_name = _finance_collect_rows(date_from=date_from, date_to=date_to)
+    summary = _finance_build_summary_payload(rows_by_tab)
+    return jsonify({
+        'period': {
+            'from': date_from.isoformat() if date_from else '',
+            'to': date_to.isoformat() if date_to else '',
+            'inclusive': True,
+        },
+        'timezone': timezone_name,
+        **summary,
+        'generatedAt': datetime.utcnow().isoformat(),
+    })
+
+
+@application.route('/api/admin/finance/report', methods=['GET'])
+def admin_finance_report():
+    tab = _clean_str(request.args.get('tab')) or 'main'
+    if tab not in FINANCE_TAB_IDS:
+        abort(400, description='`tab` must be one of: main, plaques, ritual_services, notes, ads, premium_qr')
+
+    date_from = _finance_parse_date_param(request.args.get('from'), 'from')
+    date_to = _finance_parse_date_param(request.args.get('to'), 'to')
+    if date_from and date_to and date_from > date_to:
+        abort(400, description='`from` must be less than or equal to `to`')
+
+    search_query = _clean_str(request.args.get('search'))
+    run_refresh = _finance_parse_bool(request.args.get('refreshPremium', '1'))
+    if run_refresh and tab in {'main', 'premium_qr'}:
+        _finance_best_effort_refresh_premium_tracking()
+
+    rows_by_tab, timezone_name = _finance_collect_rows(date_from=date_from, date_to=date_to)
+    summary = _finance_build_summary_payload(rows_by_tab)
+    source_rows = rows_by_tab.get(tab, [])
+    rows = [row for row in source_rows if _finance_matches_search(row, search_query)]
+    for row in rows:
+        row.pop('sortKey', None)
+
+    tab_amount = int(sum(max(int(row.get('amountUah') or 0), 0) for row in rows))
+    return jsonify({
+        'tab': tab,
+        'tabLabel': _finance_tab_label(tab),
+        'period': {
+            'from': date_from.isoformat() if date_from else '',
+            'to': date_to.isoformat() if date_to else '',
+            'inclusive': True,
+        },
+        'timezone': timezone_name,
+        'search': search_query,
+        'totalCount': len(rows),
+        'totalAmountUah': tab_amount,
+        'totalAmountLabel': f'{tab_amount} грн',
+        'rows': rows,
+        'summary': summary,
+        'generatedAt': datetime.utcnow().isoformat(),
     })
 
 

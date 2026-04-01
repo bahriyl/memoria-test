@@ -14,4 +14,4 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-CMD ["sh", "-c", "python bot.py & BOT_PID=$!; gunicorn --worker-class eventlet --workers 1 application:application --bind 0.0.0.0:${PORT:-8080}; kill $BOT_PID"]
+CMD ["sh", "-c", "gunicorn --worker-class eventlet --workers 1 application:application --bind 0.0.0.0:${PORT:-8080}"]

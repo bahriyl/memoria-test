@@ -83,6 +83,10 @@ except Exception:
 JWT_SECRET = os.environ.get("JWT_SECRET", "super-secret-key")
 JWT_ALGORITHM = "HS256"
 JWT_EXP_DELTA_SECONDS = 43200
+ADMIN_LOGIN = (os.environ.get("ADMIN_LOGIN") or "").strip()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or ""
+ADMIN_JWT_SECRET = os.environ.get("ADMIN_JWT_SECRET") or JWT_SECRET
+ADMIN_JWT_EXP_DELTA_SECONDS = 43200
 
 NP_API_KEY = os.getenv('NP_API_KEY')
 NP_BASE_URL = 'https://api.novaposhta.ua/v2.0/json/'
@@ -516,6 +520,12 @@ def verify_password(raw_password: str, hashed: str) -> bool:
 
 def hash_password(raw: str) -> str:
     return bcrypt.hashpw(raw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _admin_auth_str(value):
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def validate_new_password(pw: str):
@@ -3003,6 +3013,7 @@ ADS_ALLOWED_APPLICATION_FIELDS = {
     'companyName',
     'websiteUrl',
     'creativeUrl',
+    'pdfUrl',
     'address',
     'phone',
     'periodStart',
@@ -3311,6 +3322,7 @@ def _ads_build_application_payload(data):
         'companyName': company_name,
         'websiteUrl': _clean_str(data.get('websiteUrl')),
         'creativeUrl': _clean_str(data.get('creativeUrl')),
+        'pdfUrl': _clean_str(data.get('pdfUrl')),
         'address': address,
         'phone': phone,
         'periodStart': period_start,
@@ -3347,6 +3359,7 @@ def _ads_serialize_campaign(doc):
         'companyName': _clean_str(doc.get('companyName')),
         'websiteUrl': _clean_str(doc.get('websiteUrl')),
         'creativeUrl': _clean_str(doc.get('creativeUrl')),
+        'pdfUrl': _clean_str(doc.get('pdfUrl')),
         'address': _clean_str(doc.get('address')),
         'phone': _clean_str(doc.get('phone')),
         'periodStart': _clean_str(doc.get('periodStart')),
@@ -3379,6 +3392,7 @@ def _ads_serialize_application(doc):
         'companyName': _clean_str(doc.get('companyName')),
         'websiteUrl': _clean_str(doc.get('websiteUrl')),
         'creativeUrl': _clean_str(doc.get('creativeUrl')),
+        'pdfUrl': _clean_str(doc.get('pdfUrl')),
         'address': _clean_str(doc.get('address')),
         'phone': _clean_str(doc.get('phone')),
         'periodStart': _clean_str(doc.get('periodStart')),
@@ -3820,6 +3834,7 @@ ADMIN_CHURCH_ALLOWED_FIELDS = {
     'recipientName',
     'botCode',
     'telegramChatId',
+    'telegramChatIds',
 }
 
 
@@ -3836,6 +3851,17 @@ def _clean_contacts_list_loose(value):
         if person or phone:
             contacts.append({'person': person, 'phone': phone})
     return contacts
+
+
+def _clean_telegram_chat_ids(value):
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        cleaned = _clean_str(item)
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+    return out
 
 
 def _validate_contacts_list(value, field_name):
@@ -4006,6 +4032,10 @@ def _normalize_admin_church(church):
 
     created_at = church.get('createdAt')
     updated_at = church.get('updatedAt')
+    telegram_chat_ids = _clean_telegram_chat_ids(church.get('telegramChatIds'))
+    legacy_chat_id = _clean_str(church.get('telegramChatId'))
+    if legacy_chat_id and legacy_chat_id not in telegram_chat_ids:
+        telegram_chat_ids.append(legacy_chat_id)
 
     return {
         'id': str(church.get('_id')),
@@ -4029,7 +4059,8 @@ def _normalize_admin_church(church):
         'taxCode': _clean_str(church.get('taxCode')),
         'recipientName': _clean_str(church.get('recipientName')),
         'botCode': _clean_str(church.get('botCode')),
-        'telegramChatId': _clean_str(church.get('telegramChatId')),
+        'telegramChatId': telegram_chat_ids[0] if telegram_chat_ids else legacy_chat_id,
+        'telegramChatIds': telegram_chat_ids,
         'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
         'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
     }
@@ -4133,6 +4164,19 @@ def _build_admin_church_payload(data, partial=False):
     if 'telegramChatId' in data:
         payload['telegramChatId'] = _clean_str(data.get('telegramChatId'))
 
+    if 'telegramChatIds' in data:
+        if not isinstance(data.get('telegramChatIds'), list):
+            abort(400, description='`telegramChatIds` must be an array')
+        payload['telegramChatIds'] = _clean_telegram_chat_ids(data.get('telegramChatIds'))
+
+    if 'telegramChatIds' in payload:
+        legacy_chat_id = _clean_str(payload.get('telegramChatId'))
+        if legacy_chat_id and legacy_chat_id not in payload['telegramChatIds']:
+            payload['telegramChatIds'].append(legacy_chat_id)
+        payload['telegramChatId'] = payload['telegramChatIds'][0] if payload['telegramChatIds'] else ''
+    elif 'telegramChatId' in payload:
+        payload['telegramChatIds'] = [payload['telegramChatId']] if payload['telegramChatId'] else []
+
     if 'contacts' in payload and payload['contacts']:
         if not payload.get('contactPerson'):
             payload['contactPerson'] = payload['contacts'][0].get('person', '')
@@ -4195,6 +4239,7 @@ def _build_admin_church_payload(data, partial=False):
         payload.setdefault('recipientName', '')
         payload.setdefault('botCode', '')
         payload.setdefault('telegramChatId', '')
+        payload.setdefault('telegramChatIds', [payload['telegramChatId']] if payload['telegramChatId'] else [])
 
         if 'location' not in payload and (_location_write_is_canonical() or _location_write_is_dual()):
             payload['location'] = normalize_location_core({
@@ -4262,6 +4307,34 @@ def admin_update_church(church_id):
 
     update_fields['updatedAt'] = datetime.utcnow()
     result = churches_collection.update_one({'_id': oid}, {'$set': update_fields})
+    if result.matched_count == 0:
+        abort(404, description='Church not found')
+
+    church = churches_collection.find_one({'_id': oid})
+    return jsonify(_normalize_admin_church(church))
+
+
+def _generate_admin_church_bot_code():
+    for _ in range(20):
+        candidate = f"MEM-{secrets.token_hex(3).upper()}"
+        if not churches_collection.find_one({'botCode': candidate}):
+            return candidate
+    return f"MEM-{secrets.token_hex(4).upper()}"
+
+
+@application.route('/api/admin/churches/<string:church_id>/bot-code/regenerate', methods=['POST'])
+def admin_regenerate_church_bot_code(church_id):
+    try:
+        oid = ObjectId(church_id)
+    except Exception:
+        abort(400, description='Invalid church id')
+
+    now = datetime.utcnow()
+    bot_code = _generate_admin_church_bot_code()
+    result = churches_collection.update_one(
+        {'_id': oid},
+        {'$set': {'botCode': bot_code, 'updatedAt': now}}
+    )
     if result.matched_count == 0:
         abort(404, description='Church not found')
 
@@ -5104,13 +5177,18 @@ def _admin_note_payments_row_output(row):
     legacy_receipt_url = _clean_str(row.get('receiptUrl'))
     if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
         receipt_urls.append(legacy_receipt_url)
+    telegram_chat_ids = _clean_telegram_chat_ids(row.get('telegramChatIds'))
+    legacy_chat_id = _clean_str(row.get('telegramChatId'))
+    if legacy_chat_id and legacy_chat_id not in telegram_chat_ids:
+        telegram_chat_ids.append(legacy_chat_id)
     return {
         'id': _clean_str(row.get('id')),
         'number': int(row.get('number') or 0),
         'churchId': _clean_str(row.get('churchId')),
         'churchName': _clean_str(row.get('churchName')),
         'churchAddress': _clean_str(row.get('churchAddress')),
-        'telegramChatId': _clean_str(row.get('telegramChatId')),
+        'telegramChatId': telegram_chat_ids[0] if telegram_chat_ids else legacy_chat_id,
+        'telegramChatIds': telegram_chat_ids,
         'sumAmount': int(row.get('sumAmount') or 0),
         'receiptUrls': receipt_urls,
         'receiptUrl': receipt_urls[0] if receipt_urls else '',
@@ -5272,10 +5350,23 @@ def _admin_note_payments_refresh_rows_from_liturgies(doc, tzinfo):
             display = _admin_notes_church_display(church_doc)
             row['churchName'] = display.get('name', '')
             row['churchAddress'] = display.get('address', '')
-            row['telegramChatId'] = _clean_str(church_doc.get('telegramChatId'))
+            telegram_chat_ids = _clean_telegram_chat_ids(church_doc.get('telegramChatIds'))
+            legacy_chat_id = _clean_str(church_doc.get('telegramChatId'))
+            if legacy_chat_id and legacy_chat_id not in telegram_chat_ids:
+                telegram_chat_ids.append(legacy_chat_id)
+            row['telegramChatIds'] = telegram_chat_ids
+            row['telegramChatId'] = telegram_chat_ids[0] if telegram_chat_ids else legacy_chat_id
 
 
-def _admin_note_payments_send_telegram_message(chat_id, text):
+def _admin_note_payments_row_chat_ids(row):
+    chat_ids = _clean_telegram_chat_ids(row.get('telegramChatIds'))
+    legacy_chat_id = _clean_str(row.get('telegramChatId'))
+    if legacy_chat_id and legacy_chat_id not in chat_ids:
+        chat_ids.append(legacy_chat_id)
+    return chat_ids
+
+
+def _admin_note_payments_send_telegram_message(chat_id, text, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN:
         return False, 'TELEGRAM_BOT_TOKEN is not configured'
     if not chat_id:
@@ -5283,6 +5374,8 @@ def _admin_note_payments_send_telegram_message(chat_id, text):
 
     endpoint = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
     payload = {'chat_id': chat_id, 'text': text}
+    if isinstance(reply_markup, dict) and reply_markup:
+        payload['reply_markup'] = reply_markup
     try:
         response = requests.post(endpoint, json=payload, timeout=8)
         if response.ok:
@@ -5290,6 +5383,24 @@ def _admin_note_payments_send_telegram_message(chat_id, text):
         return False, f'Telegram API error ({response.status_code})'
     except requests.RequestException as exc:
         return False, str(exc)
+
+
+def _admin_note_payments_build_confirmation_message(doc, row, callback_base, token):
+    yes_url = f"{callback_base}/api/admin/notes/payments/confirm/{token}?answer=yes"
+    no_url = f"{callback_base}/api/admin/notes/payments/confirm/{token}?answer=no"
+    text = (
+        f"Проплата за {_clean_str((doc.get('period') or {}).get('label'))}: "
+        f"{int(row.get('sumAmount') or 0)} грн.\n"
+        f"Церква: {_clean_str(row.get('churchName'))}\n"
+        "Підтвердити отримання:"
+    )
+    reply_markup = {
+        'inline_keyboard': [[
+            {'text': 'Так', 'url': yes_url},
+            {'text': 'Ні', 'url': no_url},
+        ]]
+    }
+    return text, reply_markup
 
 
 @application.route('/api/admin/notes/payments', methods=['GET'])
@@ -5331,13 +5442,18 @@ def admin_note_payments_create_previous_month():
     rows = []
     for index, church_doc in enumerate(church_docs, start=1):
         display = _admin_notes_church_display(church_doc)
+        telegram_chat_ids = _clean_telegram_chat_ids(church_doc.get('telegramChatIds'))
+        legacy_chat_id = _clean_str(church_doc.get('telegramChatId'))
+        if legacy_chat_id and legacy_chat_id not in telegram_chat_ids:
+            telegram_chat_ids.append(legacy_chat_id)
         rows.append({
             'id': secrets.token_hex(8),
             'number': index,
             'churchId': str(church_doc.get('_id')),
             'churchName': display.get('name', ''),
             'churchAddress': display.get('address', ''),
-            'telegramChatId': _clean_str(church_doc.get('telegramChatId')),
+            'telegramChatId': telegram_chat_ids[0] if telegram_chat_ids else legacy_chat_id,
+            'telegramChatIds': telegram_chat_ids,
             'sumAmount': int(sums_by_church_id.get(str(church_doc.get('_id')), 0)),
             'receiptUrls': [],
             'receiptUrl': '',
@@ -5424,6 +5540,19 @@ def admin_note_payments_mark_row_paid(payment_id, row_id):
     if not bool(row.get('unlocked')):
         abort(400, description='Row is locked')
 
+    receipt_urls = []
+    raw_receipt_urls = row.get('receiptUrls')
+    if isinstance(raw_receipt_urls, list):
+        for item in raw_receipt_urls:
+            normalized_url = _clean_str(item)
+            if normalized_url and normalized_url not in receipt_urls:
+                receipt_urls.append(normalized_url)
+    legacy_receipt_url = _clean_str(row.get('receiptUrl'))
+    if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
+        receipt_urls.append(legacy_receipt_url)
+    if not receipt_urls:
+        abort(400, description='Receipt is required before marking row as paid')
+
     balance = doc.get('fopBalance') if isinstance(doc.get('fopBalance'), dict) else {}
     current_balance = int(balance.get('current') or 0)
     expected_balance = current_balance - int(row.get('sumAmount') or 0)
@@ -5485,6 +5614,61 @@ def admin_note_payments_unlock_row(payment_id, row_id):
         {'$set': {'rows': rows, 'updatedAt': doc.get('updatedAt')}}
     )
     return jsonify({'month': _admin_note_payments_detail_output(doc)})
+
+
+@application.route('/api/admin/notes/payments/<string:payment_id>/rows/<string:row_id>/resend-confirmation', methods=['POST'])
+def admin_note_payments_resend_row_confirmation(payment_id, row_id):
+    doc = _admin_note_payments_fetch_doc_or_404(payment_id)
+    rows, _, row = _admin_note_payments_find_row(doc, row_id)
+
+    confirmation = row.get('confirmation')
+    if not isinstance(confirmation, dict):
+        confirmation = {}
+        row['confirmation'] = confirmation
+
+    status = _clean_str(confirmation.get('status')).lower() or 'pending'
+    if status not in {'pending', 'no'}:
+        abort(400, description='Confirmation can be resent only for no or pending status')
+
+    token = _clean_str(confirmation.get('token'))
+    if not token:
+        token = secrets.token_urlsafe(20)
+        confirmation['token'] = token
+
+    now = datetime.utcnow()
+    confirmation['deadlineAt'] = (now + timedelta(days=7)).isoformat()
+    doc['updatedAt'] = now
+
+    callback_base = _clean_str(PUBLIC_WEB_BASE_URL) or _clean_str(request.host_url).rstrip('/')
+    text, reply_markup = _admin_note_payments_build_confirmation_message(doc, row, callback_base, token)
+    telegram_errors = []
+    chat_ids = _admin_note_payments_row_chat_ids(row)
+    if not chat_ids:
+        telegram_errors.append({
+            'rowId': _clean_str(row.get('id')),
+            'churchName': _clean_str(row.get('churchName')),
+            'chatId': '',
+            'error': 'telegramChatId is empty',
+        })
+    for chat_id in chat_ids:
+        ok, error = _admin_note_payments_send_telegram_message(
+            chat_id,
+            text,
+            reply_markup=reply_markup,
+        )
+        if not ok:
+            telegram_errors.append({
+                'rowId': _clean_str(row.get('id')),
+                'churchName': _clean_str(row.get('churchName')),
+                'chatId': chat_id,
+                'error': error,
+            })
+
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': rows, 'updatedAt': doc.get('updatedAt')}}
+    )
+    return jsonify({'month': _admin_note_payments_detail_output(doc), 'telegramErrors': telegram_errors})
 
 
 @application.route('/api/admin/notes/payments/<string:payment_id>/rows/<string:row_id>/receipt', methods=['POST'])
@@ -5574,21 +5758,33 @@ def admin_note_payments_mark_paid(payment_id):
         confirmation['respondedAt'] = None
         confirmation['autoConfirmed'] = False
 
-        yes_url = f"{callback_base}/api/admin/notes/payments/confirm/{confirmation['token']}?answer=yes"
-        no_url = f"{callback_base}/api/admin/notes/payments/confirm/{confirmation['token']}?answer=no"
-        text = (
-            f"Проплата за {_clean_str((doc.get('period') or {}).get('label'))}: "
-            f"{int(row.get('sumAmount') or 0)} грн.\n"
-            f"Церква: {_clean_str(row.get('churchName'))}\n"
-            f"Підтвердити отримання: Так — {yes_url} | Ні — {no_url}"
+        text, reply_markup = _admin_note_payments_build_confirmation_message(
+            doc,
+            row,
+            callback_base,
+            confirmation['token'],
         )
-        ok, error = _admin_note_payments_send_telegram_message(_clean_str(row.get('telegramChatId')), text)
-        if not ok:
+        chat_ids = _admin_note_payments_row_chat_ids(row)
+        if not chat_ids:
             telegram_errors.append({
                 'rowId': _clean_str(row.get('id')),
                 'churchName': _clean_str(row.get('churchName')),
-                'error': error,
+                'chatId': '',
+                'error': 'telegramChatId is empty',
             })
+        for chat_id in chat_ids:
+            ok, error = _admin_note_payments_send_telegram_message(
+                chat_id,
+                text,
+                reply_markup=reply_markup,
+            )
+            if not ok:
+                telegram_errors.append({
+                    'rowId': _clean_str(row.get('id')),
+                    'churchName': _clean_str(row.get('churchName')),
+                    'chatId': chat_id,
+                    'error': error,
+                })
 
     doc['paidRequestedAt'] = now.isoformat()
     doc['status'] = _admin_note_payments_recompute_status(doc)
@@ -7029,6 +7225,57 @@ def ritual_services_login():
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
     return jsonify({"token": token})
+
+
+@application.route('/api/admin/login', methods=['POST'])
+def admin_login():
+    if not ADMIN_LOGIN or not ADMIN_PASSWORD:
+        abort(503, description='Admin auth is not configured')
+
+    data = request.get_json(silent=True) or {}
+    login = _admin_auth_str(data.get('login'))
+    password = _admin_auth_str(data.get('password'))
+
+    if not login or not password:
+        abort(400, description='`login` and `password` are required')
+
+    if login != ADMIN_LOGIN or password != ADMIN_PASSWORD:
+        abort(401, description='Invalid login or password')
+
+    expires_at = datetime.utcnow() + timedelta(seconds=ADMIN_JWT_EXP_DELTA_SECONDS)
+    payload = {
+        'role': 'admin',
+        'login': ADMIN_LOGIN,
+        'exp': expires_at,
+    }
+    token = jwt.encode(payload, ADMIN_JWT_SECRET, algorithm=JWT_ALGORITHM)
+    if isinstance(token, bytes):
+        token = token.decode('utf-8')
+
+    return jsonify({
+        'token': token,
+        'expiresAt': expires_at.isoformat() + 'Z',
+    })
+
+
+@application.route('/api/admin/verify_token', methods=['POST'])
+def admin_verify_token():
+    data = request.get_json(silent=True) or {}
+    token = _admin_auth_str(data.get('token'))
+    if not token:
+        abort(400, description='`token` is required')
+
+    try:
+        payload = jwt.decode(token, ADMIN_JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        abort(401, description='Token expired')
+    except jwt.InvalidTokenError:
+        abort(401, description='Invalid token')
+
+    if payload.get('role') != 'admin':
+        abort(401, description='Invalid token')
+
+    return jsonify({'valid': True})
 
 
 @application.route('/api/ritual_services/verify_token', methods=['POST'])

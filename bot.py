@@ -6,8 +6,6 @@ from telebot.apihelper import ApiTelegramException
 from pymongo import MongoClient
 import telebot
 
-from application import _admin_note_payments_confirm_by_token
-
 load_dotenv()
 
 
@@ -36,6 +34,12 @@ MONGODB_DB_NAME = _clean_str(os.environ.get('MONGODB_DB_NAME')) or 'memoria_test
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client[MONGODB_DB_NAME]
 churches_collection = db['churches']
+admin_note_payments_collection = db['admin_note_payments']
+
+ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS = 'in_progress'
+ADMIN_NOTE_PAYMENTS_STATUS_AWAITING_CONFIRMATION = 'awaiting_confirmation'
+ADMIN_NOTE_PAYMENTS_STATUS_FINALIZABLE = 'finalizable'
+ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED = 'completed'
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 awaiting_code_chat_ids = set()
@@ -113,6 +117,83 @@ def _parse_payment_confirmation_callback(data):
 
 def _answer_text(answer):
     return 'Підтверджено.' if answer == 'yes' else 'Відхилено.'
+
+
+def _admin_note_payments_recompute_status(doc):
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    if _clean_str(doc.get('status')) == ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED:
+        return ADMIN_NOTE_PAYMENTS_STATUS_COMPLETED
+    if not rows:
+        return ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    if not all(bool(row.get('paid')) for row in rows):
+        return ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    paid_requested_at = _clean_str(doc.get('paidRequestedAt'))
+    if not paid_requested_at:
+        return ADMIN_NOTE_PAYMENTS_STATUS_IN_PROGRESS
+    confirmations = [
+        _clean_str((row.get('confirmation') or {}).get('status')).lower()
+        for row in rows
+    ]
+    if confirmations and all(status == 'yes' for status in confirmations):
+        return ADMIN_NOTE_PAYMENTS_STATUS_FINALIZABLE
+    return ADMIN_NOTE_PAYMENTS_STATUS_AWAITING_CONFIRMATION
+
+
+def _admin_note_payments_build_resolved_message(doc, row, answer):
+    status_label = 'Підтверджено' if answer == 'yes' else 'Відхилено'
+    return (
+        f"Проплата за {_clean_str((doc.get('period') or {}).get('label'))}: "
+        f"{int(row.get('sumAmount') or 0)} грн.\n"
+        f"Церква: {_clean_str(row.get('churchName'))}\n"
+        f"Статус: {status_label}"
+    )
+
+
+def _admin_note_payments_confirm_by_token(token, answer):
+    cleaned_token = _clean_str(token)
+    if not cleaned_token:
+        raise ValueError('Invalid token')
+
+    normalized_answer = _clean_str(answer).lower()
+    if normalized_answer not in {'yes', 'no'}:
+        raise ValueError('`answer` must be yes or no')
+
+    doc = admin_note_payments_collection.find_one({'rows.confirmation.token': cleaned_token})
+    if not doc:
+        raise LookupError('Confirmation token not found')
+
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    resolved_row = None
+    for row in rows:
+        confirmation = row.get('confirmation')
+        if not isinstance(confirmation, dict):
+            continue
+        if _clean_str(confirmation.get('token')) != cleaned_token:
+            continue
+        confirmation['status'] = normalized_answer
+        confirmation['respondedAt'] = datetime.utcnow().isoformat()
+        confirmation['autoConfirmed'] = False
+        resolved_row = row
+        break
+
+    if resolved_row is None:
+        raise LookupError('Confirmation token not found')
+
+    doc['rows'] = rows
+    doc['status'] = _admin_note_payments_recompute_status(doc)
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': rows, 'status': doc.get('status'), 'updatedAt': doc.get('updatedAt')}}
+    )
+
+    return {
+        'doc': doc,
+        'row': resolved_row,
+        'answer': normalized_answer,
+        'status': doc.get('status'),
+        'message_text': _admin_note_payments_build_resolved_message(doc, resolved_row, normalized_answer),
+    }
 
 
 def _safe_error_text(error):

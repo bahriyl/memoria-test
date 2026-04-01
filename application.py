@@ -5385,9 +5385,9 @@ def _admin_note_payments_send_telegram_message(chat_id, text, reply_markup=None)
         return False, str(exc)
 
 
-def _admin_note_payments_build_confirmation_message(doc, row, callback_base, token):
-    yes_url = f"{callback_base}/api/admin/notes/payments/confirm/{token}?answer=yes"
-    no_url = f"{callback_base}/api/admin/notes/payments/confirm/{token}?answer=no"
+def _admin_note_payments_build_confirmation_message(doc, row, token):
+    yes_callback = f"payconf:{token}:yes"
+    no_callback = f"payconf:{token}:no"
     text = (
         f"Проплата за {_clean_str((doc.get('period') or {}).get('label'))}: "
         f"{int(row.get('sumAmount') or 0)} грн.\n"
@@ -5396,11 +5396,68 @@ def _admin_note_payments_build_confirmation_message(doc, row, callback_base, tok
     )
     reply_markup = {
         'inline_keyboard': [[
-            {'text': 'Так', 'url': yes_url},
-            {'text': 'Ні', 'url': no_url},
+            {'text': 'Так', 'callback_data': yes_callback},
+            {'text': 'Ні', 'callback_data': no_callback},
         ]]
     }
     return text, reply_markup
+
+
+def _admin_note_payments_build_resolved_message(doc, row, answer):
+    status_label = 'Підтверджено' if answer == 'yes' else 'Відхилено'
+    return (
+        f"Проплата за {_clean_str((doc.get('period') or {}).get('label'))}: "
+        f"{int(row.get('sumAmount') or 0)} грн.\n"
+        f"Церква: {_clean_str(row.get('churchName'))}\n"
+        f"Статус: {status_label}"
+    )
+
+
+def _admin_note_payments_confirm_by_token(token, answer):
+    cleaned_token = _clean_str(token)
+    if not cleaned_token:
+        raise ValueError('Invalid token')
+
+    normalized_answer = _clean_str(answer).lower()
+    if normalized_answer not in {'yes', 'no'}:
+        raise ValueError('`answer` must be yes or no')
+
+    doc = admin_note_payments_collection.find_one({'rows.confirmation.token': cleaned_token})
+    if not doc:
+        raise LookupError('Confirmation token not found')
+
+    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
+    resolved_row = None
+    for row in rows:
+        confirmation = row.get('confirmation')
+        if not isinstance(confirmation, dict):
+            continue
+        if _clean_str(confirmation.get('token')) != cleaned_token:
+            continue
+        confirmation['status'] = normalized_answer
+        confirmation['respondedAt'] = datetime.utcnow().isoformat()
+        confirmation['autoConfirmed'] = False
+        resolved_row = row
+        break
+
+    if resolved_row is None:
+        raise LookupError('Confirmation token not found')
+
+    doc['rows'] = rows
+    doc['status'] = _admin_note_payments_recompute_status(doc)
+    doc['updatedAt'] = datetime.utcnow()
+    admin_note_payments_collection.update_one(
+        {'_id': doc.get('_id')},
+        {'$set': {'rows': rows, 'status': doc.get('status'), 'updatedAt': doc.get('updatedAt')}}
+    )
+
+    return {
+        'doc': doc,
+        'row': resolved_row,
+        'answer': normalized_answer,
+        'status': doc.get('status'),
+        'message_text': _admin_note_payments_build_resolved_message(doc, resolved_row, normalized_answer),
+    }
 
 
 @application.route('/api/admin/notes/payments', methods=['GET'])
@@ -5639,8 +5696,7 @@ def admin_note_payments_resend_row_confirmation(payment_id, row_id):
     confirmation['deadlineAt'] = (now + timedelta(days=7)).isoformat()
     doc['updatedAt'] = now
 
-    callback_base = _clean_str(PUBLIC_WEB_BASE_URL) or _clean_str(request.host_url).rstrip('/')
-    text, reply_markup = _admin_note_payments_build_confirmation_message(doc, row, callback_base, token)
+    text, reply_markup = _admin_note_payments_build_confirmation_message(doc, row, token)
     telegram_errors = []
     chat_ids = _admin_note_payments_row_chat_ids(row)
     if not chat_ids:
@@ -5744,7 +5800,6 @@ def admin_note_payments_mark_paid(payment_id):
         abort(400, description='All rows must be marked as paid')
 
     now = datetime.utcnow()
-    callback_base = _clean_str(PUBLIC_WEB_BASE_URL) or _clean_str(request.host_url).rstrip('/')
     telegram_errors = []
     for row in rows:
         confirmation = row.get('confirmation')
@@ -5761,7 +5816,6 @@ def admin_note_payments_mark_paid(payment_id):
         text, reply_markup = _admin_note_payments_build_confirmation_message(
             doc,
             row,
-            callback_base,
             confirmation['token'],
         )
         chat_ids = _admin_note_payments_row_chat_ids(row)
@@ -5804,46 +5858,17 @@ def admin_note_payments_mark_paid(payment_id):
 
 @application.route('/api/admin/notes/payments/confirm/<string:token>', methods=['GET', 'POST'])
 def admin_note_payments_confirm(token):
-    cleaned_token = _clean_str(token)
-    if not cleaned_token:
-        abort(400, description='Invalid token')
-
     answer = _clean_str(request.args.get('answer'))
     if request.method == 'POST':
         payload = request.get_json(silent=True) or {}
         answer = _clean_str(payload.get('answer') or answer)
-    answer = answer.lower()
-    if answer not in {'yes', 'no'}:
-        abort(400, description='`answer` must be yes or no')
-
-    doc = admin_note_payments_collection.find_one({'rows.confirmation.token': cleaned_token})
-    if not doc:
-        abort(404, description='Confirmation token not found')
-
-    rows = doc.get('rows') if isinstance(doc.get('rows'), list) else []
-    row_found = False
-    for row in rows:
-        confirmation = row.get('confirmation')
-        if not isinstance(confirmation, dict):
-            continue
-        if _clean_str(confirmation.get('token')) != cleaned_token:
-            continue
-        confirmation['status'] = answer
-        confirmation['respondedAt'] = datetime.utcnow().isoformat()
-        confirmation['autoConfirmed'] = False
-        row_found = True
-        break
-    if not row_found:
-        abort(404, description='Confirmation token not found')
-
-    doc['rows'] = rows
-    doc['status'] = _admin_note_payments_recompute_status(doc)
-    doc['updatedAt'] = datetime.utcnow()
-    admin_note_payments_collection.update_one(
-        {'_id': doc.get('_id')},
-        {'$set': {'rows': rows, 'status': doc.get('status'), 'updatedAt': doc.get('updatedAt')}}
-    )
-    return jsonify({'ok': True, 'status': doc.get('status')})
+    try:
+        result = _admin_note_payments_confirm_by_token(token, answer)
+    except ValueError as exc:
+        abort(400, description=str(exc))
+    except LookupError as exc:
+        abort(404, description=str(exc))
+    return jsonify({'ok': True, 'status': result.get('status')})
 
 
 @application.route('/api/admin/notes/payments/<string:payment_id>/finalize', methods=['POST'])

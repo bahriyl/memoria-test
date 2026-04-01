@@ -1,9 +1,12 @@
 import os
 from dotenv import load_dotenv
 from datetime import datetime
+from telebot.apihelper import ApiTelegramException
 
 from pymongo import MongoClient
 import telebot
+
+from application import _admin_note_payments_confirm_by_token
 
 load_dotenv()
 
@@ -92,6 +95,51 @@ def handle_text(message):
     awaiting_code_chat_ids.discard(chat_id_num)
     church_name = _clean_str(church.get('name')) or 'церкву'
     bot.reply_to(message, f'Готово! Telegram успішно підключено до {church_name}.')
+
+
+def _parse_payment_confirmation_callback(data):
+    raw = _clean_str(data)
+    parts = raw.split(':')
+    if len(parts) != 3 or parts[0] != 'payconf':
+        raise ValueError('Невірний формат підтвердження.')
+    token = _clean_str(parts[1])
+    answer = _clean_str(parts[2]).lower()
+    if not token:
+        raise ValueError('Токен підтвердження відсутній.')
+    if answer not in {'yes', 'no'}:
+        raise ValueError('Невірна відповідь підтвердження.')
+    return token, answer
+
+
+def _answer_text(answer):
+    return 'Підтверджено.' if answer == 'yes' else 'Відхилено.'
+
+
+@bot.callback_query_handler(func=lambda call: _clean_str(getattr(call, 'data', '')).startswith('payconf:'))
+def handle_payment_confirmation_callback(call):
+    callback_id = getattr(call, 'id', '')
+    data = getattr(call, 'data', '')
+    message = getattr(call, 'message', None)
+    try:
+        token, answer = _parse_payment_confirmation_callback(data)
+        result = _admin_note_payments_confirm_by_token(token, answer)
+        bot.answer_callback_query(callback_id, text=_answer_text(result.get('answer')), show_alert=False)
+        if message is not None:
+            bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                text=result.get('message_text') or '',
+                reply_markup=None,
+            )
+    except ValueError as exc:
+        bot.answer_callback_query(callback_id, text=str(exc), show_alert=False)
+    except LookupError as exc:
+        bot.answer_callback_query(callback_id, text=str(exc), show_alert=False)
+    except ApiTelegramException:
+        # Message could already be edited or unavailable; callback has already been answered.
+        pass
+    except Exception:
+        bot.answer_callback_query(callback_id, text='Не вдалося обробити підтвердження.', show_alert=False)
 
 
 if __name__ == '__main__':

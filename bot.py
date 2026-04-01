@@ -115,6 +115,23 @@ def _answer_text(answer):
     return 'Підтверджено.' if answer == 'yes' else 'Відхилено.'
 
 
+def _safe_error_text(error):
+    text = _clean_str(error) or 'Невідома помилка.'
+    if len(text) > 3500:
+        text = f"{text[:3497]}..."
+    return text
+
+
+def _reply_callback_error(call, error):
+    callback_id = getattr(call, 'id', '')
+    message = getattr(call, 'message', None)
+    error_text = _safe_error_text(error)
+    popup_text = f"Помилка: {error_text[:180]}"
+    bot.answer_callback_query(callback_id, text=popup_text, show_alert=True)
+    if message is not None:
+        bot.send_message(message.chat.id, f"Помилка підтвердження оплати:\n{error_text}")
+
+
 @bot.callback_query_handler(func=lambda call: _clean_str(getattr(call, 'data', '')).startswith('payconf:'))
 def handle_payment_confirmation_callback(call):
     callback_id = getattr(call, 'id', '')
@@ -131,15 +148,12 @@ def handle_payment_confirmation_callback(call):
                 text=result.get('message_text') or '',
                 reply_markup=None,
             )
-    except ValueError as exc:
-        bot.answer_callback_query(callback_id, text=str(exc), show_alert=False)
-    except LookupError as exc:
-        bot.answer_callback_query(callback_id, text=str(exc), show_alert=False)
-    except ApiTelegramException:
-        # Message could already be edited or unavailable; callback has already been answered.
-        pass
-    except Exception:
-        bot.answer_callback_query(callback_id, text='Не вдалося обробити підтвердження.', show_alert=False)
+    except (ValueError, LookupError) as exc:
+        _reply_callback_error(call, str(exc))
+    except ApiTelegramException as exc:
+        _reply_callback_error(call, f"Telegram API error: {exc}")
+    except Exception as exc:
+        _reply_callback_error(call, f"Unexpected error: {exc}")
 
 
 if __name__ == '__main__':

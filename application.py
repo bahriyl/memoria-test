@@ -4,6 +4,7 @@ eventlet.monkey_patch()
 import time
 import os
 import re
+import random
 import secrets
 import bcrypt
 import boto3
@@ -17,14 +18,14 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import jwt
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-from flask import Flask, request, jsonify, abort, make_response, send_file, after_this_request
+from flask import Flask, request, jsonify, abort, make_response, send_file, after_this_request, redirect
 from flask_cors import CORS
 from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
@@ -72,6 +73,11 @@ try:
 except Exception:
     Image = None
     ImageOps = None
+
+try:
+    import pypdfium2 as pdfium
+except Exception:
+    pdfium = None
 
 try:
     import segno
@@ -828,11 +834,52 @@ def _admin_pages_status_tags(person, extra_ctx=None):
     return tags
 
 
-def _admin_pages_build_burial_from_fields(area_id, area, cemetery):
+def _admin_pages_infer_path_key(admin_page, status_tags):
+    admin_page = admin_page if isinstance(admin_page, dict) else {}
+    path_key = _admin_pages_str(admin_page.get('pathKey')).lower()
+    if path_key in {'premium_qr', 'premium_qr_firma', 'plaques'}:
+        return path_key
+
+    path_label = _admin_pages_str(admin_page.get('pathLabel')).lower()
+    if 'фірма' in path_label:
+        return 'premium_qr_firma'
+    if 'таблич' in path_label:
+        return 'plaques'
+    if 'преміум qr' in path_label:
+        return 'premium_qr'
+
+    for tag in status_tags if isinstance(status_tags, list) else []:
+        lowered = _admin_pages_str(tag).lower()
+        if 'фірма' in lowered:
+            return 'premium_qr_firma'
+        if 'таблич' in lowered:
+            return 'plaques'
+        if 'преміум qr' in lowered:
+            return 'premium_qr'
+
+    return ''
+
+
+def _admin_pages_pick_fallback_qr(person_id, path_key, extra_ctx=None):
+    if not isinstance(extra_ctx, dict):
+        return ''
+    qr_lookup = extra_ctx.get('wiredQrByPersonAndPath')
+    if not isinstance(qr_lookup, dict):
+        return ''
+    lookup_key = f'{_admin_pages_str(person_id)}::{_admin_pages_str(path_key).lower()}'
+    if not lookup_key:
+        return ''
+    return _admin_pages_str(qr_lookup.get(lookup_key))
+
+
+def _admin_pages_build_burial_from_fields(area_id, area, cemetery, burial_site_coords='', burial_site_photo_urls=None):
+    photos = burial_site_photo_urls if isinstance(burial_site_photo_urls, list) else []
+    cleaned_photos = [_admin_pages_str(photo) for photo in photos if _admin_pages_str(photo)]
     burial = normalize_person_burial({
         'areaId': area_id,
         'area': area,
         'cemetery': cemetery,
+        'location': [_admin_pages_str(burial_site_coords), '', cleaned_photos],
     })
     legacy = person_burial_to_legacy_fields(burial)
     return burial, legacy
@@ -868,7 +915,35 @@ def _admin_pages_projection(person, index, extra_ctx=None):
         life_range_text = years_label
 
     status_tags = _admin_pages_status_tags(item, extra_ctx=extra_ctx)
+    path_key = _admin_pages_infer_path_key(admin_page, status_tags)
     qr_code = _admin_pages_str(admin_page.get('qrCode'))
+    wired_qr_code_id = _admin_pages_str(admin_page.get('wiredQrCodeId')) or qr_code
+    if not wired_qr_code_id:
+        fallback_qr = _admin_pages_pick_fallback_qr(item.get('_id'), path_key, extra_ctx=extra_ctx)
+        if fallback_qr:
+            wired_qr_code_id = fallback_qr
+    if not qr_code and wired_qr_code_id:
+        qr_code = wired_qr_code_id
+    phone = _admin_pages_str(admin_page.get('phone'))
+    customer_phone = _admin_pages_str(admin_page.get('customerPhone')) or phone
+    burial_site_coords = _admin_pages_str(item.get('burialSiteCoords'))
+    location_photos = location.get('photos') if isinstance(location, dict) else []
+    if not isinstance(location_photos, list):
+        location_photos = []
+    burial_photo_urls = [_admin_pages_str(photo) for photo in location_photos if _admin_pages_str(photo)]
+    if not burial_photo_urls:
+        legacy_urls = item.get('burialSitePhotoUrls')
+        if isinstance(legacy_urls, list):
+            burial_photo_urls = [_admin_pages_str(photo) for photo in legacy_urls if _admin_pages_str(photo)]
+    lead_photo = _admin_pages_str(item.get('burialSitePhotoUrl'))
+    if lead_photo and lead_photo not in burial_photo_urls:
+        burial_photo_urls.insert(0, lead_photo)
+    elif not lead_photo and burial_photo_urls:
+        lead_photo = burial_photo_urls[0]
+    internet_links = _admin_pages_str(item.get('sourceLink') or item.get('link') or item.get('internetLinks'))
+    achievements = _admin_pages_str(item.get('achievements'))
+    bio = _admin_pages_str(item.get('bio'))
+    notable = bool(item.get('notable')) or bool(internet_links) or bool(achievements) or bool(bio)
 
     return {
         'id': str(item.get('_id')),
@@ -884,13 +959,27 @@ def _admin_pages_projection(person, index, extra_ctx=None):
         'cemeteryAddress': cemetery_address,
         'statusTags': status_tags,
         'statusLabel': ', '.join(status_tags),
+        'pathKey': path_key,
+        'pathLabel': _admin_pages_str(admin_page.get('pathLabel')),
         'qrCode': qr_code or None,
+        'qrNumber': wired_qr_code_id or None,
+        'wiredQrCodeId': wired_qr_code_id or None,
         'qrLabel': qr_code,
         'area': _admin_pages_str(item.get('area')),
         'areaId': _admin_pages_str(item.get('areaId')),
         'cemetery': _admin_pages_str(item.get('cemetery')),
-        'phone': _admin_pages_str(admin_page.get('phone')),
-        'notable': bool(item.get('notable')),
+        'phone': phone,
+        'customerPhone': customer_phone,
+        'companyName': _admin_pages_str(admin_page.get('companyName')) or _admin_pages_str(item.get('companyName')),
+        'notable': notable,
+        'internetLinks': internet_links,
+        'achievements': achievements,
+        'sourceLink': internet_links,
+        'link': internet_links,
+        'bio': bio,
+        'burialSiteCoords': burial_site_coords,
+        'burialSitePhotoUrl': lead_photo,
+        'burialSitePhotoUrls': burial_photo_urls,
         'lifeRangeText': life_range_text,
     }
 
@@ -908,6 +997,13 @@ def admin_list_pages():
                 {'burial.cemeteryRef.name': pattern},
                 {'area': pattern},
                 {'adminPage.phone': pattern},
+                {'adminPage.customerPhone': pattern},
+                {'adminPage.companyName': pattern},
+                {'adminPage.qrCode': pattern},
+                {'adminPage.wiredQrCodeId': pattern},
+                {'sourceLink': pattern},
+                {'link': pattern},
+                {'bio': pattern},
             ]
         }
 
@@ -915,7 +1011,34 @@ def admin_list_pages():
 
     person_ids = [str(doc.get('_id') or '') for doc in docs if doc.get('_id')]
     plaques_person_ids = set()
+    wired_qr_by_person_and_path = {}
     if person_ids:
+        wired_qr_cursor = admin_qr_codes_collection.find(
+            {
+                'wiredPersonId': {'$in': person_ids},
+                'pathKey': {'$in': ['premium_qr', 'premium_qr_firma', 'plaques']},
+            },
+            {
+                'wiredPersonId': 1,
+                'pathKey': 1,
+                'wiredQrCodeId': 1,
+                'qrNumber': 1,
+            },
+        ).sort([('createdAt', -1), ('_id', -1)])
+        for qr_doc in wired_qr_cursor:
+            raw_person_id = qr_doc.get('wiredPersonId')
+            if isinstance(raw_person_id, ObjectId):
+                person_id = str(raw_person_id)
+            else:
+                person_id = _admin_pages_str(raw_person_id)
+            path_key = _admin_pages_str(qr_doc.get('pathKey')).lower()
+            wired_qr_code_id = _admin_pages_str(qr_doc.get('wiredQrCodeId')) or _admin_pages_str(qr_doc.get('qrNumber'))
+            if not person_id or not path_key or not wired_qr_code_id:
+                continue
+            lookup_key = f'{person_id}::{path_key}'
+            if lookup_key not in wired_qr_by_person_and_path:
+                wired_qr_by_person_and_path[lookup_key] = wired_qr_code_id
+
         wired_cursor = admin_qr_codes_collection.find(
             {
                 'pathKey': 'plaques',
@@ -932,7 +1055,10 @@ def admin_list_pages():
             if cleaned_person_id:
                 plaques_person_ids.add(cleaned_person_id)
 
-    extra_ctx = {'plaquesPersonIds': plaques_person_ids}
+    extra_ctx = {
+        'plaquesPersonIds': plaques_person_ids,
+        'wiredQrByPersonAndPath': wired_qr_by_person_and_path,
+    }
     pages = [_admin_pages_projection(person, index + 1, extra_ctx=extra_ctx) for index, person in enumerate(docs)]
     return jsonify({
         'total': len(pages),
@@ -954,7 +1080,22 @@ def admin_create_page():
     area_id = _admin_pages_str(data.get('areaId'))
     cemetery = _admin_pages_str(data.get('cemetery'))
     phone = _admin_pages_str(data.get('phone'))
+    customer_phone = _admin_pages_str(data.get('customerPhone'))
+    company_name = _admin_pages_str(data.get('companyName'))
+    generated_password = _admin_pages_str(data.get('generatedPassword'))
     qr_code = _admin_pages_str(data.get('qrCode'))
+    wired_qr_code_id = _admin_pages_str(data.get('wiredQrCodeId'))
+    path_key = _admin_pages_str(data.get('pathKey'))
+    path_label = _admin_pages_str(data.get('pathLabel'))
+    internet_links = _admin_pages_str(data.get('internetLinks') or data.get('sourceLink') or data.get('link'))
+    achievements = _admin_pages_str(data.get('achievements'))
+    bio = _admin_pages_str(data.get('bio'))
+    burial_site_coords = _admin_pages_str(data.get('burialSiteCoords'))
+    burial_site_photo_url = _admin_pages_str(data.get('burialSitePhotoUrl'))
+    burial_site_photo_urls = data.get('burialSitePhotoUrls') if isinstance(data.get('burialSitePhotoUrls'), list) else []
+    burial_site_photo_urls = [_admin_pages_str(url) for url in burial_site_photo_urls if _admin_pages_str(url)]
+    if not burial_site_photo_urls and burial_site_photo_url:
+        burial_site_photo_urls = [burial_site_photo_url]
 
     birth_year = _admin_pages_parse_year(data.get('birthYear'))
     death_year = _admin_pages_parse_year(data.get('deathYear'))
@@ -970,22 +1111,46 @@ def admin_create_page():
     elif death_year is None and range_death is not None:
         death_year = range_death
 
-    burial, legacy = _admin_pages_build_burial_from_fields(area_id, area, cemetery)
+    burial, legacy = _admin_pages_build_burial_from_fields(
+        area_id,
+        area,
+        cemetery,
+        burial_site_coords=burial_site_coords,
+        burial_site_photo_urls=burial_site_photo_urls,
+    )
+
+    notable = bool(data.get('notable')) or bool(internet_links) or bool(achievements) or bool(bio)
 
     admin_page_payload = {}
     if phone:
         admin_page_payload['phone'] = phone
+    if customer_phone:
+        admin_page_payload['customerPhone'] = customer_phone
+    if company_name:
+        admin_page_payload['companyName'] = company_name
     if qr_code:
         admin_page_payload['qrCode'] = qr_code
+    if wired_qr_code_id:
+        admin_page_payload['wiredQrCodeId'] = wired_qr_code_id
+    if path_key:
+        admin_page_payload['pathKey'] = path_key
+    if path_label:
+        admin_page_payload['pathLabel'] = path_label
     admin_page_payload['updatedAt'] = datetime.utcnow()
 
     doc = {
         'name': name,
-        'notable': bool(data.get('notable', False)),
+        'notable': notable,
         'adminPage': admin_page_payload,
         'createdAt': datetime.utcnow(),
         'updatedAt': datetime.utcnow(),
     }
+    if any(key in data for key in ('internetLinks', 'sourceLink', 'link', 'achievements', 'bio', 'notable')):
+        doc['sourceLink'] = internet_links
+        doc['link'] = internet_links
+        doc['internetLinks'] = internet_links
+        doc['achievements'] = achievements
+        doc['bio'] = bio
 
     if _location_write_is_canonical() or _location_write_is_dual():
         doc['burial'] = burial
@@ -1003,6 +1168,11 @@ def admin_create_page():
         doc['deathYear'] = death_year
     if death_date:
         doc['deathDate'] = death_date
+    if generated_password:
+        doc['premium'] = {
+            'password': hash_password(generated_password),
+            'updatedAt': datetime.utcnow(),
+        }
 
     inserted = people_collection.insert_one(doc)
     created = people_collection.find_one({'_id': inserted.inserted_id})
@@ -1031,7 +1201,26 @@ def admin_update_page(person_id):
             abort(400, description='`name` cannot be empty')
         update_fields['name'] = name
 
-    if 'notable' in data:
+    existing_admin_page = existing.get('adminPage') if isinstance(existing.get('adminPage'), dict) else {}
+    effective_path_key = _admin_pages_str(data.get('pathKey') or existing_admin_page.get('pathKey')).lower()
+    effective_path_label = _admin_pages_str(data.get('pathLabel') or existing_admin_page.get('pathLabel')).lower()
+    is_premium_qr_type = (
+        effective_path_key in {'premium_qr', 'premium_qr_firma'}
+        or 'преміум qr' in effective_path_label
+    )
+    internet_links = _admin_pages_str(data.get('internetLinks') or data.get('sourceLink') or data.get('link'))
+    achievements = _admin_pages_str(data.get('achievements'))
+    bio = _admin_pages_str(data.get('bio'))
+    if any(key in data for key in ('internetLinks', 'sourceLink', 'link', 'achievements', 'bio', 'notable')):
+        notable = bool(data.get('notable')) if 'notable' in data else bool(existing.get('notable'))
+        notable = bool(notable) or bool(internet_links) or bool(achievements) or bool(bio)
+        update_fields['notable'] = notable
+        update_fields['sourceLink'] = internet_links
+        update_fields['link'] = internet_links
+        update_fields['internetLinks'] = internet_links
+        update_fields['achievements'] = achievements
+        update_fields['bio'] = bio
+    elif 'notable' in data:
         update_fields['notable'] = bool(data.get('notable'))
 
     birth_year = _admin_pages_parse_year(data.get('birthYear')) if 'birthYear' in data else None
@@ -1078,23 +1267,98 @@ def admin_update_page(person_id):
             merged_admin_page['phone'] = phone
         else:
             merged_admin_page.pop('phone', None)
+    if 'customerPhone' in data:
+        customer_phone = _admin_pages_str(data.get('customerPhone'))
+        if customer_phone:
+            merged_admin_page['customerPhone'] = customer_phone
+        else:
+            merged_admin_page.pop('customerPhone', None)
+    if 'companyName' in data:
+        company_name = _admin_pages_str(data.get('companyName'))
+        if company_name:
+            merged_admin_page['companyName'] = company_name
+        else:
+            merged_admin_page.pop('companyName', None)
+    if 'generatedPassword' in data:
+        generated_password = _admin_pages_str(data.get('generatedPassword'))
+        if generated_password:
+            update_fields['premium.password'] = hash_password(generated_password)
+            update_fields['premium.updatedAt'] = datetime.utcnow()
+        merged_admin_page.pop('generatedPassword', None)
     if 'qrCode' in data:
         qr_code = _admin_pages_str(data.get('qrCode'))
         if qr_code:
             merged_admin_page['qrCode'] = qr_code
         else:
             merged_admin_page.pop('qrCode', None)
-    if any(key in data for key in ('phone', 'qrCode')):
+    if 'wiredQrCodeId' in data:
+        wired_qr_code_id = _admin_pages_str(data.get('wiredQrCodeId'))
+        if wired_qr_code_id:
+            merged_admin_page['wiredQrCodeId'] = wired_qr_code_id
+        else:
+            merged_admin_page.pop('wiredQrCodeId', None)
+    if 'pathKey' in data:
+        path_key = _admin_pages_str(data.get('pathKey'))
+        if path_key:
+            merged_admin_page['pathKey'] = path_key
+        else:
+            merged_admin_page.pop('pathKey', None)
+    if 'pathLabel' in data:
+        path_label = _admin_pages_str(data.get('pathLabel'))
+        if path_label:
+            merged_admin_page['pathLabel'] = path_label
+        else:
+            merged_admin_page.pop('pathLabel', None)
+    if any(key in data for key in ('phone', 'customerPhone', 'companyName', 'generatedPassword', 'qrCode', 'wiredQrCodeId', 'pathKey', 'pathLabel')):
         merged_admin_page['updatedAt'] = datetime.utcnow()
         update_fields['adminPage'] = merged_admin_page
 
-    location_change_keys = {'area', 'areaId', 'cemetery'}
+    location_change_keys = {'area', 'areaId', 'cemetery', 'burialSiteCoords', 'burialSitePhotoUrl', 'burialSitePhotoUrls'}
     has_location_changes = any(key in data for key in location_change_keys)
     if has_location_changes:
         next_area_id = _admin_pages_str(data.get('areaId')) if 'areaId' in data else _admin_pages_str(existing.get('areaId'))
         next_area = _admin_pages_str(data.get('area')) if 'area' in data else _admin_pages_str(existing.get('area'))
         next_cemetery = _admin_pages_str(data.get('cemetery')) if 'cemetery' in data else _admin_pages_str(existing.get('cemetery'))
-        burial, legacy = _admin_pages_build_burial_from_fields(next_area_id, next_area, next_cemetery)
+        next_burial_site_coords = (
+            _admin_pages_str(data.get('burialSiteCoords'))
+            if 'burialSiteCoords' in data
+            else _admin_pages_str(existing.get('burialSiteCoords'))
+        )
+        next_burial_site_photo_url = (
+            _admin_pages_str(data.get('burialSitePhotoUrl'))
+            if 'burialSitePhotoUrl' in data
+            else _admin_pages_str(existing.get('burialSitePhotoUrl'))
+        )
+        if 'burialSitePhotoUrls' in data and isinstance(data.get('burialSitePhotoUrls'), list):
+            next_burial_site_photo_urls = [
+                _admin_pages_str(url)
+                for url in data.get('burialSitePhotoUrls')
+                if _admin_pages_str(url)
+            ]
+        else:
+            raw_existing_photo_urls = existing.get('burialSitePhotoUrls')
+            next_burial_site_photo_urls = []
+            if isinstance(raw_existing_photo_urls, list):
+                next_burial_site_photo_urls = [_admin_pages_str(url) for url in raw_existing_photo_urls if _admin_pages_str(url)]
+            if not next_burial_site_photo_urls:
+                existing_burial = normalize_person_burial(existing)
+                existing_location = existing_burial.get('location') if isinstance(existing_burial.get('location'), dict) else {}
+                existing_location_photos = existing_location.get('photos') if isinstance(existing_location, dict) else []
+                if isinstance(existing_location_photos, list):
+                    next_burial_site_photo_urls = [
+                        _admin_pages_str(url)
+                        for url in existing_location_photos
+                        if _admin_pages_str(url)
+                    ]
+        if not next_burial_site_photo_urls and next_burial_site_photo_url:
+            next_burial_site_photo_urls = [next_burial_site_photo_url]
+        burial, legacy = _admin_pages_build_burial_from_fields(
+            next_area_id,
+            next_area,
+            next_cemetery,
+            burial_site_coords=next_burial_site_coords,
+            burial_site_photo_urls=next_burial_site_photo_urls,
+        )
 
         if _location_write_is_canonical() or _location_write_is_dual():
             update_fields['burial'] = burial
@@ -1123,6 +1387,21 @@ def admin_delete_page(person_id):
     result = people_collection.delete_one({'_id': oid})
     if result.deleted_count == 0:
         abort(404, description='Person not found')
+
+    # Delete all QR rows wired to this person (across all paths), while leaving unwired inventory intact.
+    qr_delete_query = {
+        '$or': [
+            {'wiredPersonId': person_id},
+            {'wiredPersonId': oid},
+        ]
+    }
+    qr_deleted = admin_qr_codes_collection.delete_many(qr_delete_query)
+    application.logger.info(
+        'admin_delete_page: deleted person_id=%s, person_docs=%s, wired_qr_docs=%s',
+        person_id,
+        result.deleted_count,
+        qr_deleted.deleted_count,
+    )
 
     return ('', 204)
 
@@ -1205,10 +1484,11 @@ def _admin_moderation_projection(raw_doc):
     area = loc_clean_str(item.get('area')) or loc_clean_str(address.get('display'))
     cemetery_exists = _admin_moderation_cemetery_exists(cemetery_name, area)
 
-    link = loc_clean_str(item.get('link') or item.get('internetLinks'))
-    achievements = loc_clean_str(item.get('bio') or item.get('achievements'))
+    link = loc_clean_str(item.get('sourceLink') or item.get('link') or item.get('internetLinks'))
+    achievements = loc_clean_str(item.get('achievements'))
+    bio = loc_clean_str(item.get('bio'))
     occupation = loc_clean_str(item.get('occupation'))
-    notable = bool(item.get('notable')) or bool(link) or bool(achievements)
+    notable = bool(item.get('notable')) or bool(link) or bool(achievements) or bool(bio)
 
     return {
         'id': str(item.get('_id')),
@@ -1224,8 +1504,9 @@ def _admin_moderation_projection(raw_doc):
         'phone': loc_clean_str(item.get('phone')),
         'internetLinks': link,
         'achievements': achievements,
+        'sourceLink': link,
         'link': link,
-        'bio': achievements,
+        'bio': bio,
         'occupation': occupation,
         'burialSiteCoords': loc_clean_str(item.get('burialSiteCoords')),
         'burialSitePhotoUrls': burial_photo_urls,
@@ -1284,26 +1565,32 @@ def _admin_build_person_from_moderation(moderation_doc, incoming):
 
     internet_links = loc_clean_str(
         payload.get('internetLinks') if 'internetLinks' in payload
+        else payload.get('sourceLink') if 'sourceLink' in payload
         else payload.get('link') if 'link' in payload
         else source.get('internetLinks') if 'internetLinks' in source
+        else source.get('sourceLink') if 'sourceLink' in source
         else source.get('link')
     )
     achievements = loc_clean_str(
         payload.get('achievements') if 'achievements' in payload
-        else payload.get('bio') if 'bio' in payload
-        else source.get('achievements') if 'achievements' in source
+        else source.get('achievements')
+    )
+    bio = loc_clean_str(
+        payload.get('bio') if 'bio' in payload
         else source.get('bio')
     )
     occupation = loc_clean_str(payload.get('occupation') if 'occupation' in payload else source.get('occupation'))
     notable_flag = payload.get('notable') if 'notable' in payload else source.get('notable')
-    notable = bool(notable_flag) or bool(internet_links) or bool(achievements) or bool(occupation)
+    notable = bool(notable_flag) or bool(internet_links) or bool(achievements) or bool(bio) or bool(occupation)
 
     phone = loc_clean_str(payload.get('phone') if 'phone' in payload else source.get('phone'))
 
     doc = {
         'name': name,
         'notable': notable,
-        'bio': achievements,
+        'achievements': achievements,
+        'bio': bio,
+        'sourceLink': internet_links,
         'createdAt': datetime.utcnow(),
         'updatedAt': datetime.utcnow(),
     }
@@ -1324,9 +1611,6 @@ def _admin_build_person_from_moderation(moderation_doc, incoming):
         doc['birthDate'] = birth_date
     if death_date:
         doc['deathDate'] = death_date
-
-    if burial_photo_urls:
-        doc['photos'] = [{'url': url, 'description': ''} for url in burial_photo_urls]
 
     if internet_links:
         doc['sourceLink'] = internet_links
@@ -1354,6 +1638,7 @@ def admin_list_person_moderation():
                 {'cemetery': pattern},
                 {'area': pattern},
                 {'bio': pattern},
+                {'sourceLink': pattern},
                 {'link': pattern},
                 {'achievements': pattern},
                 {'internetLinks': pattern},
@@ -1380,6 +1665,13 @@ def admin_verify_person_moderation(moderation_id):
         abort(404, description='Moderation record not found')
 
     payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        abort(400, description='Request must be a JSON object')
+
+    cemetery_name = loc_clean_str(payload.get('cemetery') or moderation_doc.get('cemetery'))
+    area = loc_clean_str(payload.get('area') or moderation_doc.get('area'))
+    if not _admin_moderation_cemetery_exists(cemetery_name, area):
+        abort(400, description='Активація недоступна: кладовище має статус "Не додано".')
     person_doc = _admin_build_person_from_moderation(moderation_doc, payload)
 
     created = people_collection.insert_one(person_doc)
@@ -1461,7 +1753,7 @@ def _admin_plaques_projection(raw_doc):
     cemetery_name = loc_clean_str(cemetery_ref.get('name')) or loc_clean_str(item.get('cemetery'))
     area = loc_clean_str(item.get('area')) or loc_clean_str(address.get('display'))
     cemetery_exists = _admin_moderation_cemetery_exists(cemetery_name, area)
-    link = loc_clean_str(item.get('link') or item.get('internetLinks'))
+    link = loc_clean_str(item.get('sourceLink') or item.get('link') or item.get('internetLinks'))
     achievements = loc_clean_str(item.get('bio') or item.get('achievements'))
     occupation = loc_clean_str(item.get('occupation'))
     notable = bool(item.get('notable')) or bool(link) or bool(achievements) or bool(occupation)
@@ -1484,6 +1776,7 @@ def _admin_plaques_projection(raw_doc):
         'phone': loc_clean_str(item.get('phone')),
         'internetLinks': link,
         'achievements': achievements,
+        'sourceLink': link,
         'link': link,
         'bio': achievements,
         'occupation': occupation,
@@ -1566,10 +1859,14 @@ def _admin_plaques_build_updated_document(current_doc, payload):
     internet_links = loc_clean_str(
         incoming.get('internetLinks')
         if 'internetLinks' in incoming
+        else incoming.get('sourceLink')
+        if 'sourceLink' in incoming
         else incoming.get('link')
         if 'link' in incoming
         else source.get('internetLinks')
         if 'internetLinks' in source
+        else source.get('sourceLink')
+        if 'sourceLink' in source
         else source.get('link')
     )
     achievements = loc_clean_str(
@@ -1590,6 +1887,7 @@ def _admin_plaques_build_updated_document(current_doc, payload):
         'name': name,
         'notable': notable,
         'bio': achievements,
+        'sourceLink': internet_links,
         'link': internet_links,
         'internetLinks': internet_links,
         'achievements': achievements,
@@ -1678,6 +1976,7 @@ def admin_list_plaques_moderation():
                 {'cemetery': pattern},
                 {'area': pattern},
                 {'phone': pattern},
+                {'sourceLink': pattern},
                 {'link': pattern},
                 {'bio': pattern},
                 {'internetLinks': pattern},
@@ -1760,6 +2059,11 @@ def admin_activate_plaques_moderation(moderation_id):
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         abort(400, description='Request must be a JSON object')
+
+    cemetery_name = loc_clean_str(payload.get('cemetery') or moderation_doc.get('cemetery'))
+    area = loc_clean_str(payload.get('area') or moderation_doc.get('area'))
+    if not _admin_moderation_cemetery_exists(cemetery_name, area):
+        abort(400, description='Активація недоступна: кладовище має статус "Не додано".')
 
     person_doc = _admin_build_person_from_moderation(moderation_doc, payload)
     qr_doc = _admin_plaques_pick_qr_for_activation(moderation_doc)
@@ -2078,6 +2382,9 @@ def get_person(person_id):
                 photos_norm.append(n)
 
     person = _person_with_location_projection(person)
+    premium_payload = sanitize_premium_payload(person.get('premium'))
+    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
+    admin_path_key = _clean_str(admin_page.get('pathKey')).lower()
     response = {
         "id": str(person['_id']),
         "name": person.get('name'),
@@ -2095,10 +2402,14 @@ def get_person(person_id):
         "location": person.get('location'),
         "burial": person.get('burial') if _location_read_uses_canonical() else None,
         "bio": person.get('bio'),
+        "achievements": person.get('achievements') or person.get('bio') or '',
+        "sourceLink": person.get('sourceLink') or person.get('internetLinks') or person.get('link') or '',
         "photos": photos_norm,
         "sharedPending": person.get('sharedPending', []),
         "sharedPhotos": person.get('sharedPhotos', []),
-        "comments": _sort_comments(person.get('comments', []))
+        "comments": _sort_comments(person.get('comments', [])),
+        "isPremiumProfile": bool(premium_payload),
+        "isPlaqueProfile": admin_path_key == 'plaques',
     }
     if 'relatives' in person:
         response['relatives'] = [
@@ -3207,6 +3518,46 @@ def _ads_columns_meta_for_cemetery(cemetery_oid):
     return ads_columns_meta_collection.find_one({'cemeteryId': cemetery_oid}, {'totalColumns': 1, 'priceUah': 1, 'maxColumnsAds': 1, 'maxPagesAds': 1})
 
 
+def _ads_limit_field_for_surface(surface_type):
+    if surface_type == 'columns':
+        return 'maxColumnsAds'
+    if surface_type == 'pages':
+        return 'maxPagesAds'
+    return ''
+
+
+def _ads_limit_label_for_surface(surface_type):
+    if surface_type == 'columns':
+        return 'стовпчиках'
+    if surface_type == 'pages':
+        return 'сторінках'
+    return 'площинах'
+
+
+def _ads_active_limit_for_surface(cemetery_oid, surface_type):
+    limit_field = _ads_limit_field_for_surface(surface_type)
+    if not limit_field:
+        return None
+    meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    return max(_ads_clean_int(meta.get(limit_field), limit_field, default=0), 0)
+
+
+def _ads_enforce_active_limit(cemetery_oid, surface_type, ignore_campaign_id=None):
+    limit = _ads_active_limit_for_surface(cemetery_oid, surface_type)
+    if limit is None:
+        return
+
+    query_filter = {'cemeteryId': cemetery_oid, 'status': 'active'}
+    query_filter.update(_ads_surface_query_for_mode(surface_type))
+    if ignore_campaign_id is not None:
+        query_filter['_id'] = {'$ne': ignore_campaign_id}
+
+    active_count = ads_campaigns_collection.count_documents(query_filter)
+    if active_count >= limit:
+        label = _ads_limit_label_for_surface(surface_type)
+        abort(409, description=f'Ліміт реклами на {label} для цього кладовища вичерпано ({limit}).')
+
+
 def _ads_build_campaign_payload(data, partial=False, existing=None):
     if not isinstance(data, dict):
         abort(400, description='Body must be a JSON object')
@@ -3545,6 +3896,8 @@ def admin_ads_get_columns_cemetery(cemetery_id):
 def admin_ads_create_campaign():
     data = request.get_json(silent=True) or {}
     payload = _ads_build_campaign_payload(data, partial=False, existing=None)
+    if _ads_normalize_campaign_status(payload.get('status')) == 'active':
+        _ads_enforce_active_limit(payload.get('cemeteryId'), _ads_normalize_surface_type(payload.get('surfaceType'), default='columns'))
     now = datetime.utcnow()
     payload['createdAt'] = now
     payload['updatedAt'] = now
@@ -3569,6 +3922,13 @@ def admin_ads_update_campaign(campaign_id):
     update_fields = _ads_build_campaign_payload(data, partial=True, existing=existing)
     if not update_fields:
         abort(400, description='Nothing to update')
+
+    next_status = _ads_normalize_campaign_status(update_fields.get('status', existing.get('status')))
+    next_surface_type = _ads_normalize_surface_type(update_fields.get('surfaceType', existing.get('surfaceType')), default='columns')
+    next_cemetery_oid = update_fields.get('cemeteryId', existing.get('cemeteryId'))
+    if next_status == 'active':
+        _ads_enforce_active_limit(next_cemetery_oid, next_surface_type, ignore_campaign_id=campaign_oid)
+
     update_fields['updatedAt'] = datetime.utcnow()
 
     ads_campaigns_collection.update_one({'_id': campaign_oid}, {'$set': update_fields})
@@ -3589,6 +3949,12 @@ def admin_ads_set_campaign_status(campaign_id):
 
     data = request.get_json(silent=True) or {}
     status = _ads_normalize_campaign_status(data.get('status'))
+    if status == 'active':
+        _ads_enforce_active_limit(
+            existing.get('cemeteryId'),
+            _ads_normalize_surface_type(existing.get('surfaceType'), default='columns'),
+            ignore_campaign_id=campaign_oid,
+        )
     ads_campaigns_collection.update_one(
         {'_id': campaign_oid},
         {'$set': {'status': status, 'updatedAt': datetime.utcnow()}}
@@ -3665,6 +4031,11 @@ def admin_ads_verify_application(application_id):
         source.update(data)
 
     campaign_payload = _ads_build_campaign_payload(source, partial=False, existing=None)
+    if _ads_normalize_campaign_status(campaign_payload.get('status')) == 'active':
+        _ads_enforce_active_limit(
+            campaign_payload.get('cemeteryId'),
+            _ads_normalize_surface_type(campaign_payload.get('surfaceType'), default='columns'),
+        )
     campaign_payload['sourceApplicationId'] = application_oid
     now = datetime.utcnow()
     campaign_payload['createdAt'] = now
@@ -3735,6 +4106,58 @@ def create_public_ads_application():
         'success': True,
         'application': _ads_serialize_application(created),
     }), 201
+
+
+def _ads_pick_random_active_campaign(query_filter):
+    docs = list(
+        ads_campaigns_collection
+        .find(query_filter)
+        .sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
+    )
+    if not docs:
+        return None
+    return random.choice(docs)
+
+
+@application.route('/api/ads/columns/random', methods=['GET'])
+def get_public_random_columns_ad():
+    cemetery_oid = _ads_parse_cemetery_object_id(request.args.get('cemeteryId'), required=True)
+    campaign = _ads_pick_random_active_campaign({
+        'cemeteryId': cemetery_oid,
+        'status': 'active',
+        **_ads_surface_query_for_mode('columns'),
+    })
+    if not campaign:
+        return make_response('', 204)
+    return jsonify(_ads_serialize_campaign(campaign))
+
+
+@application.route('/api/ads/pages/random', methods=['GET'])
+def get_public_random_pages_ad():
+    cemetery_oid = _ads_parse_cemetery_object_id(request.args.get('cemeteryId'), required=True)
+    campaign = _ads_pick_random_active_campaign({
+        'cemeteryId': cemetery_oid,
+        'status': 'active',
+        **_ads_surface_query_for_mode('pages'),
+    })
+    if not campaign:
+        return make_response('', 204)
+    return jsonify(_ads_serialize_campaign(campaign))
+
+
+@application.route('/api/ads/plaques/random', methods=['GET'])
+def get_public_random_plaques_ad():
+    person_id = _clean_str(request.args.get('personId'))
+    if not person_id:
+        abort(400, description='`personId` is required')
+    campaign = _ads_pick_random_active_campaign({
+        'status': 'active',
+        **_ads_surface_query_for_mode('plaques'),
+        'plaques.personId': person_id,
+    })
+    if not campaign:
+        return make_response('', 204)
+    return jsonify(_ads_serialize_campaign(campaign))
 
 
 @application.route('/api/admin/ads/settings/<string:cemetery_id>', methods=['GET'])
@@ -5177,6 +5600,22 @@ def _admin_note_payments_row_output(row):
     legacy_receipt_url = _clean_str(row.get('receiptUrl'))
     if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
         receipt_urls.append(legacy_receipt_url)
+    receipt_preview_urls = []
+    raw_preview_urls = row.get('receiptPreviewUrls')
+    if isinstance(raw_preview_urls, list):
+        for item in raw_preview_urls:
+            receipt_preview_urls.append(_clean_str(item))
+    legacy_preview_url = _clean_str(row.get('receiptPreviewUrl'))
+    if legacy_preview_url:
+        if receipt_preview_urls:
+            if not _clean_str(receipt_preview_urls[0]):
+                receipt_preview_urls[0] = legacy_preview_url
+        else:
+            receipt_preview_urls.append(legacy_preview_url)
+    while len(receipt_preview_urls) < len(receipt_urls):
+        receipt_preview_urls.append('')
+    if len(receipt_preview_urls) > len(receipt_urls):
+        receipt_preview_urls = receipt_preview_urls[:len(receipt_urls)]
     telegram_chat_ids = _clean_telegram_chat_ids(row.get('telegramChatIds'))
     legacy_chat_id = _clean_str(row.get('telegramChatId'))
     if legacy_chat_id and legacy_chat_id not in telegram_chat_ids:
@@ -5192,6 +5631,8 @@ def _admin_note_payments_row_output(row):
         'sumAmount': int(row.get('sumAmount') or 0),
         'receiptUrls': receipt_urls,
         'receiptUrl': receipt_urls[0] if receipt_urls else '',
+        'receiptPreviewUrls': receipt_preview_urls,
+        'receiptPreviewUrl': receipt_preview_urls[0] if receipt_preview_urls else '',
         'paid': bool(row.get('paid')),
         'paidAt': _clean_str(row.get('paidAt')),
         'unlocked': bool(row.get('unlocked')),
@@ -5206,6 +5647,118 @@ def _admin_note_payments_row_output(row):
             'autoConfirmed': bool(confirmation.get('autoConfirmed')),
         },
     }
+
+
+def _admin_note_payments_get_receipt_key(receipt_url):
+    cleaned_url = _clean_str(receipt_url)
+    if not cleaned_url:
+        return ''
+    try:
+        parsed = urlparse(cleaned_url)
+        host = (parsed.netloc or '').lower()
+        expected_host = f"{(SPACES_BUCKET or '').lower()}.{(SPACES_REGION or '').lower()}.digitaloceanspaces.com"
+        if expected_host and host and host != expected_host:
+            return ''
+        key = parsed.path.lstrip('/')
+        return key if key else ''
+    except Exception:
+        return ''
+
+
+def _admin_note_payments_preview_key_from_receipt_key(receipt_key):
+    cleaned_key = _clean_str(receipt_key)
+    if not cleaned_key:
+        return ''
+    if '.' in cleaned_key.rsplit('/', 1)[-1]:
+        base, _ = cleaned_key.rsplit('.', 1)
+        return f"{base}__thumb.png"
+    return f"{cleaned_key}__thumb.png"
+
+
+def _admin_note_payments_generate_pdf_preview_png(pdf_bytes):
+    if not pdf_bytes or pdfium is None:
+        return None
+    document = None
+    page = None
+    bitmap = None
+    try:
+        document = pdfium.PdfDocument(pdf_bytes)
+        if len(document) < 1:
+            return None
+        page = document[0]
+        bitmap = page.render(scale=1.2)
+        pil_image = bitmap.to_pil()
+        output = io.BytesIO()
+        pil_image.save(output, format='PNG')
+        return output.getvalue()
+    except Exception as exc:
+        application.logger.warning('Failed to render receipt PDF preview: %s', exc)
+        return None
+    finally:
+        try:
+            if bitmap is not None:
+                bitmap.close()
+        except Exception:
+            pass
+        try:
+            if page is not None:
+                page.close()
+        except Exception:
+            pass
+        try:
+            if document is not None:
+                document.close()
+        except Exception:
+            pass
+
+
+def _admin_note_payments_build_preview_url(receipt_url):
+    receipt_key = _admin_note_payments_get_receipt_key(receipt_url)
+    if not receipt_key:
+        return ''
+    preview_key = _admin_note_payments_preview_key_from_receipt_key(receipt_key)
+    if not preview_key:
+        return ''
+    return f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{preview_key}"
+
+
+def _admin_note_payments_generate_and_upload_preview(receipt_url):
+    if not SPACES_BUCKET or not SPACES_REGION:
+        return ''
+    receipt_key = _admin_note_payments_get_receipt_key(receipt_url)
+    if not receipt_key:
+        return ''
+    preview_key = _admin_note_payments_preview_key_from_receipt_key(receipt_key)
+    if not preview_key:
+        return ''
+    try:
+        response = requests.get(receipt_url, timeout=25)
+        response.raise_for_status()
+        preview_png = _admin_note_payments_generate_pdf_preview_png(response.content)
+        if not preview_png:
+            return ''
+        s3.put_object(
+            Bucket=SPACES_BUCKET,
+            Key=preview_key,
+            Body=preview_png,
+            ACL='public-read',
+            ContentType='image/png',
+            CacheControl='public, max-age=31536000, immutable',
+        )
+        return f"https://{SPACES_BUCKET}.{SPACES_REGION}.digitaloceanspaces.com/{preview_key}"
+    except Exception as exc:
+        application.logger.warning('Failed to generate/upload receipt preview: %s', exc)
+        return ''
+
+
+def _admin_note_payments_delete_preview_object(preview_url):
+    preview_key = _admin_note_payments_get_receipt_key(preview_url)
+    if not preview_key:
+        return
+    try:
+        s3.delete_object(Bucket=SPACES_BUCKET, Key=preview_key)
+    except Exception as exc:
+        application.logger.warning('Failed to delete receipt preview object: %s', exc)
 
 
 def _admin_note_payments_recompute_status(doc):
@@ -5514,6 +6067,8 @@ def admin_note_payments_create_previous_month():
             'sumAmount': int(sums_by_church_id.get(str(church_doc.get('_id')), 0)),
             'receiptUrls': [],
             'receiptUrl': '',
+            'receiptPreviewUrls': [],
+            'receiptPreviewUrl': '',
             'paid': False,
             'paidAt': None,
             'unlocked': index == 1,
@@ -5745,10 +6300,32 @@ def admin_note_payments_set_receipt(payment_id, row_id):
     legacy_receipt_url = _clean_str(row.get('receiptUrl'))
     if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
         receipt_urls.append(legacy_receipt_url)
+    receipt_preview_urls = []
+    raw_preview_urls = row.get('receiptPreviewUrls')
+    if isinstance(raw_preview_urls, list):
+        for item in raw_preview_urls:
+            receipt_preview_urls.append(_clean_str(item))
+    legacy_preview_url = _clean_str(row.get('receiptPreviewUrl'))
+    if legacy_preview_url:
+        if receipt_preview_urls:
+            if not _clean_str(receipt_preview_urls[0]):
+                receipt_preview_urls[0] = legacy_preview_url
+        else:
+            receipt_preview_urls.append(legacy_preview_url)
+    while len(receipt_preview_urls) < len(receipt_urls):
+        receipt_preview_urls.append('')
+    if len(receipt_preview_urls) > len(receipt_urls):
+        receipt_preview_urls = receipt_preview_urls[:len(receipt_urls)]
     if receipt_url not in receipt_urls:
+        preview_url = _admin_note_payments_generate_and_upload_preview(receipt_url)
+        if not preview_url:
+            preview_url = _admin_note_payments_build_preview_url(receipt_url)
         receipt_urls.append(receipt_url)
+        receipt_preview_urls.append(preview_url)
     row['receiptUrls'] = receipt_urls
     row['receiptUrl'] = receipt_urls[0] if receipt_urls else ''
+    row['receiptPreviewUrls'] = receipt_preview_urls
+    row['receiptPreviewUrl'] = receipt_preview_urls[0] if receipt_preview_urls else ''
     doc['updatedAt'] = datetime.utcnow()
     admin_note_payments_collection.update_one(
         {'_id': doc.get('_id')},
@@ -5775,13 +6352,35 @@ def admin_note_payments_delete_receipt(payment_id, row_id):
     legacy_receipt_url = _clean_str(row.get('receiptUrl'))
     if legacy_receipt_url and legacy_receipt_url not in receipt_urls:
         receipt_urls.append(legacy_receipt_url)
+    receipt_preview_urls = []
+    raw_preview_urls = row.get('receiptPreviewUrls')
+    if isinstance(raw_preview_urls, list):
+        for item in raw_preview_urls:
+            receipt_preview_urls.append(_clean_str(item))
+    legacy_preview_url = _clean_str(row.get('receiptPreviewUrl'))
+    if legacy_preview_url:
+        if receipt_preview_urls:
+            if not _clean_str(receipt_preview_urls[0]):
+                receipt_preview_urls[0] = legacy_preview_url
+        else:
+            receipt_preview_urls.append(legacy_preview_url)
+    while len(receipt_preview_urls) < len(receipt_urls):
+        receipt_preview_urls.append('')
+    if len(receipt_preview_urls) > len(receipt_urls):
+        receipt_preview_urls = receipt_preview_urls[:len(receipt_urls)]
 
     if receipt_url not in receipt_urls:
         abort(404, description='Receipt file not found')
 
+    deleted_preview_urls = [receipt_preview_urls[idx] for idx, url in enumerate(receipt_urls) if url == receipt_url]
     filtered_urls = [url for url in receipt_urls if url != receipt_url]
+    filtered_preview_urls = [preview for idx, preview in enumerate(receipt_preview_urls) if receipt_urls[idx] != receipt_url]
     row['receiptUrls'] = filtered_urls
     row['receiptUrl'] = filtered_urls[0] if filtered_urls else ''
+    row['receiptPreviewUrls'] = filtered_preview_urls
+    row['receiptPreviewUrl'] = filtered_preview_urls[0] if filtered_preview_urls else ''
+    for preview_url in deleted_preview_urls:
+        _admin_note_payments_delete_preview_object(preview_url)
     doc['updatedAt'] = datetime.utcnow()
     admin_note_payments_collection.update_one(
         {'_id': doc.get('_id')},
@@ -7507,8 +8106,9 @@ def _build_person_moderation_base_document(data):
     legacy = person_burial_to_legacy_fields(burial)
 
     link = loc_clean_str(data.get('link'))
+    achievements = loc_clean_str(data.get('achievements'))
     bio = loc_clean_str(data.get('bio'))
-    notable = bool(data.get('notable')) or bool(link) or bool(bio)
+    notable = bool(data.get('notable')) or bool(link) or bool(achievements) or bool(bio)
 
     document = {
         'name': loc_clean_str(data.get('name')),
@@ -7523,6 +8123,7 @@ def _build_person_moderation_base_document(data):
         'burial': burial,
         'notable': notable,
         'link': link,
+        'achievements': achievements,
         'bio': bio,
         'createdAt': datetime.utcnow(),
     }
@@ -8944,6 +9545,24 @@ def _premium_order_projection(doc, include_existing_person_candidate=False):
     moderation_area = _premium_order_str((moderation_payload or {}).get('area')) or _premium_order_str(doc.get('cemeteryAddress'))
     moderation_area_id = _premium_order_str((moderation_payload or {}).get('areaId'))
     moderation_cemetery = _premium_order_str((moderation_payload or {}).get('cemetery')) or cemetery_name
+    moderation_internet_links = _premium_order_str(
+        (moderation_payload or {}).get('sourceLink')
+        or (moderation_payload or {}).get('link')
+        or (moderation_payload or {}).get('internetLinks')
+    )
+    moderation_achievements = _premium_order_str((moderation_payload or {}).get('bio') or (moderation_payload or {}).get('achievements'))
+    moderation_notable = bool((moderation_payload or {}).get('notable')) or bool(moderation_internet_links) or bool(moderation_achievements)
+    raw_burial_photo_urls = (moderation_payload or {}).get('burialSitePhotoUrls')
+    burial_photo_urls = (
+        [_premium_order_str(url) for url in raw_burial_photo_urls if _premium_order_str(url)]
+        if isinstance(raw_burial_photo_urls, list)
+        else []
+    )
+    burial_site_photo_url = _premium_order_str((moderation_payload or {}).get('burialSitePhotoUrl'))
+    if burial_site_photo_url and burial_site_photo_url not in burial_photo_urls:
+        burial_photo_urls.insert(0, burial_site_photo_url)
+    elif not burial_site_photo_url and burial_photo_urls:
+        burial_site_photo_url = burial_photo_urls[0]
     is_firma_activation = (
         activation_type == 'premium_qr_firma'
         or _premium_order_str(doc.get('qrPathKey')) == 'premium_qr_firma'
@@ -8975,6 +9594,15 @@ def _premium_order_projection(doc, include_existing_person_candidate=False):
         'areaId': moderation_area_id,
         'cemetery': cemetery_name,
         'cemeteryModeration': moderation_cemetery,
+        'notable': moderation_notable,
+        'internetLinks': moderation_internet_links,
+        'sourceLink': moderation_internet_links,
+        'achievements': moderation_achievements,
+        'link': moderation_internet_links,
+        'bio': moderation_achievements,
+        'burialSiteCoords': _premium_order_str((moderation_payload or {}).get('burialSiteCoords')),
+        'burialSitePhotoUrl': burial_site_photo_url,
+        'burialSitePhotoUrls': burial_photo_urls,
         'address': cemetery_address,
         'avatarUrl': _premium_order_str(doc.get('avatarUrl') or doc.get('portraitUrl')),
         'pathType': _premium_order_str(doc.get('pathType')) or 'Сайт',
@@ -9225,6 +9853,20 @@ def admin_update_premium_order(order_id):
     current_doc = premium_orders_collection.find_one({'_id': oid})
     if not current_doc:
         abort(404, description='Order not found')
+    current_activation_type = _premium_order_str(current_doc.get('activationType'))
+    current_qr_path_key = _premium_order_str(current_doc.get('qrPathKey'))
+    current_path_type = _premium_order_str(current_doc.get('pathType')).lower()
+    is_premium_qr_firma_order = (
+        current_activation_type == 'premium_qr_firma'
+        or current_qr_path_key == 'premium_qr_firma'
+        or current_path_type == 'преміум qr | фірма'
+    )
+    is_premium_qr_order = (
+        is_premium_qr_firma_order
+        or current_activation_type == 'premium_qr'
+        or current_qr_path_key == 'premium_qr'
+        or current_path_type == 'преміум qr'
+    )
 
     current_status = _premium_order_str(current_doc.get('status')) or 'on_moderation'
     old_ttn = _premium_order_str(current_doc.get('ttn'))
@@ -9328,6 +9970,30 @@ def admin_update_premium_order(order_id):
         next_moderation_payload['phone'] = next_customer_phone
         moderation_payload_touched = True
 
+    if is_premium_qr_order and any(key in data for key in ('internetLinks', 'sourceLink', 'link')):
+        next_moderation_payload['sourceLink'] = _premium_order_str(
+            data.get('internetLinks') or data.get('sourceLink') or data.get('link')
+        )
+        next_moderation_payload['link'] = _premium_order_str(
+            data.get('internetLinks') or data.get('sourceLink') or data.get('link')
+        )
+        moderation_payload_touched = True
+
+    if is_premium_qr_order and any(key in data for key in ('achievements', 'bio')):
+        next_moderation_payload['bio'] = _premium_order_str(data.get('achievements') or data.get('bio'))
+        moderation_payload_touched = True
+
+    if is_premium_qr_order and any(key in data for key in ('notable', 'internetLinks', 'sourceLink', 'link', 'achievements', 'bio')):
+        payload_link = _premium_order_str(
+            next_moderation_payload.get('sourceLink')
+            or next_moderation_payload.get('link')
+            or next_moderation_payload.get('internetLinks')
+        )
+        payload_bio = _premium_order_str(next_moderation_payload.get('bio') or next_moderation_payload.get('achievements'))
+        notable_flag = data.get('notable') if 'notable' in data else next_moderation_payload.get('notable')
+        next_moderation_payload['notable'] = bool(notable_flag) or bool(payload_link) or bool(payload_bio)
+        moderation_payload_touched = True
+
     if 'companyName' in data:
         update_fields['companyName'] = _premium_order_str(data.get('companyName'))
 
@@ -9412,6 +10078,74 @@ def admin_update_premium_order(order_id):
     premium_orders_collection.update_one({'_id': oid}, {'$set': update_fields})
 
     doc = premium_orders_collection.find_one({'_id': oid})
+    if isinstance(doc, dict):
+        activation_type = _premium_order_str(doc.get('activationType'))
+        qr_path_key = _premium_order_str(doc.get('qrPathKey'))
+        path_type = _premium_order_str(doc.get('pathType')).lower()
+        is_premium_qr_firma = activation_type == 'premium_qr_firma' or qr_path_key == 'premium_qr_firma'
+        is_premium_qr = (
+            is_premium_qr_firma
+            or activation_type == 'premium_qr'
+            or qr_path_key == 'premium_qr'
+            or path_type == 'преміум qr'
+        )
+        should_sync_company = is_premium_qr_firma and any(
+            key in data for key in ('companyName', 'premiumQrFirmaId', 'mergePersonId')
+        )
+        should_sync_notable = is_premium_qr and any(
+            key in data for key in ('internetLinks', 'sourceLink', 'link', 'achievements', 'bio', 'notable')
+        )
+        if should_sync_company or should_sync_notable:
+            company_name_for_people = _premium_order_str(doc.get('companyName'))
+            moderation_payload = doc.get('moderationPayload') if isinstance(doc.get('moderationPayload'), dict) else {}
+            notable_link_for_people = _premium_order_str(
+                moderation_payload.get('sourceLink')
+                or moderation_payload.get('link')
+                or moderation_payload.get('internetLinks')
+            )
+            notable_bio_for_people = _premium_order_str(moderation_payload.get('bio') or moderation_payload.get('achievements'))
+            notable_for_people = bool(moderation_payload.get('notable')) or bool(notable_link_for_people) or bool(notable_bio_for_people)
+            person_ids_for_sync = doc.get('personIds') if isinstance(doc.get('personIds'), list) else []
+            if not person_ids_for_sync:
+                fallback_person_id = _premium_order_str(doc.get('personId'))
+                if fallback_person_id:
+                    person_ids_for_sync = [fallback_person_id]
+
+            for raw_person_id in person_ids_for_sync:
+                cleaned_person_id = _premium_order_str(raw_person_id)
+                if not cleaned_person_id:
+                    continue
+                try:
+                    person_oid = ObjectId(cleaned_person_id)
+                except Exception:
+                    continue
+
+                set_payload = {'adminPage.updatedAt': datetime.utcnow()}
+                unset_payload = {}
+                if should_sync_company:
+                    if company_name_for_people:
+                        set_payload['companyName'] = company_name_for_people
+                        set_payload['adminPage.companyName'] = company_name_for_people
+                    else:
+                        unset_payload['companyName'] = ''
+                        unset_payload['adminPage.companyName'] = ''
+                if should_sync_notable:
+                    set_payload['notable'] = notable_for_people
+                    if notable_link_for_people:
+                        set_payload['sourceLink'] = notable_link_for_people
+                        set_payload['link'] = notable_link_for_people
+                    else:
+                        unset_payload['sourceLink'] = ''
+                        unset_payload['link'] = ''
+                    if notable_bio_for_people:
+                        set_payload['bio'] = notable_bio_for_people
+                    else:
+                        unset_payload['bio'] = ''
+
+                update_doc = {'$set': set_payload}
+                if unset_payload:
+                    update_doc['$unset'] = unset_payload
+                people_collection.update_one({'_id': person_oid}, update_doc)
     return jsonify(_premium_order_projection(doc, include_existing_person_candidate=True))
 
 
@@ -9556,8 +10290,8 @@ def _finance_tab_label(tab_id):
     return ''
 
 
-def _finance_resolve_timezone():
-    timezone_name = _clean_str(DEFAULT_FINANCE_TIMEZONE) or 'Europe/Kyiv'
+def _finance_resolve_timezone(preferred_timezone=''):
+    timezone_name = _clean_str(preferred_timezone) or _clean_str(DEFAULT_FINANCE_TIMEZONE) or 'Europe/Kyiv'
     alias_map = {'Europe/Kiev': 'Europe/Kyiv'}
     timezone_name = alias_map.get(timezone_name, timezone_name)
     if ZoneInfo is None:
@@ -9691,11 +10425,14 @@ def _finance_build_row(
     status='',
     path_label='',
     period_label='',
+    receipt_available=False,
 ):
     safe_amount = max(int(amount_uah or 0), 0)
     date_label = local_date.strftime('%d.%m.%Y') if local_date else ''
+    safe_row_id = _clean_str(row_id)
+    can_open_receipt = bool(receipt_available and safe_row_id)
     return {
-        'id': _clean_str(row_id),
+        'id': safe_row_id,
         'tab': _clean_str(tab_id),
         'tabLabel': _finance_tab_label(tab_id),
         'categoryLabel': _clean_str(category_label),
@@ -9709,8 +10446,149 @@ def _finance_build_row(
         'status': _clean_str(status),
         'pathLabel': _clean_str(path_label),
         'periodLabel': _clean_str(period_label),
+        'receiptAvailable': can_open_receipt,
+        'receiptOpenUrl': f"/api/admin/finance/receipt?rowId={quote(safe_row_id, safe='')}" if can_open_receipt else '',
         'sortKey': _finance_datetime_sort_key(local_date, event_dt).isoformat(),
     }
+
+
+def _finance_extract_invoice_id(payload):
+    if not isinstance(payload, dict):
+        return ''
+    webhook_data = payload.get('webhookData') if isinstance(payload.get('webhookData'), dict) else {}
+    return _clean_str(webhook_data.get('invoiceId')) or _clean_str(payload.get('invoiceId'))
+
+
+def _finance_parse_ads_period_end(item):
+    if not isinstance(item, dict):
+        return datetime.min
+    end_iso = _clean_str(item.get('periodEnd'))
+    if end_iso:
+        try:
+            return datetime.strptime(end_iso, '%Y-%m-%d')
+        except Exception:
+            pass
+    start_iso = _clean_str(item.get('periodStart'))
+    if start_iso:
+        try:
+            return datetime.strptime(start_iso, '%Y-%m-%d')
+        except Exception:
+            pass
+    return datetime.min
+
+
+def _finance_parse_ritual_period_end(item):
+    if not isinstance(item, dict):
+        return datetime.min
+    parsed = _parse_ritual_period_str(item.get('period'))
+    if parsed and isinstance(parsed.get('endDateObj'), datetime):
+        return parsed.get('endDateObj')
+    end_text = _clean_str(item.get('endDate')) or _clean_str(item.get('periodEnd'))
+    if end_text:
+        try:
+            return datetime.strptime(end_text, '%d.%m.%Y')
+        except Exception:
+            pass
+    start_text = _clean_str(item.get('startDate')) or _clean_str(item.get('periodStart'))
+    if start_text:
+        try:
+            return datetime.strptime(start_text, '%d.%m.%Y')
+        except Exception:
+            pass
+    return datetime.min
+
+
+def _finance_pick_latest_ads_receipt_url(doc):
+    if not isinstance(doc, dict):
+        return ''
+    payments = _ads_normalize_payments(doc.get('payments'))
+    sorted_payments = sorted(
+        payments,
+        key=lambda item: (_finance_parse_ads_period_end(item), _clean_str(item.get('periodEnd')), _clean_str(item.get('periodStart'))),
+        reverse=True,
+    )
+    for item in sorted_payments:
+        pdf_url = _clean_str(item.get('pdfUrl'))
+        if pdf_url:
+            return pdf_url
+    return _clean_str(doc.get('pdfUrl'))
+
+
+def _finance_pick_latest_ritual_receipt_url(doc):
+    if not isinstance(doc, dict):
+        return ''
+    payments = _clean_ritual_payments(doc.get('payments'))
+    sorted_payments = sorted(
+        payments,
+        key=lambda item: (_finance_parse_ritual_period_end(item), _clean_str(item.get('endDate')), _clean_str(item.get('period'))),
+        reverse=True,
+    )
+    for item in sorted_payments:
+        pdf_url = _clean_str(item.get('pdfUrl'))
+        if pdf_url:
+            return pdf_url
+    return ''
+
+
+def _finance_fetch_monobank_receipt_pdf(invoice_id):
+    cleaned_invoice_id = _clean_str(invoice_id)
+    if not cleaned_invoice_id:
+        return None
+    token = _clean_str(os.getenv('MONOPAY_TOKEN'))
+    if not token:
+        return None
+
+    response = None
+    try:
+        response = requests.get(
+            'https://api.monobank.ua/api/merchant/invoice/receipt',
+            headers={'X-Token': token},
+            params={'invoiceId': cleaned_invoice_id},
+            timeout=25,
+        )
+        response.raise_for_status()
+    except Exception:
+        return None
+
+    content_type = _clean_str(response.headers.get('Content-Type')).lower()
+    if 'application/pdf' in content_type and response.content:
+        return response.content
+
+    encoded = ''
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        for key in ('receipt', 'content', 'file', 'pdf', 'data'):
+            candidate = payload.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                encoded = candidate.strip()
+                break
+    elif isinstance(payload, str) and payload.strip():
+        encoded = payload.strip()
+
+    if not encoded:
+        text = (response.text or '').strip()
+        if text:
+            encoded = text
+
+    if not encoded:
+        return None
+
+    if encoded.startswith('data:'):
+        comma_idx = encoded.find(',')
+        if comma_idx >= 0:
+            encoded = encoded[comma_idx + 1:]
+    encoded = ''.join(encoded.split())
+    if not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded + '=' * ((4 - len(encoded) % 4) % 4))
+    except Exception:
+        return None
+    return decoded or None
 
 
 def _finance_matches_search(row, search_query):
@@ -9792,6 +10670,7 @@ def _finance_collect_premium_rows(tzinfo, date_from, date_to):
                 contact=_clean_str(doc.get('customerPhone')),
                 status='Отримано',
                 path_label=path_label,
+                receipt_available=bool(_finance_extract_invoice_id(doc)),
             )
         )
     return rows
@@ -9823,6 +10702,7 @@ def _finance_collect_plaques_rows(tzinfo, date_from, date_to):
                 contact=_clean_str(doc.get('phone')),
                 status='Заявка',
                 path_label=path_label,
+                receipt_available=bool(_finance_extract_invoice_id(doc)),
             )
         )
     return rows
@@ -9835,6 +10715,7 @@ def _finance_collect_ritual_rows(tzinfo, date_from, date_to):
         service_name = _clean_str(service_doc.get('name'))
         service_logo = _clean_str(service_doc.get('logo'))
         status = _normalize_ritual_service_status(service_doc.get('status'))
+        receipt_available = bool(_finance_pick_latest_ritual_receipt_url(service_doc))
         contacts = _clean_ritual_contacts_loose(service_doc.get('contacts'))
         contact_phone = ''
         if contacts:
@@ -9869,6 +10750,7 @@ def _finance_collect_ritual_rows(tzinfo, date_from, date_to):
                     contact=contact_phone,
                     status=status,
                     period_label=period_label,
+                    receipt_available=receipt_available,
                 )
             )
     return rows
@@ -9876,7 +10758,7 @@ def _finance_collect_ritual_rows(tzinfo, date_from, date_to):
 
 def _finance_collect_notes_rows(tzinfo, date_from, date_to):
     rows = []
-    projection = {'churchName': 1, 'personName': 1, 'phone': 1, 'price': 1, 'paymentStatus': 1, 'createdAt': 1, 'serviceDate': 1, 'webhookData': 1}
+    projection = {'churchName': 1, 'personName': 1, 'phone': 1, 'price': 1, 'paymentStatus': 1, 'createdAt': 1, 'serviceDate': 1, 'webhookData': 1, 'invoiceId': 1}
     docs = liturgies_collection.find({'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}}, projection).sort([('createdAt', -1), ('_id', -1)])
     
     # Build church mapping for address lookup
@@ -9930,6 +10812,7 @@ def _finance_collect_notes_rows(tzinfo, date_from, date_to):
                 source_details=church_address,
                 contact=_clean_str(doc.get('phone')),
                 status='Оплачено',
+                receipt_available=bool(_finance_extract_invoice_id(doc)),
             )
         )
     return rows
@@ -9973,6 +10856,7 @@ def _finance_collect_ads_rows(tzinfo, date_from, date_to):
                 status=_ads_campaign_status_label(_ads_normalize_campaign_status(doc.get('status'))),
                 path_label=surface_label,
                 period_label=period_label,
+                receipt_available=bool(_finance_pick_latest_ads_receipt_url(doc)),
             )
         )
     return rows
@@ -9993,6 +10877,79 @@ def _finance_collect_rows(date_from=None, date_to=None):
     for tab_id in by_tab:
         by_tab[tab_id].sort(key=lambda row: row.get('sortKey') or '', reverse=True)
     return by_tab, timezone_name
+
+
+def _finance_build_graph_points(period, rows, tzinfo):
+    cleaned_period = _clean_str(period).lower() or 'month'
+    if cleaned_period not in {'day', 'week', 'month'}:
+        cleaned_period = 'month'
+
+    source_rows = rows if isinstance(rows, list) else []
+    now_local = datetime.now(tzinfo)
+
+    if cleaned_period == 'day':
+        labels = [f'{hour:02d}:00' for hour in range(0, 24, 3)]
+        sums = [0 for _ in labels]
+        today = now_local.date()
+
+        for row in source_rows:
+            row_dt = _finance_parse_any_datetime(row.get('sortKey'))
+            if not row_dt:
+                continue
+            if row_dt.tzinfo is not None:
+                try:
+                    row_dt = row_dt.astimezone(tzinfo).replace(tzinfo=None)
+                except Exception:
+                    row_dt = row_dt.replace(tzinfo=None)
+            if row_dt.date() != today:
+                continue
+            bucket = min(max(row_dt.hour // 3, 0), len(sums) - 1)
+            sums[bucket] += max(int(row.get('amountUah') or 0), 0)
+
+        return cleaned_period, [{'label': labels[idx], 'value': sums[idx]} for idx in range(len(labels))]
+
+    if cleaned_period == 'week':
+        day_list = [now_local.date() - timedelta(days=delta) for delta in range(6, -1, -1)]
+        index_by_day = {day: idx for idx, day in enumerate(day_list)}
+        labels = [ADMIN_NOTES_WEEKDAY_LABELS[(day.weekday() + 1) % 7] for day in day_list]
+        sums = [0 for _ in day_list]
+
+        for row in source_rows:
+            row_dt = _finance_parse_any_datetime(row.get('sortKey'))
+            if not row_dt:
+                continue
+            if row_dt.tzinfo is not None:
+                try:
+                    row_dt = row_dt.astimezone(tzinfo).replace(tzinfo=None)
+                except Exception:
+                    row_dt = row_dt.replace(tzinfo=None)
+            row_day = row_dt.date()
+            if row_day not in index_by_day:
+                continue
+            sums[index_by_day[row_day]] += max(int(row.get('amountUah') or 0), 0)
+
+        return cleaned_period, [{'label': labels[idx], 'value': sums[idx]} for idx in range(len(labels))]
+
+    day_list = [now_local.date() - timedelta(days=delta) for delta in range(29, -1, -1)]
+    index_by_day = {day: idx for idx, day in enumerate(day_list)}
+    labels = [day.strftime('%d.%m') for day in day_list]
+    sums = [0 for _ in day_list]
+
+    for row in source_rows:
+        row_dt = _finance_parse_any_datetime(row.get('sortKey'))
+        if not row_dt:
+            continue
+        if row_dt.tzinfo is not None:
+            try:
+                row_dt = row_dt.astimezone(tzinfo).replace(tzinfo=None)
+            except Exception:
+                row_dt = row_dt.replace(tzinfo=None)
+        row_day = row_dt.date()
+        if row_day not in index_by_day:
+            continue
+        sums[index_by_day[row_day]] += max(int(row.get('amountUah') or 0), 0)
+
+    return cleaned_period, [{'label': labels[idx], 'value': sums[idx]} for idx in range(len(labels))]
 
 
 def _finance_build_summary_payload(rows_by_tab):
@@ -10090,6 +11047,89 @@ def admin_finance_report():
     })
 
 
+@application.route('/api/admin/finance/receipt', methods=['GET'])
+def admin_finance_receipt():
+    raw_row_id = _clean_str(request.args.get('rowId'))
+    if not raw_row_id:
+        abort(400, description='`rowId` is required')
+
+    parts = raw_row_id.split(':')
+    if not parts:
+        abort(404, description='Receipt not found')
+
+    kind = parts[0]
+    target_url = ''
+    invoice_id = ''
+
+    if kind == 'premium' and len(parts) >= 2:
+        try:
+            doc = premium_orders_collection.find_one({'_id': ObjectId(parts[1])}, {'invoiceId': 1, 'webhookData': 1})
+        except Exception:
+            doc = None
+        invoice_id = _finance_extract_invoice_id(doc or {})
+    elif kind == 'plaques' and len(parts) >= 2:
+        try:
+            doc = plaques_moderation_collection.find_one({'_id': ObjectId(parts[1])}, {'invoiceId': 1, 'webhookData': 1})
+        except Exception:
+            doc = None
+        invoice_id = _finance_extract_invoice_id(doc or {})
+    elif kind == 'notes' and len(parts) >= 2:
+        try:
+            doc = liturgies_collection.find_one({'_id': ObjectId(parts[1])}, {'invoiceId': 1, 'webhookData': 1})
+        except Exception:
+            doc = None
+        invoice_id = _finance_extract_invoice_id(doc or {})
+    elif kind == 'ads' and len(parts) >= 2:
+        try:
+            doc = ads_campaigns_collection.find_one({'_id': ObjectId(parts[1])}, {'payments': 1, 'pdfUrl': 1})
+        except Exception:
+            doc = None
+        target_url = _finance_pick_latest_ads_receipt_url(doc or {})
+    elif kind == 'ritual' and len(parts) >= 2:
+        try:
+            doc = ritual_services_collection.find_one({'_id': ObjectId(parts[1])}, {'payments': 1})
+        except Exception:
+            doc = None
+        target_url = _finance_pick_latest_ritual_receipt_url(doc or {})
+
+    if target_url:
+        return redirect(target_url, code=302)
+
+    if invoice_id:
+        pdf_bytes = _finance_fetch_monobank_receipt_pdf(invoice_id)
+        if pdf_bytes:
+            return send_file(
+                io.BytesIO(pdf_bytes),
+                mimetype='application/pdf',
+                as_attachment=False,
+                download_name=f'{invoice_id}-receipt.pdf',
+            )
+
+    abort(404, description='Receipt not found')
+
+
+@application.route('/api/admin/finance/graph', methods=['GET'])
+def admin_finance_graph():
+    period = _clean_str(request.args.get('period')).lower() or 'month'
+    if period not in {'day', 'week', 'month'}:
+        abort(400, description='`period` must be one of: day, week, month')
+
+    timezone_value = _clean_str(request.args.get('timezone'))
+    tzinfo, timezone_name = _finance_resolve_timezone(timezone_value)
+    rows_by_tab, _ = _finance_collect_rows(date_from=None, date_to=None)
+    active_period, points = _finance_build_graph_points(period, rows_by_tab.get('main', []), tzinfo)
+
+    return jsonify({
+        'period': active_period,
+        'points': points,
+        'meta': {
+            'timezone': timezone_name,
+            'isFallback': False,
+            'fallbackReason': [],
+        },
+    })
+
+
 def _premium_pick_qr_code_for_activation(path_key='premium_qr'):
     target_path_key = _premium_order_str(path_key) or 'premium_qr'
     preferred_doc = admin_qr_codes_collection.find_one(
@@ -10115,6 +11155,18 @@ def admin_activate_premium_order(order_id):
     if not order_doc:
         abort(404, description='Order not found')
 
+    moderation_payload = order_doc.get('moderationPayload') if isinstance(order_doc.get('moderationPayload'), dict) else {}
+    cemetery_name = loc_clean_str(moderation_payload.get('cemetery') or order_doc.get('cemetery'))
+    area = loc_clean_str(
+        moderation_payload.get('area')
+        or moderation_payload.get('cemeteryAddress')
+        or order_doc.get('cemeteryAddress')
+        or order_doc.get('address')
+        or order_doc.get('area')
+    )
+    if not _admin_moderation_cemetery_exists(cemetery_name, area):
+        abort(400, description='Активація недоступна: кладовище має статус "Не додано".')
+
     raw_password = _premium_order_str(order_doc.get('generatedPassword'))
     if not raw_password:
         abort(400, description='Missing generatedPassword for activation')
@@ -10124,6 +11176,16 @@ def admin_activate_premium_order(order_id):
     activation_type = _premium_order_str(order_doc.get('activationType'))
     qr_path_key = _premium_order_str(order_doc.get('qrPathKey')) or 'premium_qr'
     is_premium_qr_firma = activation_type == 'premium_qr_firma' or qr_path_key == 'premium_qr_firma'
+    company_name = _premium_order_str(order_doc.get('companyName'))
+    customer_name = _premium_order_str(order_doc.get('customerName'))
+    customer_phone = _premium_order_str(order_doc.get('customerPhone'))
+    notable_link = _premium_order_str(
+        moderation_payload.get('sourceLink')
+        or moderation_payload.get('link')
+        or moderation_payload.get('internetLinks')
+    )
+    notable_bio = _premium_order_str(moderation_payload.get('bio') or moderation_payload.get('achievements'))
+    notable_flag = bool(moderation_payload.get('notable')) or bool(notable_link) or bool(notable_bio)
 
     person_ids = order_doc.get('personIds') if isinstance(order_doc.get('personIds'), list) else []
     primary_person_id = _premium_order_str(order_doc.get('personId')) or _premium_order_str(person_ids[0] if person_ids else '')
@@ -10153,10 +11215,19 @@ def admin_activate_premium_order(order_id):
             primary_person_id = merge_person_id
             person_ids = [merge_person_id]
         else:
-            moderation_payload = order_doc.get('moderationPayload') if isinstance(order_doc.get('moderationPayload'), dict) else None
             if not moderation_payload:
                 abort(400, description='Missing moderationPayload for premium_qr_firma activation')
             person_doc = _admin_build_person_from_moderation(moderation_payload, {})
+            person_doc['notable'] = notable_flag
+            person_doc['sourceLink'] = notable_link
+            person_doc['link'] = notable_link
+            person_doc['bio'] = notable_bio
+            if company_name:
+                person_doc['companyName'] = company_name
+                admin_page_payload = person_doc.get('adminPage') if isinstance(person_doc.get('adminPage'), dict) else {}
+                admin_page_payload['companyName'] = company_name
+                admin_page_payload['updatedAt'] = datetime.utcnow()
+                person_doc['adminPage'] = admin_page_payload
             if premium_partner_ref:
                 person_doc['premiumPartnerRitualServiceId'] = premium_partner_ref
             created_person = people_collection.insert_one(person_doc)
@@ -10200,12 +11271,26 @@ def admin_activate_premium_order(order_id):
                     {
                         'premium.password': hashed,
                         'premium.updatedAt': now,
+                        'customerName': customer_name,
+                        'customerPhone': customer_phone,
+                        'notable': notable_flag,
+                        'sourceLink': notable_link,
+                        'link': notable_link,
+                        'bio': notable_bio,
                         **({'premiumPartnerRitualServiceId': premium_partner_ref} if premium_partner_ref else {}),
                     }
                     if not is_premium_qr_firma
                     else {
                         'premium.password': hashed,
                         'premium.updatedAt': now,
+                        'customerName': customer_name,
+                        'customerPhone': customer_phone,
+                        'notable': notable_flag,
+                        'sourceLink': notable_link,
+                        'link': notable_link,
+                        'bio': notable_bio,
+                        **({'companyName': company_name} if company_name else {}),
+                        **({'adminPage.companyName': company_name} if company_name else {}),
                         'adminPage.pathKey': 'premium_qr_firma',
                         'adminPage.pathLabel': 'Преміум QR | Фірма',
                         'adminPage.updatedAt': now,

@@ -924,8 +924,16 @@ def _admin_pages_projection(person, index, extra_ctx=None):
             wired_qr_code_id = fallback_qr
     if not qr_code and wired_qr_code_id:
         qr_code = wired_qr_code_id
-    phone = _admin_pages_str(admin_page.get('phone'))
-    customer_phone = _admin_pages_str(admin_page.get('customerPhone')) or phone
+    phone = _admin_pages_str(admin_page.get('phone')) or _admin_pages_str(item.get('phone'))
+    customer_phone = (
+        _admin_pages_str(admin_page.get('customerPhone'))
+        or _admin_pages_str(item.get('customerPhone'))
+        or phone
+    )
+    customer_name = (
+        _admin_pages_str(admin_page.get('customerName'))
+        or _admin_pages_str(item.get('customerName'))
+    )
     burial_site_coords = _admin_pages_str(item.get('burialSiteCoords'))
     location_photos = location.get('photos') if isinstance(location, dict) else []
     if not isinstance(location_photos, list):
@@ -969,6 +977,7 @@ def _admin_pages_projection(person, index, extra_ctx=None):
         'areaId': _admin_pages_str(item.get('areaId')),
         'cemetery': _admin_pages_str(item.get('cemetery')),
         'phone': phone,
+        'customerName': customer_name,
         'customerPhone': customer_phone,
         'companyName': _admin_pages_str(admin_page.get('companyName')) or _admin_pages_str(item.get('companyName')),
         'notable': notable,
@@ -997,7 +1006,10 @@ def admin_list_pages():
                 {'burial.cemeteryRef.name': pattern},
                 {'area': pattern},
                 {'adminPage.phone': pattern},
+                {'adminPage.customerName': pattern},
                 {'adminPage.customerPhone': pattern},
+                {'customerName': pattern},
+                {'customerPhone': pattern},
                 {'adminPage.companyName': pattern},
                 {'adminPage.qrCode': pattern},
                 {'adminPage.wiredQrCodeId': pattern},
@@ -1080,6 +1092,7 @@ def admin_create_page():
     area_id = _admin_pages_str(data.get('areaId'))
     cemetery = _admin_pages_str(data.get('cemetery'))
     phone = _admin_pages_str(data.get('phone'))
+    customer_name = _admin_pages_str(data.get('customerName'))
     customer_phone = _admin_pages_str(data.get('customerPhone'))
     company_name = _admin_pages_str(data.get('companyName'))
     generated_password = _admin_pages_str(data.get('generatedPassword'))
@@ -1124,6 +1137,8 @@ def admin_create_page():
     admin_page_payload = {}
     if phone:
         admin_page_payload['phone'] = phone
+    if customer_name:
+        admin_page_payload['customerName'] = customer_name
     if customer_phone:
         admin_page_payload['customerPhone'] = customer_phone
     if company_name:
@@ -1267,6 +1282,12 @@ def admin_update_page(person_id):
             merged_admin_page['phone'] = phone
         else:
             merged_admin_page.pop('phone', None)
+    if 'customerName' in data:
+        customer_name = _admin_pages_str(data.get('customerName'))
+        if customer_name:
+            merged_admin_page['customerName'] = customer_name
+        else:
+            merged_admin_page.pop('customerName', None)
     if 'customerPhone' in data:
         customer_phone = _admin_pages_str(data.get('customerPhone'))
         if customer_phone:
@@ -1309,7 +1330,7 @@ def admin_update_page(person_id):
             merged_admin_page['pathLabel'] = path_label
         else:
             merged_admin_page.pop('pathLabel', None)
-    if any(key in data for key in ('phone', 'customerPhone', 'companyName', 'generatedPassword', 'qrCode', 'wiredQrCodeId', 'pathKey', 'pathLabel')):
+    if any(key in data for key in ('phone', 'customerName', 'customerPhone', 'companyName', 'generatedPassword', 'qrCode', 'wiredQrCodeId', 'pathKey', 'pathLabel')):
         merged_admin_page['updatedAt'] = datetime.utcnow()
         update_fields['adminPage'] = merged_admin_page
 
@@ -1429,29 +1450,141 @@ def _admin_moderation_parse_year(value):
     return int(raw)
 
 
+_CEMETERY_NAME_NOISE_TOKENS = {
+    'кладовище',
+    'кладовища',
+    'цвинтар',
+    'цвинтаря',
+    'цвинтарі',
+    'кладбише',
+    'cemetery',
+}
+
+_AREA_NOISE_TOKENS = {
+    'україна',
+    'область',
+    'обл',
+    'район',
+    'р',
+    'місто',
+    'м',
+}
+
+
+def _admin_norm_text(value):
+    raw = loc_clean_str(value).lower()
+    if not raw:
+        return ''
+    normalized = re.sub(r"[`'\"’ʼ]+", '', raw)
+    normalized = re.sub(r'[\(\)\[\]\{\}\.,;:!?\-_/\\]+', ' ', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return normalized
+
+
+def _admin_norm_tokens(value, noise_tokens=None):
+    tokens = [token for token in re.split(r'\W+', _admin_norm_text(value), flags=re.UNICODE) if token]
+    if not noise_tokens:
+        return tokens
+    return [token for token in tokens if token not in noise_tokens]
+
+
+def _admin_cemetery_name_matches(request_name, candidate_name):
+    req_norm = _admin_norm_text(request_name)
+    cand_norm = _admin_norm_text(candidate_name)
+    if not req_norm or not cand_norm:
+        return False
+    if req_norm == cand_norm:
+        return True
+
+    req_tokens = _admin_norm_tokens(req_norm, _CEMETERY_NAME_NOISE_TOKENS)
+    cand_tokens = _admin_norm_tokens(cand_norm, _CEMETERY_NAME_NOISE_TOKENS)
+    if not req_tokens or not cand_tokens:
+        return False
+
+    req_compact = ''.join(req_tokens)
+    cand_compact = ''.join(cand_tokens)
+    if req_compact and cand_compact:
+        if req_compact == cand_compact:
+            return True
+        if len(req_compact) >= 7 and req_compact in cand_compact:
+            return True
+        if len(cand_compact) >= 7 and cand_compact in req_compact:
+            return True
+
+    req_set = set(req_tokens)
+    cand_set = set(cand_tokens)
+    overlap = req_set & cand_set
+    if not overlap:
+        return False
+
+    smaller_size = min(len(req_set), len(cand_set))
+    if smaller_size <= 2:
+        return len(overlap) >= 1
+    return len(overlap) >= (smaller_size - 1)
+
+
+def _admin_area_matches(request_area, candidate_area):
+    req_norm = _admin_norm_text(request_area)
+    if not req_norm:
+        return True
+
+    cand_norm = _admin_norm_text(candidate_area)
+    if not cand_norm:
+        return False
+
+    if req_norm == cand_norm or req_norm in cand_norm or cand_norm in req_norm:
+        return True
+
+    req_tokens = set(_admin_norm_tokens(req_norm, _AREA_NOISE_TOKENS))
+    cand_tokens = set(_admin_norm_tokens(cand_norm, _AREA_NOISE_TOKENS))
+    if not req_tokens or not cand_tokens:
+        return False
+
+    overlap = req_tokens & cand_tokens
+    if not overlap:
+        return False
+
+    if min(len(req_tokens), len(cand_tokens)) <= 2:
+        return True
+    return len(overlap) >= 2
+
+
 def _admin_moderation_cemetery_exists(name, area=''):
     cleaned_name = loc_clean_str(name)
     if not cleaned_name:
         return False
 
+    # Fast path: exact name match, case-insensitive.
     name_regex = {'$regex': f'^{re.escape(cleaned_name)}$', '$options': 'i'}
     candidates = list(cemeteries_collection.find({'name': name_regex}).limit(60))
+
+    # Fallback path: tolerate minor punctuation/spacing/suffix variations.
     if not candidates:
-        return False
+        search_tokens = _admin_norm_tokens(cleaned_name, _CEMETERY_NAME_NOISE_TOKENS)
+        loose_token = next((token for token in search_tokens if len(token) >= 4), '')
+        if not loose_token and search_tokens:
+            loose_token = search_tokens[0]
+        if loose_token:
+            loose_regex = {'$regex': re.escape(loose_token), '$options': 'i'}
+            loose_candidates = list(cemeteries_collection.find({'name': loose_regex}).limit(120))
+            candidates = [
+                doc for doc in loose_candidates
+                if _admin_cemetery_name_matches(cleaned_name, loc_clean_str(doc.get('name')))
+            ]
+        if not candidates:
+            return False
 
     area_text = loc_clean_str(area)
     if not area_text:
         return True
 
-    city_part = area_text.split(',')[0].strip()
-    if not city_part:
-        return True
-
-    pattern = re.compile(r'\b' + re.escape(city_part) + r'\b', re.IGNORECASE)
     for doc in candidates:
         option = cemetery_option_from_doc(doc)
-        area_candidate = loc_clean_str(option.get('area'))
-        if area_candidate and pattern.search(area_candidate):
+        candidate_name = loc_clean_str(option.get('name') or doc.get('name'))
+        if not _admin_cemetery_name_matches(cleaned_name, candidate_name):
+            continue
+        area_candidate = loc_clean_str(option.get('area') or doc.get('locality'))
+        if _admin_area_matches(area_text, area_candidate):
             return True
     return False
 

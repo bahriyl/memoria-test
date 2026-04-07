@@ -925,6 +925,7 @@ def _admin_pages_projection(person, index, extra_ctx=None):
     if not qr_code and wired_qr_code_id:
         qr_code = wired_qr_code_id
     phone = _admin_pages_str(admin_page.get('phone')) or _admin_pages_str(item.get('phone'))
+    generated_password = _admin_pages_str(admin_page.get('generatedPassword'))
     customer_phone = (
         _admin_pages_str(admin_page.get('customerPhone'))
         or _admin_pages_str(item.get('customerPhone'))
@@ -977,6 +978,8 @@ def _admin_pages_projection(person, index, extra_ctx=None):
         'areaId': _admin_pages_str(item.get('areaId')),
         'cemetery': _admin_pages_str(item.get('cemetery')),
         'phone': phone,
+        'generatedPassword': generated_password,
+        'password': generated_password,
         'customerName': customer_name,
         'customerPhone': customer_phone,
         'companyName': _admin_pages_str(admin_page.get('companyName')) or _admin_pages_str(item.get('companyName')),
@@ -1011,6 +1014,7 @@ def admin_list_pages():
                 {'customerName': pattern},
                 {'customerPhone': pattern},
                 {'adminPage.companyName': pattern},
+                {'adminPage.generatedPassword': pattern},
                 {'adminPage.qrCode': pattern},
                 {'adminPage.wiredQrCodeId': pattern},
                 {'sourceLink': pattern},
@@ -1143,6 +1147,8 @@ def admin_create_page():
         admin_page_payload['customerPhone'] = customer_phone
     if company_name:
         admin_page_payload['companyName'] = company_name
+    if generated_password:
+        admin_page_payload['generatedPassword'] = generated_password
     if qr_code:
         admin_page_payload['qrCode'] = qr_code
     if wired_qr_code_id:
@@ -1305,7 +1311,9 @@ def admin_update_page(person_id):
         if generated_password:
             update_fields['premium.password'] = hash_password(generated_password)
             update_fields['premium.updatedAt'] = datetime.utcnow()
-        merged_admin_page.pop('generatedPassword', None)
+            merged_admin_page['generatedPassword'] = generated_password
+        else:
+            merged_admin_page.pop('generatedPassword', None)
     if 'qrCode' in data:
         qr_code = _admin_pages_str(data.get('qrCode'))
         if qr_code:

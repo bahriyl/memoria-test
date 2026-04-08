@@ -53,6 +53,26 @@ def parse_geo_point(raw):
                 "coordinates": [lng, lat],
                 "precision": clean_str(raw.get("precision")) or "exact",
             }
+        # Accept geo payload shape like {"coords": "49.838055, 24.042791"}.
+        coords_text = clean_str(raw.get("coords"))
+        if coords_text:
+            parsed_from_coords = parse_geo_point(coords_text)
+            if parsed_from_coords:
+                return {
+                    **parsed_from_coords,
+                    "precision": clean_str(raw.get("precision")) or parsed_from_coords.get("precision") or "exact",
+                }
+        # Accept geo payload shape like {"coordinates": [24.04, 49.83]} without explicit type.
+        coordinates = raw.get("coordinates")
+        if isinstance(coordinates, list) and len(coordinates) == 2:
+            lng = parse_float(coordinates[0])
+            lat = parse_float(coordinates[1])
+            if lat is not None and lng is not None:
+                return {
+                    "type": "Point",
+                    "coordinates": [lng, lat],
+                    "precision": clean_str(raw.get("precision")) or "exact",
+                }
         lat = parse_float(raw.get("lat"))
         lng = parse_float(raw.get("lng"))
         if lat is not None and lng is not None:

@@ -127,7 +127,8 @@ def cemetery_location_to_legacy(location):
     area = location.get("area") or {}
     address = location.get("address") or {}
     locality = clean_str(area.get("city") or area.get("display"))
-    address_line = clean_str(address.get("display") or location.get("display"))
+    # Prefer full canonical display to avoid short street-only values.
+    address_line = clean_str(location.get("display") or address.get("display"))
     return {
         "locality": locality,
         "addressLine": address_line,
@@ -150,7 +151,8 @@ def church_location_to_legacy(location):
 def ritual_location_to_legacy(hq_location, current_doc=None):
     current_doc = current_doc if isinstance(current_doc, dict) else {}
     location = normalize_location_core(hq_location if isinstance(hq_location, dict) else {})
-    address_display = clean_str((location.get("address") or {}).get("display") or location.get("display"))
+    # Prefer full canonical display to avoid short street-only values.
+    address_display = clean_str(location.get("display") or (location.get("address") or {}).get("display"))
     geo = location.get("geo") or {}
     coords = geo.get("coordinates") if isinstance(geo.get("coordinates"), list) else []
     lng = coords[0] if len(coords) == 2 else None

@@ -75,6 +75,17 @@ except Exception:
     ImageOps = None
 
 try:
+    from pillow_heif import register_heif_opener
+except Exception:
+    register_heif_opener = None
+
+if Image is not None and register_heif_opener is not None:
+    try:
+        register_heif_opener()
+    except Exception:
+        pass
+
+try:
     import pypdfium2 as pdfium
 except Exception:
     pdfium = None
@@ -925,7 +936,6 @@ def _admin_pages_projection(person, index, extra_ctx=None):
     if not qr_code and wired_qr_code_id:
         qr_code = wired_qr_code_id
     phone = _admin_pages_str(admin_page.get('phone')) or _admin_pages_str(item.get('phone'))
-    generated_password = _admin_pages_str(admin_page.get('generatedPassword'))
     customer_phone = (
         _admin_pages_str(admin_page.get('customerPhone'))
         or _admin_pages_str(item.get('customerPhone'))
@@ -954,6 +964,19 @@ def _admin_pages_projection(person, index, extra_ctx=None):
     bio = _admin_pages_str(item.get('bio'))
     notable = bool(item.get('notable')) or bool(internet_links) or bool(achievements) or bool(bio)
 
+    coords_from_location_geo = loc_clean_str(
+        ((location.get('geo') or {}).get('coords'))
+        if isinstance(location.get('geo'), dict)
+        else ''
+    )
+    if not coords_from_location_geo:
+        coordinates = (location.get('geo') or {}).get('coordinates') if isinstance(location.get('geo'), dict) else None
+        if isinstance(coordinates, list) and len(coordinates) == 2:
+            try:
+                coords_from_location_geo = f'{float(coordinates[1]):.6f}, {float(coordinates[0]):.6f}'
+            except Exception:
+                coords_from_location_geo = ''
+
     return {
         'id': str(item.get('_id')),
         'index': int(index),
@@ -978,8 +1001,6 @@ def _admin_pages_projection(person, index, extra_ctx=None):
         'areaId': _admin_pages_str(item.get('areaId')),
         'cemetery': _admin_pages_str(item.get('cemetery')),
         'phone': phone,
-        'generatedPassword': generated_password,
-        'password': generated_password,
         'customerName': customer_name,
         'customerPhone': customer_phone,
         'companyName': _admin_pages_str(admin_page.get('companyName')) or _admin_pages_str(item.get('companyName')),
@@ -1014,7 +1035,6 @@ def admin_list_pages():
                 {'customerName': pattern},
                 {'customerPhone': pattern},
                 {'adminPage.companyName': pattern},
-                {'adminPage.generatedPassword': pattern},
                 {'adminPage.qrCode': pattern},
                 {'adminPage.wiredQrCodeId': pattern},
                 {'sourceLink': pattern},
@@ -1406,6 +1426,28 @@ def admin_update_page(person_id):
     return jsonify(_admin_pages_projection(updated, 1))
 
 
+@application.route('/api/admin/pages/<string:person_id>/password', methods=['GET'])
+def admin_get_page_password(person_id):
+    try:
+        oid = ObjectId(person_id)
+    except Exception:
+        abort(400, description='Invalid person id')
+
+    person = people_collection.find_one({'_id': oid}, {'adminPage.generatedPassword': 1})
+    if not person:
+        abort(404, description='Person not found')
+
+    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
+    generated_password = _admin_pages_str(admin_page.get('generatedPassword'))
+    if not generated_password:
+        abort(404, description='Password not found')
+
+    return jsonify({
+        'generatedPassword': generated_password,
+        'password': generated_password,
+    })
+
+
 @application.route('/api/admin/pages/<string:person_id>', methods=['DELETE'])
 def admin_delete_page(person_id):
     try:
@@ -1649,7 +1691,7 @@ def _admin_moderation_projection(raw_doc):
         'link': link,
         'bio': bio,
         'occupation': occupation,
-        'burialSiteCoords': loc_clean_str(item.get('burialSiteCoords')),
+        'burialSiteCoords': loc_clean_str(item.get('burialSiteCoords')) or coords_from_location_geo,
         'burialSitePhotoUrls': burial_photo_urls,
         'burialSitePhotoUrl': burial_photo_urls[0] if burial_photo_urls else '',
         'cemeteryExists': cemetery_exists,
@@ -1683,26 +1725,56 @@ def _admin_build_person_from_moderation(moderation_doc, incoming):
     source_burial = source.get('burial') if isinstance(source.get('burial'), dict) else None
     burial_source = incoming_burial if incoming_burial is not None else source_burial
 
+    incoming_burial_coords = loc_clean_str(
+        ((incoming_burial or {}).get('location') or {}).get('geo', {}).get('coords')
+        if isinstance(((incoming_burial or {}).get('location') or {}).get('geo'), dict)
+        else ''
+    )
+    source_burial_coords = loc_clean_str(
+        ((source_burial or {}).get('location') or {}).get('geo', {}).get('coords')
+        if isinstance(((source_burial or {}).get('location') or {}).get('geo'), dict)
+        else ''
+    )
+    incoming_payload_coords = loc_clean_str(payload.get('burialSiteCoords')) if 'burialSiteCoords' in payload else ''
+    source_payload_coords = loc_clean_str(source.get('burialSiteCoords'))
+    burial_site_coords = incoming_payload_coords or incoming_burial_coords or source_payload_coords or source_burial_coords
+
+    incoming_payload_photo_urls = (
+        loc_clean_str_list(payload.get('burialSitePhotoUrls'))
+        if 'burialSitePhotoUrls' in payload
+        else []
+    )
+    incoming_single_photo = (
+        loc_clean_str(payload.get('burialSitePhotoUrl'))
+        if 'burialSitePhotoUrl' in payload
+        else ''
+    )
+    source_photo_urls = loc_clean_str_list(source.get('burialSitePhotoUrls'))
+    source_single_photo = loc_clean_str(source.get('burialSitePhotoUrl'))
+    source_burial_photos = loc_clean_str_list(source_burial.get('photos') if isinstance(source_burial, dict) else [])
+
+    if incoming_payload_photo_urls:
+        burial_photo_urls = incoming_payload_photo_urls
+    elif incoming_single_photo:
+        burial_photo_urls = [incoming_single_photo]
+    elif source_photo_urls:
+        burial_photo_urls = source_photo_urls
+    elif source_single_photo:
+        burial_photo_urls = [source_single_photo]
+    else:
+        burial_photo_urls = source_burial_photos
+    burial_site_photo_url = burial_photo_urls[0] if burial_photo_urls else ''
+
     burial = normalize_person_burial({
         'burial': burial_source,
         'area': area,
         'areaId': area_id,
         'cemetery': cemetery,
         'location': source.get('location'),
-        'burialSiteCoords': loc_clean_str(source.get('burialSiteCoords')),
-        'burialSitePhotoUrls': loc_clean_str_list(source.get('burialSitePhotoUrls')),
+        'burialSiteCoords': burial_site_coords,
+        'burialSitePhotoUrls': burial_photo_urls,
     })
     legacy = person_burial_to_legacy_fields(burial)
-
-    burial_photo_urls = loc_clean_str_list(
-        payload.get('burialSitePhotoUrls')
-        if 'burialSitePhotoUrls' in payload
-        else source.get('burialSitePhotoUrls') or (burial.get('photos') if isinstance(burial, dict) else [])
-    )
-    if not burial_photo_urls:
-        one_photo = loc_clean_str(payload.get('burialSitePhotoUrl') if 'burialSitePhotoUrl' in payload else source.get('burialSitePhotoUrl'))
-        if one_photo:
-            burial_photo_urls = [one_photo]
 
     internet_links = loc_clean_str(
         payload.get('internetLinks') if 'internetLinks' in payload
@@ -1732,6 +1804,10 @@ def _admin_build_person_from_moderation(moderation_doc, incoming):
         'achievements': achievements,
         'bio': bio,
         'sourceLink': internet_links,
+        'burialSiteCoords': burial_site_coords,
+        'burialSitePhotoUrls': burial_photo_urls,
+        'burialSitePhotoUrl': burial_site_photo_url,
+        'burialSitePhotoCount': len(burial_photo_urls),
         'createdAt': datetime.utcnow(),
         'updatedAt': datetime.utcnow(),
     }
@@ -2994,11 +3070,12 @@ def cemeteries_page():
     for cemetery in cemeteries_cursor:
         location = normalize_cemetery_location(cemetery)
         legacy_loc = cemetery_location_to_legacy(location)
+        full_address = _clean_str(location.get('display'))
         cemeteries_list.append({
             "id": str(cemetery.get('_id')),
             "name": cemetery.get('name'),
             "image": cemetery.get('image'),
-            "address": cemetery.get('address') or legacy_loc.get("address"),
+            "address": full_address or legacy_loc.get("address") or cemetery.get('address'),
             "phone": cemetery.get('phone'),
             "description": cemetery.get('description'),
             "location": location if _location_read_uses_canonical() else None,
@@ -3026,11 +3103,12 @@ def get_cemetery_page(cemetery_id):
     # 3) Build your response payload
     location = normalize_cemetery_location(cemetery)
     legacy_loc = cemetery_location_to_legacy(location)
+    full_address = _clean_str(location.get('display'))
     return jsonify({
         "id": str(cemetery.get('_id')),
         "name": cemetery.get('name'),
         "image": cemetery.get('image'),
-        "address": cemetery.get('address') or legacy_loc.get("address"),
+        "address": full_address or legacy_loc.get("address") or cemetery.get('address'),
         "phone": cemetery.get('phone'),
         "description": cemetery.get('description'),
         "location": location if _location_read_uses_canonical() else None,
@@ -6922,7 +7000,6 @@ def _normalize_admin_ritual_service(ritual_service):
         'banner': _clean_str(ritual_service.get('banner')),
         'link': _clean_str(ritual_service.get('link')),
         'login': _clean_str(ritual_service.get('login')),
-        'password': _clean_str(ritual_service.get('password')),
         'settlements': settlements,
         'contacts': contacts,
         'payments': payments,
@@ -6941,6 +7018,26 @@ def _normalize_admin_ritual_service(ritual_service):
         'createdAt': created_at.isoformat() if isinstance(created_at, datetime) else None,
         'updatedAt': updated_at.isoformat() if isinstance(updated_at, datetime) else None,
     }
+
+
+@application.route('/api/admin/ritual-services/<string:service_id>/password', methods=['GET'])
+def admin_get_ritual_service_password(service_id):
+    try:
+        oid = ObjectId(service_id)
+    except Exception:
+        abort(400, description='Invalid ritual service id')
+
+    ritual_service = ritual_services_collection.find_one({'_id': oid}, {'password': 1})
+    if not ritual_service:
+        abort(404, description='Ritual service not found')
+
+    password = _clean_str(ritual_service.get('password'))
+    if not password:
+        abort(404, description='Password not found')
+
+    return jsonify({
+        'password': password,
+    })
 
 
 def _derive_ritual_hq_location_from_payload(payload, current_doc=None):
@@ -7749,10 +7846,21 @@ def ritual_services():
     for ritual_service in ritual_services_cursor:
         hq_location = normalize_ritual_hq_location(ritual_service)
         legacy_loc = ritual_location_to_legacy(hq_location, current_doc=ritual_service)
+        full_address = _clean_str(hq_location.get('display'))
+        raw_address = ritual_service.get('address')
+        if isinstance(raw_address, list):
+            address_value = [_clean_str(item) for item in raw_address if _clean_str(item)]
+            if full_address:
+                if address_value:
+                    address_value[0] = full_address
+                else:
+                    address_value = [full_address]
+        else:
+            address_value = full_address or raw_address or legacy_loc.get("address")
         ritual_services_list.append({
             "id": str(ritual_service.get('_id')),
             "name": ritual_service.get('name'),
-            "address": ritual_service.get('address') or legacy_loc.get("address"),
+            "address": address_value,
             "category": ritual_service.get('category'),
             "logo": ritual_service.get('logo'),
             "latitude": ritual_service.get("latitude") if ritual_service.get("latitude") is not None else legacy_loc.get("latitude"),
@@ -7837,10 +7945,21 @@ def get_ritual_service(ritual_service_id):
 
         hq_location = normalize_ritual_hq_location(ritual_service)
         legacy_loc = ritual_location_to_legacy(hq_location, current_doc=ritual_service)
+        full_address = _clean_str(hq_location.get('display'))
+        raw_address = ritual_service.get('address')
+        if isinstance(raw_address, list):
+            address_value = [_clean_str(item) for item in raw_address if _clean_str(item)]
+            if full_address:
+                if address_value:
+                    address_value[0] = full_address
+                else:
+                    address_value = [full_address]
+        else:
+            address_value = full_address or raw_address or legacy_loc.get("address")
         return jsonify({
             "id": str(ritual_service['_id']),
             "name": ritual_service.get('name'),
-            "address": ritual_service.get('address') or legacy_loc.get("address"),
+            "address": address_value,
             "category": ritual_service.get('category'),
             "logo": ritual_service.get('logo'),
             "latitude": ritual_service.get('latitude') if ritual_service.get('latitude') is not None else legacy_loc.get("latitude"),
@@ -8221,13 +8340,28 @@ def _build_person_moderation_base_document(data):
     area_id = loc_clean_str(data.get('areaId'))
     cemetery = loc_clean_str(data.get('cemetery'))
 
-    burial_site_coords = loc_clean_str(data.get('burialSiteCoords'))
+    incoming_burial = data.get('burial') if isinstance(data.get('burial'), dict) else None
+    incoming_burial_location = incoming_burial.get('location') if isinstance((incoming_burial or {}).get('location'), dict) else {}
+    incoming_burial_geo = incoming_burial_location.get('geo') if isinstance((incoming_burial_location or {}).get('geo'), dict) else {}
+    incoming_geo_coords_text = loc_clean_str(incoming_burial_geo.get('coords'))
+    incoming_geo_coordinates = incoming_burial_geo.get('coordinates') if isinstance(incoming_burial_geo.get('coordinates'), list) else []
+    incoming_geo_coordinates_text = ''
+    if len(incoming_geo_coordinates) == 2:
+        try:
+            incoming_geo_coordinates_text = f'{float(incoming_geo_coordinates[1]):.6f}, {float(incoming_geo_coordinates[0]):.6f}'
+        except Exception:
+            incoming_geo_coordinates_text = ''
+
+    burial_site_coords = (
+        loc_clean_str(data.get('burialSiteCoords'))
+        or incoming_geo_coords_text
+        or incoming_geo_coordinates_text
+    )
     burial_site_photo_url = loc_clean_str(data.get('burialSitePhotoUrl'))
     burial_site_photo_urls = loc_clean_str_list(data.get('burialSitePhotoUrls'))
     if not burial_site_photo_urls and burial_site_photo_url:
         burial_site_photo_urls = [burial_site_photo_url]
 
-    incoming_burial = data.get('burial') if isinstance(data.get('burial'), dict) else None
     if incoming_burial:
         burial = normalize_person_burial({
             'burial': incoming_burial,
@@ -9768,7 +9902,6 @@ def _premium_order_projection(doc, include_existing_person_candidate=False):
         'deliveryBranchRef': _premium_order_str(doc.get('deliveryBranchRef')),
         'deliveryBranchDesc': _premium_order_str(doc.get('deliveryBranchDesc')),
         'ttn': ttn,
-        'generatedPassword': _premium_order_str(doc.get('generatedPassword')),
         'adminNotes': _premium_order_str(doc.get('adminNotes')),
         'orderNumber': _premium_order_str(doc.get('orderNumber')),
         'wiredQrCodeId': _premium_order_str(doc.get('wiredQrCodeId')),
@@ -9940,7 +10073,6 @@ def admin_list_premium_orders():
             {'deliveryCityName': pattern},
             {'deliveryBranchDesc': pattern},
             {'ttn': pattern},
-            {'generatedPassword': pattern},
         ]
 
     docs = list(premium_orders_collection.find(query).sort([('createdAt', -1), ('_id', -1)]))
@@ -9978,6 +10110,26 @@ def admin_get_premium_order(order_id):
                 payload['avatarUrl'] = _premium_order_str(person_doc.get('avatarUrl') or person_doc.get('portraitUrl'))
 
     return jsonify(payload)
+
+
+@application.route('/api/admin/premium-orders/<string:order_id>/password', methods=['GET'])
+def admin_get_premium_order_password(order_id):
+    try:
+        oid = ObjectId(order_id)
+    except Exception:
+        abort(400, description='Invalid order id')
+
+    doc = premium_orders_collection.find_one({'_id': oid}, {'generatedPassword': 1})
+    if not doc:
+        abort(404, description='Order not found')
+
+    generated_password = _premium_order_str(doc.get('generatedPassword'))
+    if not generated_password:
+        abort(404, description='Password not found')
+
+    return jsonify({
+        'generatedPassword': generated_password,
+    })
 
 
 @application.route('/api/admin/premium-orders/<string:order_id>', methods=['PATCH'])

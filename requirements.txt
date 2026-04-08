@@ -11,6 +11,7 @@ PyJWT
 boto3
 bcrypt
 Pillow
+pillow-heif
 pypdfium2
 segno
 pytelegrambotapi

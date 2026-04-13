@@ -206,6 +206,7 @@ people_moderation_collection = db['people_moderation']
 orders_collection = db['orders']
 premium_orders_collection = db['premium_orders']
 plaques_moderation_collection = db['plaques_moderation']
+plaques_orders_collection = db['plaques_orders']
 admin_qr_batches_collection = db['admin_qr_batches']
 admin_qr_codes_collection = db['admin_qr_codes']
 chat_collection = db['chats']
@@ -509,6 +510,36 @@ except Exception:
 
 try:
     plaques_moderation_collection.create_index([("status", ASCENDING), ("createdAt", -1)])
+except Exception:
+    pass
+
+try:
+    plaques_orders_collection.create_index([("createdAt", DESCENDING), ("_id", DESCENDING)])
+except Exception:
+    pass
+
+try:
+    plaques_orders_collection.create_index([("updatedAt", DESCENDING), ("_id", DESCENDING)])
+except Exception:
+    pass
+
+try:
+    plaques_orders_collection.create_index([("invoiceId", ASCENDING)], sparse=True)
+except Exception:
+    pass
+
+try:
+    plaques_orders_collection.create_index([("paymentStatus", ASCENDING), ("createdAt", DESCENDING)])
+except Exception:
+    pass
+
+try:
+    plaques_orders_collection.create_index([("moderationId", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    plaques_orders_collection.create_index([("qrDocId", ASCENDING), ("wiredQrCodeId", ASCENDING)])
 except Exception:
     pass
 
@@ -2424,6 +2455,22 @@ def admin_activate_plaques_moderation(moderation_id):
             }
         )
 
+    plaques_orders_collection.update_one(
+        {'moderationId': str(oid)},
+        {
+            '$set': {
+                'personId': person_id,
+                'personIds': [person_id],
+                'personName': _qr_str(person_doc.get('name')),
+                'personNames': [_qr_str(person_doc.get('name'))] if _qr_str(person_doc.get('name')) else [],
+                'qrDocId': str(qr_doc_id) if qr_doc_id else '',
+                'qrNumber': _qr_str(qr_doc.get('qrNumber')),
+                'wiredQrCodeId': wired_qr_code_id,
+                'updatedAt': now,
+            }
+        }
+    )
+
     plaques_moderation_collection.delete_one({'_id': oid})
     return jsonify({
         'success': True,
@@ -2711,6 +2758,25 @@ def get_person(person_id):
     premium_payload = sanitize_premium_payload(person.get('premium'))
     admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
     admin_path_key = _clean_str(admin_page.get('pathKey')).lower()
+    cemetery_id = ''
+    burial = person.get('burial') if isinstance(person.get('burial'), dict) else {}
+    cemetery_ref = burial.get('cemeteryRef') if isinstance(burial.get('cemeteryRef'), dict) else {}
+    raw_cemetery_id = _clean_str(cemetery_ref.get('id') or person.get('cemeteryId'))
+    if raw_cemetery_id:
+        try:
+            cemetery_id = str(ObjectId(raw_cemetery_id))
+        except Exception:
+            cemetery_id = ''
+    if not cemetery_id:
+        cemetery_name = _clean_str(cemetery_ref.get('name')) or _clean_str(person.get('cemetery'))
+        if cemetery_name:
+            cemetery_doc = cemeteries_collection.find_one(
+                {'name': {'$regex': f'^{re.escape(cemetery_name)}$', '$options': 'i'}},
+                {'_id': 1},
+            )
+            if cemetery_doc and isinstance(cemetery_doc.get('_id'), ObjectId):
+                cemetery_id = str(cemetery_doc.get('_id'))
+
     response = {
         "id": str(person['_id']),
         "name": person.get('name'),
@@ -2725,6 +2791,7 @@ def get_person(person_id):
         "areaId": person.get('areaId'),
         "area": person.get('area'),
         "cemetery": person.get('cemetery'),
+        "cemeteryId": cemetery_id,
         "location": person.get('location'),
         "burial": person.get('burial') if _location_read_uses_canonical() else None,
         "bio": person.get('bio'),
@@ -3840,10 +3907,185 @@ def _ads_normalize_plaques(value, strict=False):
     return plaques
 
 
+def _ads_is_standard_account_person(person):
+    if not isinstance(person, dict):
+        return False
+    if _admin_pages_has_premium(person) or _admin_pages_is_premium_firma(person):
+        return False
+    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
+    path_key = _admin_pages_str(admin_page.get('pathKey')).lower()
+    path_label = _admin_pages_str(admin_page.get('pathLabel')).lower()
+    if not path_key:
+        if path_label == 'табличка':
+            path_key = 'plaques'
+        elif path_label == 'преміум qr':
+            path_key = 'premium_qr'
+        elif path_label == 'преміум qr | фірма':
+            path_key = 'premium_qr_firma'
+    return path_key not in {'plaques', 'premium_qr', 'premium_qr_firma'}
+
+
+def _ads_collect_standard_accounts_counts():
+    by_cemetery_oid = {}
+    by_cemetery_name = {}
+    projection = {
+        'premium': 1,
+        'adminPage.pathKey': 1,
+        'adminPage.pathLabel': 1,
+        'burial.cemeteryRef.id': 1,
+        'burial.cemeteryRef.name': 1,
+        'cemetery': 1,
+    }
+    for person in people_collection.find({}, projection):
+        if not _ads_is_standard_account_person(person):
+            continue
+        cemetery_id = (
+            person.get('burial', {}).get('cemeteryRef', {}).get('id')
+            if isinstance(person.get('burial'), dict)
+            else None
+        )
+        if cemetery_id:
+            try:
+                cemetery_oid = ObjectId(str(cemetery_id))
+            except Exception:
+                cemetery_oid = None
+            if cemetery_oid is not None:
+                by_cemetery_oid[cemetery_oid] = by_cemetery_oid.get(cemetery_oid, 0) + 1
+                continue
+
+        cemetery_name = _clean_str(
+            person.get('burial', {}).get('cemeteryRef', {}).get('name')
+            if isinstance(person.get('burial'), dict)
+            else ''
+        ) or _clean_str(person.get('cemetery'))
+        if not cemetery_name:
+            continue
+        key = cemetery_name.lower()
+        by_cemetery_name[key] = by_cemetery_name.get(key, 0) + 1
+    return by_cemetery_oid, by_cemetery_name
+
+
 def _ads_columns_meta_for_cemetery(cemetery_oid):
     if not cemetery_oid:
         return None
-    return ads_columns_meta_collection.find_one({'cemeteryId': cemetery_oid}, {'totalColumns': 1, 'priceUah': 1, 'maxColumnsAds': 1, 'maxPagesAds': 1})
+    return ads_columns_meta_collection.find_one(
+        {'cemeteryId': cemetery_oid},
+        {
+            'totalColumns': 1,
+            'priceUah': 1,
+            'maxColumnsAds': 1,
+            'maxPagesAds': 1,
+            'adsQrToken': 1,
+            'adsQrScanUrl': 1,
+            'adsQrImageUrl': 1,
+            'adsQrUpdatedAt': 1,
+        }
+    )
+
+
+def _ads_public_base_url():
+    if PUBLIC_WEB_BASE_URL:
+        return PUBLIC_WEB_BASE_URL.rstrip('/')
+    try:
+        host = _clean_str(request.host_url)
+    except RuntimeError:
+        host = ''
+    return host.rstrip('/')
+
+
+def _ads_build_cemetery_qr_scan_url(cemetery_oid):
+    base = _ads_public_base_url()
+    path = f"/?cemeteryId={quote(str(cemetery_oid), safe='')}"
+    return f'{base}{path}' if base else path
+
+
+def _ads_generate_unique_qr_token():
+    for _ in range(12):
+        token = secrets.token_urlsafe(9).rstrip('=')
+        if not ads_columns_meta_collection.find_one({'adsQrToken': token}, {'_id': 1}):
+            return token
+    abort(500, description='Failed to allocate unique ads QR token')
+
+
+def _ads_build_qr_image_url(scan_url):
+    cleaned = _clean_str(scan_url)
+    if not cleaned or segno is None:
+        return ''
+    out = io.BytesIO()
+    qr = segno.make(cleaned, error='m')
+    qr.save(out, kind='svg', scale=6, border=2, dark='#111111', light='#ffffff')
+    encoded = base64.b64encode(out.getvalue()).decode('ascii')
+    return f'data:image/svg+xml;base64,{encoded}'
+
+
+def _ads_build_qr_svg_bytes(scan_url):
+    cleaned = _clean_str(scan_url)
+    if not cleaned or segno is None:
+        return b''
+    out = io.BytesIO()
+    qr = segno.make(cleaned, error='m')
+    qr.save(out, kind='svg', scale=6, border=2, dark='#111111', light='#ffffff')
+    return out.getvalue()
+
+
+def _ads_ensure_cemetery_qr(cemetery_oid, *, force_regenerate=False):
+    meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    token = _clean_str(meta.get('adsQrToken'))
+    scan_url = _clean_str(meta.get('adsQrScanUrl'))
+    image_url = _clean_str(meta.get('adsQrImageUrl'))
+
+    if force_regenerate or not token:
+        token = _ads_generate_unique_qr_token()
+    if force_regenerate or not scan_url:
+        scan_url = _ads_build_cemetery_qr_scan_url(cemetery_oid)
+    if force_regenerate or not image_url:
+        image_url = _ads_build_qr_image_url(scan_url)
+
+    now = datetime.utcnow()
+    ads_columns_meta_collection.update_one(
+        {'cemeteryId': cemetery_oid},
+        {
+            '$set': {
+                'adsQrToken': token,
+                'adsQrScanUrl': scan_url,
+                'adsQrImageUrl': image_url,
+                'adsQrUpdatedAt': now,
+                'updatedAt': now,
+            },
+            '$setOnInsert': {
+                'cemeteryId': cemetery_oid,
+                'createdAt': now,
+            },
+        },
+        upsert=True,
+    )
+    return {
+        'token': token,
+        'scanUrl': scan_url,
+        'imageUrl': image_url,
+    }
+
+
+def _ads_build_settings_qr_payload(cemetery_oid, total_columns, meta):
+    if int(total_columns or 0) <= 0:
+        return {
+            'enabled': False,
+            'scanUrl': '',
+            'imageUrl': '',
+            'exportUrl': '',
+        }
+    qr_scan_url = _clean_str((meta or {}).get('adsQrScanUrl'))
+    qr_image_url = _clean_str((meta or {}).get('adsQrImageUrl'))
+    if not qr_scan_url or not qr_image_url:
+        ensured = _ads_ensure_cemetery_qr(cemetery_oid)
+        qr_scan_url = _clean_str(ensured.get('scanUrl'))
+        qr_image_url = _clean_str(ensured.get('imageUrl'))
+    return {
+        'enabled': True,
+        'scanUrl': qr_scan_url,
+        'imageUrl': qr_image_url,
+        'exportUrl': f"/api/admin/ads/settings/{quote(str(cemetery_oid), safe='')}/qr.svg",
+    }
 
 
 def _ads_limit_field_for_surface(surface_type):
@@ -3994,10 +4236,17 @@ def _ads_build_application_payload(data):
     if not phone:
         abort(400, description='`phone` is required')
 
+    normalized_surface_type = _ads_normalize_surface_type(data.get('surfaceType'), default='columns')
+    if normalized_surface_type == 'pages' and cemetery_oid:
+        meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+        total_columns = _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0)
+        if total_columns <= 0:
+            abort(400, description='Для реклами на сторінках обране кладовище має мати кількість стовбчиків більше 0')
+
     return {
         'cemeteryId': cemetery_oid,
         'cemeteryName': _clean_str(data.get('cemeteryName')) or _clean_str(cemetery_doc.get('name') if cemetery_doc else ''),
-        'surfaceType': _ads_normalize_surface_type(data.get('surfaceType'), default='columns'),
+        'surfaceType': normalized_surface_type,
         'companyName': company_name,
         'websiteUrl': _clean_str(data.get('websiteUrl')),
         'creativeUrl': _clean_str(data.get('creativeUrl')),
@@ -4133,6 +4382,42 @@ def admin_ads_list_columns_cemeteries():
         if plaques_count > 0:
             plaques_applications_count[cemetery_oid] = plaques_applications_count.get(cemetery_oid, 0) + 1
 
+    activated_plaques_count = {}
+    activated_plaques_count_by_name = {}
+    people_query = {
+        'adminPage.pathKey': 'plaques',
+    }
+    for person in people_collection.find(people_query, {'burial.cemeteryRef.id': 1, 'cemetery': 1, 'burial.cemeteryRef.name': 1}):
+        cemetery_id = (
+            person.get('burial', {}).get('cemeteryRef', {}).get('id')
+            if isinstance(person.get('burial'), dict)
+            else None
+        )
+        if cemetery_id:
+            try:
+                cemetery_oid = ObjectId(str(cemetery_id))
+            except Exception:
+                cemetery_oid = None
+            if cemetery_oid is not None:
+                related_ids.add(cemetery_oid)
+                activated_plaques_count[cemetery_oid] = activated_plaques_count.get(cemetery_oid, 0) + 1
+                continue
+
+        cemetery_name = _clean_str(
+            person.get('burial', {}).get('cemeteryRef', {}).get('name')
+            if isinstance(person.get('burial'), dict)
+            else ''
+        ) or _clean_str(person.get('cemetery'))
+        if not cemetery_name:
+            continue
+        key = cemetery_name.lower()
+        activated_plaques_count_by_name[key] = activated_plaques_count_by_name.get(key, 0) + 1
+
+    standard_accounts_by_oid = {}
+    standard_accounts_by_name = {}
+    if mode == 'pages':
+        standard_accounts_by_oid, standard_accounts_by_name = _ads_collect_standard_accounts_counts()
+
     query_filter = {}
     if related_ids:
         query_filter['_id'] = {'$in': list(related_ids)}
@@ -4151,7 +4436,15 @@ def admin_ads_list_columns_cemeteries():
     for cemetery in cemetery_docs:
         cemetery_oid = cemetery.get('_id')
         total_columns = meta_by_cemetery.get(cemetery_oid, 0)
+        if mode == 'pages':
+            total_columns = (
+                standard_accounts_by_oid.get(cemetery_oid, 0)
+                + standard_accounts_by_name.get(_clean_str(cemetery.get('name')).lower(), 0)
+            )
+        if mode == 'columns' and total_columns <= 0:
+            continue
         busy_plaques = campaigns_busy_count.get(cemetery_oid, 0)
+        legacy_plaques_count = activated_plaques_count_by_name.get(_clean_str(cemetery.get('name')).lower(), 0)
         items.append({
             'cemeteryId': str(cemetery_oid),
             'name': _clean_str(cemetery.get('name')),
@@ -4159,7 +4452,7 @@ def admin_ads_list_columns_cemeteries():
             'columnsCount': total_columns,
             'adsCount': campaigns_count.get(cemetery_oid, 0),
             'applicationsCount': applications_count.get(cemetery_oid, 0),
-            'plaquesCount': total_columns,
+            'plaquesCount': activated_plaques_count.get(cemetery_oid, 0) + legacy_plaques_count,
             'busyPlaquesCount': busy_plaques,
             'freePlaquesCount': max(total_columns - busy_plaques, 0),
             'plaquesApplicationsCount': plaques_applications_count.get(cemetery_oid, 0),
@@ -4206,6 +4499,41 @@ def admin_ads_get_columns_cemetery(cemetery_id):
     total_columns = _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0)
     busy_columns = len(campaign_docs)
     free_columns = max(total_columns - busy_columns, 0)
+
+    if mode == 'plaques':
+        cemetery_name = _clean_str(cemetery_doc.get('name'))
+        people_query = {
+            'adminPage.pathKey': 'plaques',
+            '$or': [
+                {'burial.cemeteryRef.id': str(cemetery_oid)},
+            ],
+        }
+        if cemetery_name:
+            people_query['$or'].extend([
+                {'burial.cemeteryRef.name': cemetery_name},
+                {'cemetery': cemetery_name},
+            ])
+        total_plaques = people_collection.count_documents(people_query)
+
+        busy_person_ids = set()
+        for campaign in campaign_docs:
+            for plaque in _ads_normalize_plaques(campaign.get('plaques')):
+                person_id = _clean_str(plaque.get('personId'))
+                if person_id:
+                    busy_person_ids.add(person_id)
+
+        total_columns = total_plaques
+        busy_columns = len(busy_person_ids)
+        free_columns = max(total_columns - busy_columns, 0)
+    elif mode == 'pages':
+        standard_accounts_by_oid, standard_accounts_by_name = _ads_collect_standard_accounts_counts()
+        cemetery_name = _clean_str(cemetery_doc.get('name')).lower()
+        total_columns = (
+            standard_accounts_by_oid.get(cemetery_oid, 0)
+            + standard_accounts_by_name.get(cemetery_name, 0)
+        )
+        busy_columns = len(campaign_docs)
+        free_columns = max(total_columns - busy_columns, 0)
 
     return jsonify({
         'cemeteryId': str(cemetery_oid),
@@ -4496,14 +4824,16 @@ def admin_ads_get_settings(cemetery_id):
         abort(404, description='Cemetery not found')
 
     meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    total_columns = _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0)
     return jsonify({
         'cemeteryId': str(cemetery_oid),
         'cemeteryName': _clean_str(cemetery_doc.get('name')),
         'address': _ads_extract_cemetery_address(cemetery_doc),
-        'totalColumns': _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0),
+        'totalColumns': total_columns,
         'priceUah': _ads_clean_int(meta.get('priceUah'), 'priceUah', default=0),
         'maxColumnsAds': _ads_clean_int(meta.get('maxColumnsAds'), 'maxColumnsAds', default=0),
         'maxPagesAds': _ads_clean_int(meta.get('maxPagesAds'), 'maxPagesAds', default=0),
+        'adsQr': _ads_build_settings_qr_payload(cemetery_oid, total_columns, meta),
     })
 
 
@@ -4518,12 +4848,16 @@ def admin_ads_upsert_settings(cemetery_id):
     if not isinstance(data, dict):
         abort(400, description='Body must be a JSON object')
 
-    allowed_fields = {'maxColumnsAds', 'maxPagesAds'}
+    allowed_fields = {'totalColumns', 'maxColumnsAds', 'maxPagesAds'}
     unknown = set(data.keys()) - allowed_fields
     if unknown:
         abort(400, description=f'Unsupported fields: {", ".join(sorted(unknown))}')
 
     update_fields = {}
+    next_total_columns = None
+    if 'totalColumns' in data:
+        next_total_columns = max(_ads_clean_int(data.get('totalColumns'), 'totalColumns', default=0), 0)
+        update_fields['totalColumns'] = next_total_columns
     if 'maxColumnsAds' in data:
         update_fields['maxColumnsAds'] = max(_ads_clean_int(data.get('maxColumnsAds'), 'maxColumnsAds', default=0), 0)
     if 'maxPagesAds' in data:
@@ -4537,17 +4871,49 @@ def admin_ads_upsert_settings(cemetery_id):
         {'$set': update_fields, '$setOnInsert': {'cemeteryId': cemetery_oid, 'createdAt': datetime.utcnow()}},
         upsert=True
     )
+    if next_total_columns is not None and next_total_columns > 0:
+        _ads_ensure_cemetery_qr(cemetery_oid)
 
     meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    total_columns = _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0)
     return jsonify({
         'cemeteryId': str(cemetery_oid),
         'cemeteryName': _clean_str(cemetery_doc.get('name')),
         'address': _ads_extract_cemetery_address(cemetery_doc),
-        'totalColumns': _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0),
+        'totalColumns': total_columns,
         'priceUah': _ads_clean_int(meta.get('priceUah'), 'priceUah', default=0),
         'maxColumnsAds': _ads_clean_int(meta.get('maxColumnsAds'), 'maxColumnsAds', default=0),
         'maxPagesAds': _ads_clean_int(meta.get('maxPagesAds'), 'maxPagesAds', default=0),
+        'adsQr': _ads_build_settings_qr_payload(cemetery_oid, total_columns, meta),
     })
+
+
+@application.route('/api/admin/ads/settings/<string:cemetery_id>/qr.svg', methods=['GET'])
+def admin_ads_get_settings_qr_svg(cemetery_id):
+    cemetery_oid = _ads_parse_cemetery_object_id(cemetery_id, required=True)
+    cemetery_doc = _ads_find_cemetery(cemetery_oid)
+    if not cemetery_doc:
+        abort(404, description='Cemetery not found')
+
+    meta = _ads_columns_meta_for_cemetery(cemetery_oid) or {}
+    total_columns = _ads_clean_int(meta.get('totalColumns'), 'totalColumns', default=0)
+    if total_columns <= 0:
+        abort(404, description='QR is unavailable for cemetery with zero columns')
+
+    qr_scan_url = _clean_str(meta.get('adsQrScanUrl'))
+    if not qr_scan_url:
+        ensured = _ads_ensure_cemetery_qr(cemetery_oid)
+        qr_scan_url = _clean_str(ensured.get('scanUrl'))
+
+    svg_bytes = _ads_build_qr_svg_bytes(qr_scan_url)
+    if not svg_bytes:
+        abort(500, description='Failed to build QR svg')
+
+    response = make_response(svg_bytes)
+    response.headers['Content-Type'] = 'image/svg+xml; charset=utf-8'
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]+', '-', _clean_str(cemetery_doc.get('name')) or str(cemetery_oid))
+    response.headers['Content-Disposition'] = f'attachment; filename="ads-qr-{safe_name}.svg"'
+    return response
 
 
 ADMIN_CHURCH_STATUSES = {'Активний', 'Неактивний'}
@@ -8774,8 +9140,42 @@ def public_qr_activation_plaques():
         'createdAt': now,
     }
 
-    plaques_moderation_collection.insert_one(document)
-    return jsonify({'success': True})
+    insert_result = plaques_moderation_collection.insert_one(document)
+    moderation_id = str(insert_result.inserted_id)
+
+    payment_method_raw = _qr_str(data.get('paymentMethod')).lower()
+    payment_method = payment_method_raw if payment_method_raw in {'online', 'cod', 'moderation'} else 'moderation'
+    payment_status = _qr_str(data.get('paymentStatus'))
+    if not payment_status:
+        payment_status = 'pending' if payment_method == 'online' else ('cod' if payment_method == 'cod' else 'pending')
+
+    plaques_order_doc = {
+        'moderationId': moderation_id,
+        'personId': '',
+        'personIds': [],
+        'personName': _qr_str(base_document.get('name')),
+        'personNames': [_qr_str(base_document.get('name'))] if _qr_str(base_document.get('name')) else [],
+        'lifeRange': _admin_plaques_life_range_text(base_document),
+        'cemetery': _qr_str(base_document.get('cemetery')),
+        'cemeteryAddress': _qr_str(base_document.get('area')),
+        'customerPhone': phone,
+        'paymentMethod': payment_method,
+        'paymentStatus': payment_status,
+        'invoiceId': _qr_str(data.get('invoiceId')),
+        'webhookData': data.get('webhookData') if isinstance(data.get('webhookData'), dict) else {},
+        'sourceType': 'qr_activation_plaques',
+        'activationType': 'plaques',
+        'status': 'on_moderation',
+        'qrCode': qr_code,
+        'qrPathKey': 'plaques',
+        'qrDocId': str(qr_doc.get('_id')) if qr_doc.get('_id') else '',
+        'qrNumber': _qr_str(qr_doc.get('qrNumber')),
+        'wiredQrCodeId': _qr_str(qr_doc.get('wiredQrCodeId')),
+        'createdAt': now,
+        'updatedAt': now,
+    }
+    order_insert = plaques_orders_collection.insert_one(plaques_order_doc)
+    return jsonify({'success': True, 'orderId': str(order_insert.inserted_id)})
 
 
 @application.route('/api/settlements', methods=['GET'])
@@ -11202,10 +11602,24 @@ def _finance_best_effort_refresh_premium_tracking():
                 pass
 
 
+def _finance_is_success_payment(value):
+    return _clean_str(value).lower() in ADMIN_NOTES_SUCCESS_PAYMENT_STATUSES
+
+
 def _finance_collect_premium_rows(tzinfo, date_from, date_to):
     rows = []
-    docs = premium_orders_collection.find({'status': 'received'}).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
+    success_statuses = []
+    for status in ADMIN_NOTES_SUCCESS_PAYMENT_STATUSES:
+        success_statuses.extend([status, status.upper(), status.capitalize()])
+    docs = premium_orders_collection.find({
+        '$or': [
+            {'paymentStatus': {'$in': sorted(set(success_statuses))}},
+            {'status': 'received'},
+        ]
+    }).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
     for doc in docs:
+        if not (_finance_is_success_payment(doc.get('paymentStatus')) or _clean_str(doc.get('status')).lower() == 'received'):
+            continue
         webhook_data = doc.get('webhookData') if isinstance(doc.get('webhookData'), dict) else {}
         amount_uah = _finance_extract_webhook_amount_uah(webhook_data)
         if amount_uah is None:
@@ -11241,30 +11655,35 @@ def _finance_collect_premium_rows(tzinfo, date_from, date_to):
 
 def _finance_collect_plaques_rows(tzinfo, date_from, date_to):
     rows = []
-    docs = plaques_moderation_collection.find({}).sort([('createdAt', -1), ('_id', -1)])
+    docs = plaques_orders_collection.find({}).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)])
     for doc in docs:
         webhook_data = doc.get('webhookData') if isinstance(doc.get('webhookData'), dict) else {}
         amount_uah = _finance_extract_webhook_amount_uah(webhook_data)
         if amount_uah is None:
             amount_uah = FINANCE_FALLBACK_PLAQUE_UAH
-        event_dt = _finance_extract_webhook_datetime(webhook_data) or _finance_parse_any_datetime(doc.get('createdAt'))
+        event_dt = (
+            _finance_extract_webhook_datetime(webhook_data)
+            or _finance_parse_any_datetime(doc.get('updatedAt'))
+            or _finance_parse_any_datetime(doc.get('createdAt'))
+        )
         local_date = _finance_to_local_date(event_dt, tzinfo)
         if not _finance_is_in_period(local_date, date_from, date_to):
             continue
-        path_label = _admin_plaques_path_label(doc)
+        payment_status = _clean_str(doc.get('paymentStatus')).lower()
+        status_label = 'Оплачено' if payment_status in {'success', 'paid', 'completed'} else 'На модерації'
         rows.append(
             _finance_build_row(
-                row_id=f"plaques:{doc.get('_id')}",
+                row_id=f"plaques_order:{doc.get('_id')}",
                 tab_id='plaques',
                 category_label='Таблички',
                 amount_uah=amount_uah,
                 local_date=local_date,
                 event_dt=event_dt,
-                source_name=_clean_str(doc.get('name')),
-                source_details=_clean_str(doc.get('cemetery')) or _clean_str(doc.get('area')),
-                contact=_clean_str(doc.get('phone')),
-                status='Заявка',
-                path_label=path_label,
+                source_name=_clean_str(doc.get('personName')) or _clean_str(doc.get('name')),
+                source_details=_clean_str(doc.get('cemetery')) or _clean_str(doc.get('cemeteryAddress')),
+                contact=_clean_str(doc.get('customerPhone')) or _clean_str(doc.get('phone')),
+                status=status_label,
+                path_label='Таблички',
                 receipt_available=bool(_finance_extract_invoice_id(doc)),
             )
         )
@@ -11654,9 +12073,12 @@ def admin_finance_receipt():
         except Exception:
             doc = None
         invoice_id = _finance_extract_invoice_id(doc or {})
-    elif kind == 'plaques' and len(parts) >= 2:
+    elif kind in {'plaques', 'plaques_order'} and len(parts) >= 2:
         try:
-            doc = plaques_moderation_collection.find_one({'_id': ObjectId(parts[1])}, {'invoiceId': 1, 'webhookData': 1})
+            if kind == 'plaques_order':
+                doc = plaques_orders_collection.find_one({'_id': ObjectId(parts[1])}, {'invoiceId': 1, 'webhookData': 1})
+            else:
+                doc = plaques_moderation_collection.find_one({'_id': ObjectId(parts[1])}, {'invoiceId': 1, 'webhookData': 1})
         except Exception:
             doc = None
         invoice_id = _finance_extract_invoice_id(doc or {})
@@ -11848,6 +12270,9 @@ def admin_activate_premium_order(order_id):
     order_id_str = str(oid)
     qr_doc = None
     wired_qr_doc_id = _premium_order_str(order_doc.get('qrDocId') or order_doc.get('wiredQrCodeDocId'))
+    wired_qr_code_from_order = _premium_order_str(order_doc.get('wiredQrCodeId'))
+    if not wired_qr_doc_id and not wired_qr_code_from_order:
+        abort(400, description="Спочатку прив'яжіть QR-код перед активацією")
     if wired_qr_doc_id:
         try:
             qr_doc = admin_qr_codes_collection.find_one({'_id': ObjectId(wired_qr_doc_id)})
@@ -11855,11 +12280,21 @@ def admin_activate_premium_order(order_id):
             abort(400, description='Invalid wired QR code id')
         if not qr_doc:
             abort(409, description='Selected QR code is not found')
-
-    if not qr_doc:
-        qr_doc = _premium_pick_qr_code_for_activation(qr_path_key)
-    if not qr_doc:
-        abort(409, description='No available Premium QR code to wire')
+    elif wired_qr_code_from_order:
+        qr_query = {
+            'pathKey': qr_path_key,
+            '$or': [
+                {'wiredQrCodeId': wired_qr_code_from_order},
+            ],
+        }
+        try:
+            qr_number = int(wired_qr_code_from_order)
+            qr_query['$or'].append({'qrNumber': qr_number})
+        except Exception:
+            pass
+        qr_doc = admin_qr_codes_collection.find_one(qr_query)
+        if not qr_doc:
+            abort(409, description='Selected QR code is not found')
 
     qr_doc = _qr_ensure_doc_runtime_fields(qr_doc, persist=True)
     qr_doc_id = qr_doc.get('_id')
@@ -12009,6 +12444,17 @@ def monopay_webhook():
     )
 
     premium_orders_collection.update_one(
+        {'invoiceId': invoice_id},
+        {
+            '$set': {
+                'paymentStatus': status,
+                'webhookData': data,
+                'updatedAt': datetime.utcnow(),
+            }
+        }
+    )
+
+    plaques_orders_collection.update_one(
         {'invoiceId': invoice_id},
         {
             '$set': {

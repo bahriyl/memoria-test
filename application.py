@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlparse
 import jwt
+import hashlib
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -31,6 +32,7 @@ from pymongo import MongoClient, ASCENDING
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from flask_socketio import SocketIO, join_room
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -537,6 +539,63 @@ def verify_password(raw_password: str, hashed: str) -> bool:
 
 def hash_password(raw: str) -> str:
     return bcrypt.hashpw(raw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _password_reveal_key() -> bytes:
+    key_source = (
+        os.getenv('PREMIUM_PASSWORD_REVEAL_KEY')
+        or os.getenv('ADMIN_JWT_SECRET')
+        or os.getenv('JWT_SECRET')
+        or 'memoria-password-reveal-default'
+    )
+    return hashlib.sha256(key_source.encode('utf-8')).digest()
+
+
+def _password_reveal_encrypt(raw_password: str) -> dict:
+    cleaned = _admin_auth_str(raw_password)
+    if not cleaned:
+        return {}
+    key = _password_reveal_key()
+    iv = os.urandom(12)
+    encrypted = AESGCM(key).encrypt(iv, cleaned.encode('utf-8'), None)
+    ciphertext = encrypted[:-16]
+    tag = encrypted[-16:]
+    return {
+        'version': 'v1',
+        'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
+        'iv': base64.b64encode(iv).decode('utf-8'),
+        'tag': base64.b64encode(tag).decode('utf-8'),
+        'updatedAt': datetime.utcnow(),
+    }
+
+
+def _password_reveal_decrypt(payload) -> str:
+    if not isinstance(payload, dict):
+        return ''
+    try:
+        ciphertext = base64.b64decode(_admin_auth_str(payload.get('ciphertext')))
+        iv = base64.b64decode(_admin_auth_str(payload.get('iv')))
+        tag = base64.b64decode(_admin_auth_str(payload.get('tag')))
+        if not ciphertext or not iv or not tag:
+            return ''
+        key = _password_reveal_key()
+        decrypted = AESGCM(key).decrypt(iv, ciphertext + tag, None)
+        return decrypted.decode('utf-8').strip()
+    except Exception:
+        return ''
+
+
+def _premium_password_set_payload(raw_password: str, *, include_updated_at: bool = True) -> dict:
+    cleaned = _admin_auth_str(raw_password)
+    if not cleaned:
+        return {}
+    payload = {
+        'premium.password': hash_password(cleaned),
+        'premium.passwordReveal': _password_reveal_encrypt(cleaned),
+    }
+    if include_updated_at:
+        payload['premium.updatedAt'] = datetime.utcnow()
+    return payload
 
 
 def _admin_auth_str(value):
@@ -1210,8 +1269,10 @@ def admin_create_page():
     if death_date:
         doc['deathDate'] = death_date
     if generated_password:
+        premium_password_payload = _premium_password_set_payload(generated_password)
         doc['premium'] = {
-            'password': hash_password(generated_password),
+            'password': premium_password_payload.get('premium.password'),
+            'passwordReveal': premium_password_payload.get('premium.passwordReveal'),
             'updatedAt': datetime.utcnow(),
         }
 
@@ -1329,8 +1390,7 @@ def admin_update_page(person_id):
     if 'generatedPassword' in data:
         generated_password = _admin_pages_str(data.get('generatedPassword'))
         if generated_password:
-            update_fields['premium.password'] = hash_password(generated_password)
-            update_fields['premium.updatedAt'] = datetime.utcnow()
+            update_fields.update(_premium_password_set_payload(generated_password))
             merged_admin_page['generatedPassword'] = generated_password
         else:
             merged_admin_page.pop('generatedPassword', None)
@@ -1433,16 +1493,65 @@ def admin_get_page_password(person_id):
     except Exception:
         abort(400, description='Invalid person id')
 
-    person = people_collection.find_one({'_id': oid}, {'adminPage.generatedPassword': 1})
+    person = people_collection.find_one(
+        {'_id': oid},
+        {'adminPage.generatedPassword': 1, 'premium.passwordReveal': 1, 'premium.password': 1},
+    )
     if not person:
         abort(404, description='Person not found')
 
     admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
     generated_password = _admin_pages_str(admin_page.get('generatedPassword'))
+
     if not generated_password:
+        premium = person.get('premium') if isinstance(person.get('premium'), dict) else {}
+        generated_password = _password_reveal_decrypt(premium.get('passwordReveal'))
+
+    if not generated_password:
+        premium = person.get('premium') if isinstance(person.get('premium'), dict) else {}
+        if _admin_pages_str(premium.get('password')):
+            abort(404, description='Password cannot be recovered. Use reset.')
         abort(404, description='Password not found')
 
     return jsonify({
+        'generatedPassword': generated_password,
+        'password': generated_password,
+    })
+
+
+@application.route('/api/admin/pages/<string:person_id>/password/reset', methods=['POST'])
+def admin_reset_page_password(person_id):
+    try:
+        oid = ObjectId(person_id)
+    except Exception:
+        abort(400, description='Invalid person id')
+
+    person = people_collection.find_one({'_id': oid}, {'_id': 1})
+    if not person:
+        abort(404, description='Person not found')
+
+    data = request.get_json(silent=True) or {}
+    raw_password = _admin_pages_str(data.get('password') or data.get('newPassword'))
+    generated_password = raw_password or _generate_premium_order_password()
+    validate_new_password(generated_password)
+
+    people_collection.update_one(
+        {'_id': oid},
+        {
+            '$set': {
+                **_premium_password_set_payload(generated_password),
+                'adminPage.generatedPassword': generated_password,
+                'adminPage.updatedAt': datetime.utcnow(),
+            },
+            '$unset': {
+                'premium.reset': '',
+                'premium.resetSms': '',
+            },
+        },
+    )
+
+    return jsonify({
+        'ok': True,
         'generatedPassword': generated_password,
         'password': generated_password,
     })
@@ -5079,6 +5188,19 @@ def _admin_notes_parse_ua_date(value):
         return None
 
 
+def _admin_notes_parse_graph_date(value):
+    raw = _clean_str(value)
+    if not raw:
+        return None
+    parsed_ua = _admin_notes_parse_ua_date(raw)
+    if parsed_ua:
+        return parsed_ua
+    try:
+        return datetime.strptime(raw, '%Y-%m-%d').date()
+    except Exception:
+        return None
+
+
 def _admin_notes_normalize_payment_status(value):
     return _clean_str(value).lower()
 
@@ -5374,10 +5496,12 @@ def admin_notes_overview():
 @application.route('/api/admin/notes/graph', methods=['GET'])
 def admin_notes_graph():
     period = _clean_str(request.args.get('period')).lower() or 'month'
-    if period not in {'day', 'week', 'month'}:
-        abort(400, description='`period` must be one of: day, week, month')
+    if period not in {'day', 'week', 'month', 'custom'}:
+        abort(400, description='`period` must be one of: day, week, month, custom')
 
     search = _clean_str(request.args.get('search')).casefold()
+    date_from_raw = _clean_str(request.args.get('dateFrom'))
+    date_to_raw = _clean_str(request.args.get('dateTo'))
     fallback_reasons = set()
     timezone_value = _clean_str(request.args.get('timezone'))
     tzinfo, resolved_timezone = _admin_notes_resolve_timezone(timezone_value, fallback_reasons)
@@ -5473,8 +5597,65 @@ def admin_notes_graph():
 
         points = [{'label': labels[index], 'value': counts[index]} for index in range(len(labels))]
 
-    else:
+    elif period == 'month':
         day_list = [now_local.date() - timedelta(days=delta) for delta in range(29, -1, -1)]
+        index_by_day = {day: index for index, day in enumerate(day_list)}
+        labels = [day.strftime('%d.%m') for day in day_list]
+        counts = [0 for _ in day_list]
+
+        projection = {
+            'churchId': 1,
+            'churchName': 1,
+            'personName': 1,
+            'phone': 1,
+            'createdAt': 1,
+            'serviceDate': 1,
+            'paymentStatus': 1,
+        }
+        liturgy_cursor = liturgies_collection.find({'paymentStatus': {'$in': ADMIN_NOTES_SUCCESS_QUERY_VALUES}}, projection)
+        for liturgy_doc in liturgy_cursor:
+            if not _admin_notes_is_success_payment(liturgy_doc.get('paymentStatus')):
+                continue
+
+            church_doc = _admin_notes_resolve_church_for_liturgy(liturgy_doc, church_by_id, church_by_name)
+            church_address = _admin_notes_church_display(church_doc).get('address') if church_doc else ''
+            if not _admin_notes_matches_search(search, [
+                liturgy_doc.get('churchName'),
+                liturgy_doc.get('personName'),
+                liturgy_doc.get('phone'),
+                church_address,
+            ]):
+                continue
+
+            event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('createdAt'), tzinfo)
+            if not event_local_dt:
+                event_local_dt = _admin_notes_to_local_datetime(liturgy_doc.get('serviceDate'), tzinfo)
+                if event_local_dt:
+                    fallback_reasons.add('Для частини точок графіка відсутній createdAt, використано serviceDate.')
+            if not event_local_dt:
+                continue
+
+            event_day = event_local_dt.date()
+            if event_day not in index_by_day:
+                continue
+            counts[index_by_day[event_day]] += 1
+
+        points = [{'label': labels[index], 'value': counts[index]} for index in range(len(labels))]
+    else:
+        if not date_from_raw or not date_to_raw:
+            abort(400, description='`dateFrom` and `dateTo` are required for custom period')
+        date_from = _admin_notes_parse_graph_date(date_from_raw)
+        date_to = _admin_notes_parse_graph_date(date_to_raw)
+        if date_from is None:
+            abort(400, description='`dateFrom` must be in format DD.MM.YYYY or YYYY-MM-DD')
+        if date_to is None:
+            abort(400, description='`dateTo` must be in format DD.MM.YYYY or YYYY-MM-DD')
+        if date_from > date_to:
+            abort(400, description='`dateFrom` must be less or equal to `dateTo`')
+        if (date_to - date_from).days > 366:
+            abort(400, description='Custom period cannot exceed 367 days')
+
+        day_list = [date_from + timedelta(days=delta) for delta in range((date_to - date_from).days + 1)]
         index_by_day = {day: index for index, day in enumerate(day_list)}
         labels = [day.strftime('%d.%m') for day in day_list]
         counts = [0 for _ in day_list]
@@ -10162,8 +10343,12 @@ def admin_update_premium_order(order_id):
     )
 
     current_status = _premium_order_str(current_doc.get('status')) or 'on_moderation'
+    current_activated_at = current_doc.get('activatedAt')
     old_ttn = _premium_order_str(current_doc.get('ttn'))
+    order_id_str = str(oid)
     update_fields = {}
+    qr_reserve_target_doc_id = None
+    qr_release_previous_doc_id = None
     has_explicit_status = 'status' in data
     current_moderation_payload = (
         dict(current_doc.get('moderationPayload'))
@@ -10196,6 +10381,49 @@ def admin_update_premium_order(order_id):
         if not next_password:
             abort(400, description='`generatedPassword` cannot be empty')
         update_fields['generatedPassword'] = next_password
+
+    if 'wiredQrCodeId' in data or 'qrNumber' in data:
+        if current_activated_at:
+            abort(409, description='Cannot rewire QR after activation')
+
+        target_qr_number_raw = _premium_order_str(data.get('wiredQrCodeId') or data.get('qrNumber'))
+        current_qr_doc_id = _premium_order_str(current_doc.get('wiredQrCodeDocId'))
+        if current_qr_doc_id:
+            try:
+                qr_release_previous_doc_id = ObjectId(current_qr_doc_id)
+            except Exception:
+                qr_release_previous_doc_id = None
+
+        if not target_qr_number_raw:
+            update_fields['wiredQrCodeId'] = ''
+            update_fields['wiredQrCodeDocId'] = ''
+        else:
+            try:
+                target_qr_number = int(target_qr_number_raw)
+            except Exception:
+                abort(400, description='Invalid QR number')
+            if target_qr_number <= 0:
+                abort(400, description='Invalid QR number')
+
+            target_qr_path_key = 'premium_qr_firma' if is_premium_qr_firma_order else 'premium_qr'
+            qr_doc = admin_qr_codes_collection.find_one({'pathKey': target_qr_path_key, 'qrNumber': target_qr_number})
+            if not qr_doc:
+                abort(404, description='QR code not found')
+            if bool(qr_doc.get('isConnected')):
+                abort(409, description='QR code is already connected')
+
+            reserved_order_id = _qr_str(qr_doc.get('reservedOrderId'))
+            if reserved_order_id and reserved_order_id != order_id_str:
+                abort(409, description='QR code is already reserved')
+
+            qr_doc_id = qr_doc.get('_id')
+            if not qr_doc_id:
+                abort(409, description='QR code cannot be reserved')
+
+            qr_reserve_target_doc_id = qr_doc_id
+            effective_qr_code_id = _qr_str(qr_doc.get('wiredQrCodeId')) or _qr_str(qr_doc.get('qrNumber'))
+            update_fields['wiredQrCodeId'] = effective_qr_code_id
+            update_fields['wiredQrCodeDocId'] = str(qr_doc_id)
 
     if 'personName' in data:
         next_person_name = _premium_order_str(data.get('personName'))
@@ -10367,8 +10595,50 @@ def admin_update_premium_order(order_id):
     if not update_fields:
         abort(400, description='No fields to update')
 
-    update_fields['updatedAt'] = datetime.utcnow()
+    now = datetime.utcnow()
+    update_fields['updatedAt'] = now
+
+    if qr_reserve_target_doc_id:
+        reserve_result = admin_qr_codes_collection.update_one(
+            {
+                '_id': qr_reserve_target_doc_id,
+                'isConnected': {'$ne': True},
+                '$or': [
+                    {'reservedOrderId': {'$exists': False}},
+                    {'reservedOrderId': ''},
+                    {'reservedOrderId': order_id_str},
+                ],
+            },
+            {
+                '$set': {
+                    'reservedOrderId': order_id_str,
+                    'reservedAt': now,
+                    'updatedAt': now,
+                }
+            }
+        )
+        if reserve_result.matched_count == 0:
+            abort(409, description='QR code is already reserved')
+
     premium_orders_collection.update_one({'_id': oid}, {'$set': update_fields})
+
+    if qr_release_previous_doc_id and (not qr_reserve_target_doc_id or qr_release_previous_doc_id != qr_reserve_target_doc_id):
+        admin_qr_codes_collection.update_one(
+            {
+                '_id': qr_release_previous_doc_id,
+                'isConnected': {'$ne': True},
+                'reservedOrderId': order_id_str,
+            },
+            {
+                '$unset': {
+                    'reservedOrderId': '',
+                    'reservedAt': '',
+                },
+                '$set': {
+                    'updatedAt': now,
+                },
+            }
+        )
 
     doc = premium_orders_collection.find_one({'_id': oid})
     if isinstance(doc, dict):
@@ -11172,9 +11442,9 @@ def _finance_collect_rows(date_from=None, date_to=None):
     return by_tab, timezone_name
 
 
-def _finance_build_graph_points(period, rows, tzinfo):
+def _finance_build_graph_points(period, rows, tzinfo, *, date_from=None, date_to=None):
     cleaned_period = _clean_str(period).lower() or 'month'
-    if cleaned_period not in {'day', 'week', 'month'}:
+    if cleaned_period not in {'day', 'week', 'month', 'custom'}:
         cleaned_period = 'month'
 
     source_rows = rows if isinstance(rows, list) else []
@@ -11205,6 +11475,30 @@ def _finance_build_graph_points(period, rows, tzinfo):
         day_list = [now_local.date() - timedelta(days=delta) for delta in range(6, -1, -1)]
         index_by_day = {day: idx for idx, day in enumerate(day_list)}
         labels = [ADMIN_NOTES_WEEKDAY_LABELS[(day.weekday() + 1) % 7] for day in day_list]
+        sums = [0 for _ in day_list]
+
+        for row in source_rows:
+            row_dt = _finance_parse_any_datetime(row.get('sortKey'))
+            if not row_dt:
+                continue
+            if row_dt.tzinfo is not None:
+                try:
+                    row_dt = row_dt.astimezone(tzinfo).replace(tzinfo=None)
+                except Exception:
+                    row_dt = row_dt.replace(tzinfo=None)
+            row_day = row_dt.date()
+            if row_day not in index_by_day:
+                continue
+            sums[index_by_day[row_day]] += max(int(row.get('amountUah') or 0), 0)
+
+        return cleaned_period, [{'label': labels[idx], 'value': sums[idx]} for idx in range(len(labels))]
+
+    if cleaned_period == 'custom':
+        if not date_from or not date_to or date_from > date_to:
+            return cleaned_period, []
+        day_list = [date_from + timedelta(days=delta) for delta in range((date_to - date_from).days + 1)]
+        index_by_day = {day: idx for idx, day in enumerate(day_list)}
+        labels = [day.strftime('%d.%m') for day in day_list]
         sums = [0 for _ in day_list]
 
         for row in source_rows:
@@ -11404,13 +11698,33 @@ def admin_finance_receipt():
 @application.route('/api/admin/finance/graph', methods=['GET'])
 def admin_finance_graph():
     period = _clean_str(request.args.get('period')).lower() or 'month'
-    if period not in {'day', 'week', 'month'}:
-        abort(400, description='`period` must be one of: day, week, month')
+    if period not in {'day', 'week', 'month', 'custom'}:
+        abort(400, description='`period` must be one of: day, week, month, custom')
+
+    date_from_raw = _clean_str(request.args.get('from') or request.args.get('dateFrom'))
+    date_to_raw = _clean_str(request.args.get('to') or request.args.get('dateTo'))
+    date_from = _finance_parse_date_param(date_from_raw, 'from') if date_from_raw else None
+    date_to = _finance_parse_date_param(date_to_raw, 'to') if date_to_raw else None
+    if period == 'custom':
+        if not date_from_raw or not date_to_raw:
+            abort(400, description='`from` and `to` are required for custom period')
+        if date_from is None or date_to is None:
+            abort(400, description='`from` and `to` must be in format YYYY-MM-DD')
+        if date_from > date_to:
+            abort(400, description='`from` must be less or equal to `to`')
+        if (date_to - date_from).days > 366:
+            abort(400, description='Custom period cannot exceed 367 days')
 
     timezone_value = _clean_str(request.args.get('timezone'))
     tzinfo, timezone_name = _finance_resolve_timezone(timezone_value)
     rows_by_tab, _ = _finance_collect_rows(date_from=None, date_to=None)
-    active_period, points = _finance_build_graph_points(period, rows_by_tab.get('main', []), tzinfo)
+    active_period, points = _finance_build_graph_points(
+        period,
+        rows_by_tab.get('main', []),
+        tzinfo,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
     return jsonify({
         'period': active_period,
@@ -11464,7 +11778,6 @@ def admin_activate_premium_order(order_id):
     if not raw_password:
         abort(400, description='Missing generatedPassword for activation')
 
-    hashed = hash_password(raw_password)
     now = datetime.utcnow()
     activation_type = _premium_order_str(order_doc.get('activationType'))
     qr_path_key = _premium_order_str(order_doc.get('qrPathKey')) or 'premium_qr'
@@ -11532,13 +11845,16 @@ def admin_activate_premium_order(order_id):
         if not primary_person_id:
             abort(400, description='Order has no primary personId')
 
+    order_id_str = str(oid)
     qr_doc = None
     wired_qr_doc_id = _premium_order_str(order_doc.get('qrDocId') or order_doc.get('wiredQrCodeDocId'))
     if wired_qr_doc_id:
         try:
             qr_doc = admin_qr_codes_collection.find_one({'_id': ObjectId(wired_qr_doc_id)})
         except Exception:
-            qr_doc = None
+            abort(400, description='Invalid wired QR code id')
+        if not qr_doc:
+            abort(409, description='Selected QR code is not found')
 
     if not qr_doc:
         qr_doc = _premium_pick_qr_code_for_activation(qr_path_key)
@@ -11547,6 +11863,11 @@ def admin_activate_premium_order(order_id):
 
     qr_doc = _qr_ensure_doc_runtime_fields(qr_doc, persist=True)
     qr_doc_id = qr_doc.get('_id')
+    if bool(qr_doc.get('isConnected')):
+        abort(409, description='QR code is already connected')
+    reserved_order_id = _qr_str(qr_doc.get('reservedOrderId'))
+    if reserved_order_id and reserved_order_id != order_id_str:
+        abort(409, description='QR code is already reserved')
     wired_qr_code_id = _qr_str(qr_doc.get('wiredQrCodeId')) or _qr_str(qr_doc.get('qrNumber'))
 
     for person_id in person_ids:
@@ -11562,7 +11883,7 @@ def admin_activate_premium_order(order_id):
             {
                 '$set': (
                     {
-                        'premium.password': hashed,
+                        **_premium_password_set_payload(raw_password, include_updated_at=False),
                         'premium.updatedAt': now,
                         'customerName': customer_name,
                         'customerPhone': customer_phone,
@@ -11574,7 +11895,7 @@ def admin_activate_premium_order(order_id):
                     }
                     if not is_premium_qr_firma
                     else {
-                        'premium.password': hashed,
+                        **_premium_password_set_payload(raw_password, include_updated_at=False),
                         'premium.updatedAt': now,
                         'customerName': customer_name,
                         'customerPhone': customer_phone,
@@ -11620,7 +11941,11 @@ def admin_activate_premium_order(order_id):
                     'wiredOrderId': str(oid),
                     'wiredAt': now,
                     'updatedAt': now,
-                }
+                },
+                '$unset': {
+                    'reservedOrderId': '',
+                    'reservedAt': '',
+                },
             }
         )
 
@@ -13198,8 +13523,7 @@ def premium_reset():
         people_collection.update_one(
             {'_id': person['_id']},
             {"$set": {
-                "premium.password": hash_password(new_pw),
-                "premium.updatedAt": datetime.utcnow()
+                **_premium_password_set_payload(new_pw),
              },
              "$unset": {"premium.reset": "", "premium.resetSms": ""}}
         )
@@ -13237,8 +13561,7 @@ def premium_reset():
     people_collection.update_one(
         {"_id": p["_id"]},
         {"$set": {
-            "premium.password": hash_password(new_pw),
-            "premium.updatedAt": datetime.utcnow()
+            **_premium_password_set_payload(new_pw),
          },
          "$unset": {"premium.reset": ""}}
     )

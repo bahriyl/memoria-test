@@ -4619,6 +4619,39 @@ def admin_ads_set_campaign_status(campaign_id):
     return jsonify(_ads_serialize_campaign(updated))
 
 
+@application.route('/api/admin/ads/campaigns', methods=['GET'])
+def admin_ads_list_campaigns():
+    search = _clean_str(request.args.get('search', ''))
+    cemetery_id = _clean_str(request.args.get('cemeteryId', ''))
+    status_filter = _clean_str(request.args.get('status', '')).lower()
+    mode = _clean_str(request.args.get('mode', '')).lower()
+
+    query_filter = {}
+    if cemetery_id:
+        query_filter['cemeteryId'] = _ads_parse_cemetery_object_id(cemetery_id, required=True)
+    if status_filter:
+        if status_filter not in ADS_CAMPAIGN_STATUSES:
+            abort(400, description='`status` must be one of: active, inactive')
+        query_filter['status'] = status_filter
+    if mode:
+        query_filter.update(_ads_surface_query_for_mode(mode))
+    if search:
+        regex = {'$regex': re.escape(search), '$options': 'i'}
+        query_filter['$or'] = [
+            {'companyName': regex},
+            {'address': regex},
+            {'phone': regex},
+            {'websiteUrl': regex},
+        ]
+
+    docs = list(ads_campaigns_collection.find(query_filter).sort([('updatedAt', -1), ('createdAt', -1), ('_id', -1)]))
+    items = [_ads_serialize_campaign(doc) for doc in docs]
+    return jsonify({
+        'total': len(items),
+        'items': items,
+    })
+
+
 @application.route('/api/admin/ads/applications', methods=['GET'])
 def admin_ads_list_applications():
     search = _clean_str(request.args.get('search', ''))

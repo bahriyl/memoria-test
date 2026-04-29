@@ -1812,6 +1812,18 @@ def _admin_moderation_projection(raw_doc):
     bio = loc_clean_str(item.get('bio'))
     occupation = loc_clean_str(item.get('occupation'))
     notable = bool(item.get('notable')) or bool(link) or bool(achievements) or bool(bio)
+    coords_from_location_geo = loc_clean_str(
+        ((location.get('geo') or {}).get('coords'))
+        if isinstance(location.get('geo'), dict)
+        else ''
+    )
+    if not coords_from_location_geo:
+        coordinates = (location.get('geo') or {}).get('coordinates') if isinstance(location.get('geo'), dict) else None
+        if isinstance(coordinates, list) and len(coordinates) == 2:
+            try:
+                coords_from_location_geo = f'{float(coordinates[1]):.6f}, {float(coordinates[0]):.6f}'
+            except Exception:
+                coords_from_location_geo = ''
 
     return {
         'id': str(item.get('_id')),

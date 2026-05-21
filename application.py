@@ -9009,6 +9009,29 @@ def _build_person_moderation_base_document(data):
     return document
 
 
+def _is_duplicate_person_for_moderation(document):
+    if not isinstance(document, dict):
+        return False
+
+    name = loc_clean_str(document.get('name'))
+    birth_date = loc_clean_str(document.get('birthDate'))
+    death_date = loc_clean_str(document.get('deathDate'))
+    if not name or not birth_date or not death_date:
+        return False
+
+    duplicate_query = {
+        'name': name,
+        'birthDate': birth_date,
+        'deathDate': death_date,
+    }
+    existing_person = people_collection.find_one(duplicate_query, {'_id': 1})
+    if existing_person:
+        return True
+
+    existing_moderation = people_moderation_collection.find_one(duplicate_query, {'_id': 1})
+    return bool(existing_moderation)
+
+
 def _qr_activation_find_doc_or_404(code, expected_path_key=''):
     token = _qr_str(code)
     if not token:
@@ -9036,6 +9059,12 @@ def people_add_moderation():
     if not isinstance(data, dict):
         return jsonify({'error': 'invalid_payload', 'message': 'JSON object expected'}), 400
     document = _build_person_moderation_base_document(data)
+    if _is_duplicate_person_for_moderation(document):
+        return jsonify({
+            'success': False,
+            'error': 'duplicate_person',
+            'message': 'Особа вже існує',
+        }), 409
 
     people_moderation_collection.insert_one(document)
 

@@ -481,6 +481,49 @@ def _photon_area_suggestion_from_feature(feature, country_codes):
     }
 
 
+def _is_settlement_nominatim_item(item):
+    if not isinstance(item, dict):
+        return False
+    item_class = clean_str(item.get("class")).lower()
+    item_type = clean_str(item.get("type")).lower()
+    if item_class == "place" and item_type in _SETTLEMENT_TYPES:
+        return True
+    return item_type in _SETTLEMENT_TYPES
+
+
+def _nominatim_area_suggestion_from_item(item, country_codes):
+    if not isinstance(item, dict):
+        return None
+    if not _is_settlement_nominatim_item(item):
+        return None
+
+    address = item.get("address") if isinstance(item.get("address"), dict) else {}
+    country_code = _extract_country_code(address)
+    if not _is_country_allowed(country_code, country_codes):
+        return None
+
+    area_id = _to_osm_ref(item.get("osm_type"), item.get("osm_id"))
+    if not area_id:
+        return None
+
+    city = _extract_city(address) or clean_str(item.get("name")) or clean_str(item.get("display_name")).split(",")[0].strip()
+    region = _extract_region(address)
+    area = _build_area_ref(city, region, country_code, area_id, source="nominatim")
+    geo = parse_geo_point({"lat": item.get("lat"), "lng": item.get("lon")})
+    if not area or not geo:
+        return None
+
+    display = clean_str(area.get("display") or _build_display(city, region, _display_country_name(country_code)))
+    return {
+        "id": clean_str(area.get("id")),
+        "display": display,
+        "lat": geo.get("coordinates", [None, None])[1],
+        "lng": geo.get("coordinates", [None, None])[0],
+        "area": area,
+        "source": "nominatim",
+    }
+
+
 def _dedupe_by_key(items, key_fn):
     out = []
     seen = set()
@@ -743,12 +786,23 @@ def _resolve_area_from_geo(lat, lng, photon_base_url, nominatim_base_url, user_a
     return normalize_area_ref((areas[0] or {}).get("area") if isinstance(areas[0], dict) else {})
 
 
-def search_area_suggestions(search, photon_base_url, user_agent="", language="uk", country_codes="UA", max_rows=10, timeout_seconds=5, retries=1):
+def search_area_suggestions(
+    search,
+    photon_base_url,
+    nominatim_base_url="",
+    user_agent="",
+    language="uk",
+    country_codes="UA",
+    max_rows=10,
+    timeout_seconds=5,
+    retries=1,
+):
     search_clean = clean_str(search)
     if not search_clean:
         return []
 
-    cache_key = f"photon:areas:{search_clean.lower()}:{clean_str(language).lower()}:{','.join(_to_country_codes(country_codes))}:{int(max_rows)}"
+    request_limit = max(int(max_rows), 1)
+    cache_key = f"photon:areas:{search_clean.lower()}:{clean_str(language).lower()}:{','.join(_to_country_codes(country_codes))}:{request_limit}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -757,7 +811,7 @@ def search_area_suggestions(search, photon_base_url, user_agent="", language="uk
         photon_base_url,
         {
             "q": search_clean,
-            "limit": max(int(max_rows), 1),
+            "limit": request_limit,
             "lang": clean_str(language) or "uk",
         },
         user_agent=user_agent,
@@ -773,8 +827,27 @@ def search_area_suggestions(search, photon_base_url, user_agent="", language="uk
             continue
         out.append(item)
 
+    # Some providers return no settlement-level city suggestions for very short queries.
+    # For 1-2 chars only, fallback to Nominatim settlement search to avoid empty responses.
+    if not out and len(search_clean) <= 2 and clean_str(nominatim_base_url):
+        nominatim_items = _nominatim_search(
+            search_clean,
+            nominatim_base_url=nominatim_base_url,
+            user_agent=user_agent,
+            language=language,
+            country_codes=country_codes,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+            limit=max(request_limit, 20),
+        )
+        for item in nominatim_items:
+            suggestion = _nominatim_area_suggestion_from_item(item, country_codes=country_codes)
+            if not suggestion:
+                continue
+            out.append(suggestion)
+
     out = _dedupe_by_key(out, lambda x: x.get("id") or x.get("display"))
-    out = out[: max(int(max_rows), 1)]
+    out = out[: request_limit]
     _cache_set(cache_key, out, ttl_seconds=300)
     return out
 
@@ -981,11 +1054,12 @@ def search_location_areas(
     retries=1,
     **_,
 ):
-    del provider, nominatim_base_url
+    del provider
     timeout_seconds = max(parse_float(timeout_ms) or 5000, 1000) / 1000.0
     return search_area_suggestions(
         search,
         photon_base_url=photon_base_url,
+        nominatim_base_url=nominatim_base_url,
         user_agent=user_agent,
         language=language,
         country_codes=country_codes,

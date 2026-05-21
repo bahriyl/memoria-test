@@ -759,40 +759,41 @@ def people():
     if death_year and death_year.isdigit():
         conditions.append({'deathYear': int(death_year)})
 
+    area_or_conditions = []
     if area_id:
-        conditions.append({
-            '$or': [
-                {'areaId': area_id},
-                {'burial.location.area.id': area_id},
-            ]
-        })
-    elif area:
-        city_part = area.split(',')[0].strip()
-        if city_part:
-            pattern = r'\b' + re.escape(city_part) + r'\b'
-            conditions.append({
-                '$or': [
-                    {'area': {'$regex': pattern, '$options': 'i'}},
-                    {'burial.location.area.display': {'$regex': pattern, '$options': 'i'}},
-                    {'burial.location.area.city': {'$regex': pattern, '$options': 'i'}},
-                ]
-            })
+        area_or_conditions.extend([
+            {'areaId': area_id},
+            {'burial.location.area.id': area_id},
+        ])
 
+    city_part = area.split(',')[0].strip() if area else ''
+    if city_part:
+        pattern = re.escape(city_part)
+        area_or_conditions.extend([
+            {'area': {'$regex': pattern, '$options': 'i'}},
+            {'burial.location.area.display': {'$regex': pattern, '$options': 'i'}},
+            {'burial.location.area.city': {'$regex': pattern, '$options': 'i'}},
+        ])
+
+    if area_or_conditions:
+        conditions.append({'$or': area_or_conditions})
+
+    cemetery_or_conditions = []
     if cemetery_id:
-        conditions.append({
-            '$or': [
-                {'cemeteryId': cemetery_id},
-                {'burial.cemeteryRef.id': cemetery_id},
-            ]
-        })
-    elif cemetery:
+        cemetery_or_conditions.extend([
+            {'cemeteryId': cemetery_id},
+            {'burial.cemeteryRef.id': cemetery_id},
+        ])
+
+    if cemetery:
         cem_regex = {'$regex': re.escape(cemetery), '$options': 'i'}
-        conditions.append({
-            '$or': [
-                {'cemetery': cem_regex},
-                {'burial.cemeteryRef.name': cem_regex},
-            ]
-        })
+        cemetery_or_conditions.extend([
+            {'cemetery': cem_regex},
+            {'burial.cemeteryRef.name': cem_regex},
+        ])
+
+    if cemetery_or_conditions:
+        conditions.append({'$or': cemetery_or_conditions})
 
     mongo_filter = {'$and': conditions} if len(conditions) > 1 else (conditions[0] if conditions else {})
     docs = list(people_collection.find(mongo_filter))
@@ -3113,10 +3114,10 @@ def update_person(person_id):
     location_fields = {"area", "areaId", "cemetery", "location", "burial"}
     has_location_changes = bool(location_fields.intersection(set(update_doc.keys())))
     if has_location_changes:
+        legacy_updates = {k: update_doc[k] for k in ("area", "areaId", "cemetery", "location") if k in update_doc}
         if "burial" in update_doc:
-            merged_doc = merge_dict(existing_person, {"burial": update_doc["burial"]})
+            merged_doc = merge_dict(existing_person, {"burial": update_doc["burial"], **legacy_updates})
         else:
-            legacy_updates = {k: update_doc[k] for k in ("area", "areaId", "cemetery", "location") if k in update_doc}
             merged_doc = merge_dict(existing_person, legacy_updates)
 
         burial_normalized = normalize_person_burial(merged_doc)
@@ -5519,6 +5520,7 @@ def admin_delete_church(church_id):
 
 
 ADMIN_NOTES_SUCCESS_PAYMENT_STATUSES = {'success', 'paid', 'completed'}
+LITURGY_FAILURE_PAYMENT_STATUSES = {'failure', 'expired', 'reversed', 'cancelled', 'canceled', 'declined'}
 ADMIN_NOTES_STATUS_QUEUED = 'На черзі'
 ADMIN_NOTES_STATUS_DONE = 'Відбулася'
 DEFAULT_ADMIN_NOTES_TIMEZONE = 'Europe/Kyiv'
@@ -9249,15 +9251,18 @@ def get_warehouses():
     if not city_ref:
         return jsonify({'success': False, 'data': [], 'errors': ['Missing cityRef parameter']}), 400
 
+    method_props = {
+        "SettlementRef": city_ref,
+        "Limit": 5
+    }
+    if q:
+        method_props["FindByString"] = q
+
     payload = {
         "apiKey": NP_API_KEY,
         "modelName": "Address",
         "calledMethod": "getWarehouses",
-        "methodProperties": {
-            "SettlementRef": city_ref,
-            "FindByString": q,
-            "Limit": 5
-        }
+        "methodProperties": method_props
     }
     resp = requests.post(NP_BASE_URL, json=payload)
     return jsonify(resp.json())
@@ -12510,15 +12515,19 @@ def monopay_webhook():
         }
     )
 
-    liturgies_collection.update_one(
-        {'invoiceId': invoice_id},
-        {
-            '$set': {
-                'paymentStatus': status,
-                'webhookData': data
+    normalized_status = _clean_str(status).lower()
+    if normalized_status in LITURGY_FAILURE_PAYMENT_STATUSES:
+        liturgies_collection.delete_many({'invoiceId': invoice_id})
+    else:
+        liturgies_collection.update_one(
+            {'invoiceId': invoice_id},
+            {
+                '$set': {
+                    'paymentStatus': status,
+                    'webhookData': data
+                }
             }
-        }
-    )
+        )
 
     # Monopay очікує 200 OK
     return jsonify({'result': 'ok'}), 200
@@ -13296,16 +13305,23 @@ def create_liturgy():
 
 @application.route("/api/people/<person_id>/liturgies", methods=["GET"])
 def list_liturgies(person_id):
-    """Return all liturgies for a given person, sorted by serviceDate ascending."""
+    """Return successful liturgies for a given person, sorted by serviceDate ascending."""
     try:
         person_oid = ObjectId(person_id)
     except Exception:
         abort(400, "Invalid personId")
 
-    cursor = liturgies_collection.find({"person": person_oid}).sort("serviceDate", ASCENDING)
+    cursor = liturgies_collection.find(
+        {
+            "person": person_oid,
+            "paymentStatus": {"$in": ADMIN_NOTES_SUCCESS_QUERY_VALUES},
+        }
+    ).sort("serviceDate", ASCENDING)
 
     results = []
     for doc in cursor:
+        if not _admin_notes_is_success_payment(doc.get("paymentStatus")):
+            continue
         results.append({
             "_id": str(doc["_id"]),
             "person": str(doc["person"]),

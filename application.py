@@ -2549,11 +2549,27 @@ def mask_phone(phone: str) -> str:
     return masked
 
 
-def sanitize_premium_payload(premium_doc):
+def _extract_premium_phone(person_doc=None, premium_doc=None):
+    premium = premium_doc if isinstance(premium_doc, dict) else {}
+    phone = premium.get('phone') or ''
+    if isinstance(phone, str):
+        phone = phone.strip()
+    else:
+        phone = ''
+    if phone:
+        return phone
+
+    person = person_doc if isinstance(person_doc, dict) else {}
+    admin_page = person.get('adminPage') if isinstance(person.get('adminPage'), dict) else {}
+    fallback_phone = admin_page.get('phone') or ''
+    return fallback_phone.strip() if isinstance(fallback_phone, str) else ''
+
+
+def sanitize_premium_payload(premium_doc, person_doc=None):
     if not isinstance(premium_doc, dict):
         return None
 
-    phone = (premium_doc.get('phone') or '').strip()
+    phone = _extract_premium_phone(person_doc=person_doc, premium_doc=premium_doc)
     payload = {'locked': True, 'hasPhone': bool(phone)}
     masked = mask_phone(phone)
     if masked:
@@ -2633,7 +2649,7 @@ def _attach_premium_partner_to_response(response, person_doc):
     if 'premium' not in person_doc:
         return
 
-    premium_payload = sanitize_premium_payload(person_doc.get('premium'))
+    premium_payload = sanitize_premium_payload(person_doc.get('premium'), person_doc=person_doc)
     if not premium_payload:
         return
 
@@ -8791,11 +8807,11 @@ def send_code():
             oid = ObjectId(person_id)
         except Exception:
             return jsonify({'error': 'invalid_person_id'}), 400
-        person = people_collection.find_one({'_id': oid}, {'premium': 1})
+        person = people_collection.find_one({'_id': oid}, {'premium': 1, 'adminPage.phone': 1})
         if not person:
             return jsonify({'error': 'person_not_found'}), 404
         premium = person.get('premium') or {}
-        phone = (premium.get('phone') or '').strip()
+        phone = _extract_premium_phone(person_doc=person, premium_doc=premium)
         if not phone:
             return jsonify({'error': 'phone_not_set'}), 400
     elif not phone:
@@ -8860,11 +8876,11 @@ def verify_code():
             oid = ObjectId(person_id)
         except Exception:
             return jsonify({'error': 'invalid_person_id'}), 400
-        person = people_collection.find_one({'_id': oid}, {'premium': 1})
+        person = people_collection.find_one({'_id': oid}, {'premium': 1, 'adminPage.phone': 1})
         if not person:
             return jsonify({'error': 'person_not_found'}), 404
         premium = person.get('premium') or {}
-        phone = (premium.get('phone') or '').strip()
+        phone = _extract_premium_phone(person_doc=person, premium_doc=premium)
         if not phone:
             return jsonify({'error': 'phone_not_set'}), 400
     elif not phone:
@@ -14044,7 +14060,7 @@ def premium_reset():
             abort(404, description="Person not found")
 
         premium = person.get('premium') or {}
-        phone = (premium.get('phone') or '').strip()
+        phone = _extract_premium_phone(person_doc=person, premium_doc=premium)
         if not phone:
             abort(400, description="Для цієї особи не вказано номер телефону")
 

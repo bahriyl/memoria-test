@@ -9,6 +9,13 @@ from location_mapper import normalize_cemetery_location
 from location_schema import clean_str, normalize_area_ref, normalize_location_core, parse_float, parse_geo_point
 
 _SETTLEMENT_TYPES = {"city", "town", "village", "hamlet", "municipality"}
+_SETTLEMENT_TYPE_ORDER = {
+    "city": 0,
+    "town": 1,
+    "village": 2,
+    "hamlet": 3,
+    "municipality": 4,
+}
 _DEFAULT_GEOCODING_USER_AGENT = "memoria-geocoder/1.0 (+https://memoria.com.ua)"
 
 _QUERY_CACHE = {}
@@ -448,6 +455,12 @@ def _is_settlement_feature(feature):
     return osm_value in _SETTLEMENT_TYPES
 
 
+def _settlement_type_from_feature(feature):
+    props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+    osm_value = clean_str(props.get("osm_value")).lower()
+    return osm_value if osm_value in _SETTLEMENT_TYPES else ""
+
+
 def _photon_area_suggestion_from_feature(feature, country_codes):
     if not isinstance(feature, dict):
         return None
@@ -477,6 +490,7 @@ def _photon_area_suggestion_from_feature(feature, country_codes):
         "lat": geo.get("coordinates", [None, None])[1],
         "lng": geo.get("coordinates", [None, None])[0],
         "area": area,
+        "_settlementType": _settlement_type_from_feature(feature),
         "source": "photon",
     }
 
@@ -514,14 +528,43 @@ def _nominatim_area_suggestion_from_item(item, country_codes):
         return None
 
     display = clean_str(area.get("display") or _build_display(city, region, _display_country_name(country_code)))
+    item_type = clean_str(item.get("type")).lower()
     return {
         "id": clean_str(area.get("id")),
         "display": display,
         "lat": geo.get("coordinates", [None, None])[1],
         "lng": geo.get("coordinates", [None, None])[0],
         "area": area,
+        "_settlementType": item_type if item_type in _SETTLEMENT_TYPES else "",
         "source": "nominatim",
     }
+
+
+def _area_name_for_match(item):
+    if not isinstance(item, dict):
+        return ""
+    area = item.get("area") if isinstance(item.get("area"), dict) else {}
+    return clean_str(area.get("city") or item.get("display"))
+
+
+def _prefix_matches_area(item, query):
+    query_norm = _normalize_text_for_match(query)
+    if not query_norm:
+        return False
+    area_name = _area_name_for_match(item)
+    area_norm = _normalize_text_for_match(area_name)
+    return bool(area_norm and area_norm.startswith(query_norm))
+
+
+def _area_sort_key(item):
+    if not isinstance(item, dict):
+        return (999, "", "")
+    settlement_type = clean_str(item.get("_settlementType")).lower()
+    type_rank = _SETTLEMENT_TYPE_ORDER.get(settlement_type, 999)
+    area = item.get("area") if isinstance(item.get("area"), dict) else {}
+    city_norm = _normalize_text_for_match(area.get("city") or item.get("display"))
+    region_norm = _normalize_text_for_match(area.get("region") or "")
+    return (type_rank, city_norm, region_norm)
 
 
 def _dedupe_by_key(items, key_fn):
@@ -600,7 +643,8 @@ def _nominatim_search(query, nominatim_base_url, user_agent, language, country_c
     if not query_clean:
         return []
 
-    cache_key = f"nominatim:search:{query_clean.lower()}:{clean_str(language).lower()}:{','.join(_to_country_codes(country_codes))}"
+    request_limit = max(int(limit), 1)
+    cache_key = f"nominatim:search:{query_clean.lower()}:{clean_str(language).lower()}:{','.join(_to_country_codes(country_codes))}:{request_limit}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
@@ -611,7 +655,7 @@ def _nominatim_search(query, nominatim_base_url, user_agent, language, country_c
         {
             "q": query_clean,
             "addressdetails": 1,
-            "limit": max(int(limit), 1),
+            "limit": request_limit,
             "countrycodes": ",".join(code.lower() for code in _to_country_codes(country_codes)),
         },
         user_agent=user_agent,
@@ -827,9 +871,9 @@ def search_area_suggestions(
             continue
         out.append(item)
 
-    # Some providers return no settlement-level city suggestions for very short queries.
-    # For 1-2 chars only, fallback to Nominatim settlement search to avoid empty responses.
-    if not out and len(search_clean) <= 2 and clean_str(nominatim_base_url):
+    # For very short queries, Photon may return too few UA settlement suggestions.
+    # Enrich with Nominatim until request limit is reached.
+    if len(search_clean) <= 2 and clean_str(nominatim_base_url) and len(out) < request_limit:
         nominatim_items = _nominatim_search(
             search_clean,
             nominatim_base_url=nominatim_base_url,
@@ -845,9 +889,15 @@ def search_area_suggestions(
             if not suggestion:
                 continue
             out.append(suggestion)
+            if len(out) >= request_limit:
+                break
 
+    out = [item for item in out if _prefix_matches_area(item, search_clean)]
     out = _dedupe_by_key(out, lambda x: x.get("id") or x.get("display"))
+    out.sort(key=_area_sort_key)
     out = out[: request_limit]
+    for item in out:
+        item.pop("_settlementType", None)
     _cache_set(cache_key, out, ttl_seconds=300)
     return out
 

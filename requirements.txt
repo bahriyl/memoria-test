@@ -4,7 +4,7 @@ pymongo
 twilio
 dotenv
 requests
-gunicorn
+gunicorn<23
 flask-socketio
 eventlet
 PyJWT

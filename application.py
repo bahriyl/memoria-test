@@ -61,11 +61,8 @@ from location_schema import (
 from location_service import (
     cemetery_option_from_doc,
     filter_docs_by_radius,
-    normalize_location_input,
-    reverse_geocode_location,
-    search_location_addresses,
-    search_location_areas,
 )
+from katottg_settlements import search_settlements as search_katottg_settlements
 
 load_dotenv()
 
@@ -280,18 +277,6 @@ ALLOWED_UPDATE_FIELDS = {
     "burial",
 }
 
-PHOTON_BASE_URL = os.environ.get("PHOTON_BASE_URL", "https://photon.komoot.io").strip()
-NOMINATIM_BASE_URL = os.environ.get("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org").strip()
-GEOCODING_USER_AGENT = os.environ.get(
-    "GEOCODING_USER_AGENT",
-    "memoria-geocoder/1.0 (+https://memoria.com.ua)",
-).strip()
-try:
-    GEOCODING_TIMEOUT_MS = max(int(os.environ.get("GEOCODING_TIMEOUT_MS", "5000").strip() or "5000"), 1000)
-except Exception:
-    GEOCODING_TIMEOUT_MS = 5000
-LOCATION_COUNTRY_CODES = os.environ.get("LOCATION_COUNTRY_CODES", "UA").strip() or "UA"
-LOCATION_ACCEPT_LANGUAGE = os.environ.get("LOCATION_ACCEPT_LANGUAGE", "uk").strip() or "uk"
 LOCATION_READ_MODE = os.environ.get("LOCATION_READ_MODE", "hybrid").strip().lower() or "hybrid"
 LOCATION_WRITE_MODE = os.environ.get("LOCATION_WRITE_MODE", "dual").strip().lower() or "dual"
 LOCATION_ADMIN_STRICT_LOCATION = os.environ.get("LOCATION_ADMIN_STRICT_LOCATION", "").strip().lower()
@@ -334,10 +319,9 @@ def _location_admin_strict_geonames_enabled():
 def _location_has_provider_area_and_geo(location):
     normalized = normalize_location_core(location if isinstance(location, dict) else {})
     area = normalized.get("area") if isinstance(normalized.get("area"), dict) else {}
-    geo = loc_parse_geo_point(normalized.get("geo"))
     area_id = loc_clean_str(area.get("id"))
     area_source = loc_clean_str(area.get("source")).lower()
-    return bool(area_id and area_source in {"photon", "nominatim"} and geo)
+    return bool(area_id and area_source in {"katottg", "manual"})
 
 
 def _location_has_manual_address_text(location):
@@ -8269,18 +8253,8 @@ def locations():
     search = request.args.get('search', '').strip()
     if not search:
         return jsonify([])
-    return jsonify(
-        search_location_areas(
-            search,
-            photon_base_url=PHOTON_BASE_URL,
-            nominatim_base_url=NOMINATIM_BASE_URL,
-            user_agent=GEOCODING_USER_AGENT,
-            language=LOCATION_ACCEPT_LANGUAGE,
-            country_codes=LOCATION_COUNTRY_CODES,
-            timeout_ms=GEOCODING_TIMEOUT_MS,
-            max_rows=10,
-        )
-    )
+    rows = search_katottg_settlements(search, limit=10, min_query_len=1)
+    return jsonify([_katottg_item_to_location_suggestion(item) for item in rows])
 
 
 def _query_cemetery_options(area_id='', area='', search='', limit=10):
@@ -8293,6 +8267,8 @@ def _query_cemetery_options(area_id='', area='', search='', limit=10):
 
     docs = list(cemeteries_collection.find(query_filter).limit(max(int(limit), 1)))
     options = []
+    strict_area_id_used = bool(area_id)
+    fallback_city_match_used = False
     for doc in docs:
         item = cemetery_option_from_doc(doc)
         if not item.get("name"):
@@ -8308,6 +8284,21 @@ def _query_cemetery_options(area_id='', area='', search='', limit=10):
                 if not pattern.search(area_text):
                     continue
         options.append(item)
+
+    # Temporary compatibility fallback during KATOTTG area-id migration:
+    # if strict areaId has no results and area label is present, fall back to city text matching.
+    if strict_area_id_used and not options and area:
+        city_part = area.split(',')[0].strip()
+        if city_part:
+            pattern = re.compile(r'\b' + re.escape(city_part) + r'\b', re.IGNORECASE)
+            for doc in docs:
+                item = cemetery_option_from_doc(doc)
+                area_text = item.get("area") or ""
+                if not pattern.search(area_text):
+                    continue
+                options.append(item)
+            if options:
+                fallback_city_match_used = True
 
     # Fallback for legacy docs without normalized location.
     if not options and (area_id or area):
@@ -8334,7 +8325,10 @@ def _query_cemetery_options(area_id='', area='', search='', limit=10):
         seen.add(key)
         uniq.append(item)
     uniq.sort(key=lambda x: (loc_clean_str(x.get("name")).lower(), loc_clean_str(x.get("area")).lower()))
-    return uniq[: max(int(limit), 1)]
+    return uniq[: max(int(limit), 1)], {
+        "strictAreaIdUsed": strict_area_id_used,
+        "fallbackCityMatchUsed": fallback_city_match_used,
+    }
 
 
 @application.route('/api/cemeteries', methods=['GET'])
@@ -8342,51 +8336,82 @@ def cemeteries():
     area_id = request.args.get('areaId', '').strip()
     area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
-    items = _query_cemetery_options(area_id=area_id, area=area, search=search, limit=10)
+    items, _ = _query_cemetery_options(area_id=area_id, area=area, search=search, limit=10)
     return jsonify(items)
+
+
+def _katottg_item_to_location_suggestion(item):
+    area_display = loc_clean_str(item.get("label"))
+    city = loc_clean_str(item.get("name"))
+    region = loc_clean_str(item.get("region"))
+    district = loc_clean_str(item.get("district"))
+    community = loc_clean_str(item.get("community"))
+    settlement_type = loc_clean_str(item.get("type"))
+    katottg = loc_clean_str(item.get("katottg"))
+
+    return {
+        "id": katottg,
+        "display": area_display,
+        "name": city,
+        "label": area_display,
+        "lat": None,
+        "lng": None,
+        "source": "katottg",
+        "provider": "katottg",
+        "settlement": {
+            "cityName": city,
+            "settlementType": settlement_type,
+            "katottg": katottg,
+            "region": region,
+            "district": district,
+            "community": community,
+            "label": area_display,
+        },
+        "area": {
+            "id": katottg,
+            "source": "katottg",
+            "city": city,
+            "region": region,
+            "countryCode": "UA",
+            "display": area_display,
+        },
+        "address": {
+            "raw": area_display,
+            "display": area_display,
+            "provider": "katottg",
+            "city": city,
+            "region": region,
+        },
+    }
 
 
 @application.route('/api/location/areas', methods=['GET'])
 def location_areas():
     search = request.args.get('search', '').strip()
+    limit_raw = request.args.get('limit', '').strip()
+    try:
+        limit = max(int(limit_raw or "10"), 1)
+    except Exception:
+        limit = 10
     if not search:
         return jsonify({"total": 0, "items": []})
-    items = search_location_areas(
-        search,
-        photon_base_url=PHOTON_BASE_URL,
-        nominatim_base_url=NOMINATIM_BASE_URL,
-        user_agent=GEOCODING_USER_AGENT,
-        language=LOCATION_ACCEPT_LANGUAGE,
-        country_codes=LOCATION_COUNTRY_CODES,
-        timeout_ms=GEOCODING_TIMEOUT_MS,
-        max_rows=10,
-    )
+    rows = search_katottg_settlements(search, limit=limit, min_query_len=1)
+    items = [_katottg_item_to_location_suggestion(item) for item in rows]
     return jsonify({"total": len(items), "items": items})
 
 
 @application.route('/api/location/addresses', methods=['GET'])
 def location_addresses():
     search = request.args.get('search', '').strip()
-    area_id = request.args.get('areaId', '').strip()
-    city = request.args.get('city', '').strip()
-    lat = request.args.get('lat')
-    lng = request.args.get('lng')
+    limit_raw = request.args.get('limit', '').strip()
+    try:
+        limit = max(int(limit_raw or "10"), 1)
+    except Exception:
+        limit = 10
     if not search:
         return jsonify({"total": 0, "items": []})
-    items = search_location_addresses(
-        search,
-        photon_base_url=PHOTON_BASE_URL,
-        nominatim_base_url=NOMINATIM_BASE_URL,
-        user_agent=GEOCODING_USER_AGENT,
-        language=LOCATION_ACCEPT_LANGUAGE,
-        country_codes=LOCATION_COUNTRY_CODES,
-        timeout_ms=GEOCODING_TIMEOUT_MS,
-        max_rows=20,
-        area_id=area_id,
-        city=city,
-        bias_lat=lat,
-        bias_lng=lng,
-    )
+    rows = search_katottg_settlements(search, limit=limit, min_query_len=1)
+    items = [_katottg_item_to_location_suggestion(item) for item in rows]
     return jsonify({"total": len(items), "items": items})
 
 
@@ -8395,42 +8420,20 @@ def location_cemeteries():
     area_id = request.args.get('areaId', '').strip()
     area = request.args.get('area', '').strip()
     search = request.args.get('search', '').strip()
-    items = _query_cemetery_options(area_id=area_id, area=area, search=search, limit=20)
-    return jsonify({"total": len(items), "items": items})
+    items, meta = _query_cemetery_options(area_id=area_id, area=area, search=search, limit=20)
+    return jsonify({"total": len(items), "items": items, "meta": meta})
 
 
 @application.route('/api/location/normalize', methods=['POST'])
 def location_normalize():
     payload = request.get_json(silent=True) or {}
-    location = normalize_location_input(
-        payload,
-        photon_base_url=PHOTON_BASE_URL,
-        nominatim_base_url=NOMINATIM_BASE_URL,
-        user_agent=GEOCODING_USER_AGENT,
-        language=LOCATION_ACCEPT_LANGUAGE,
-        country_codes=LOCATION_COUNTRY_CODES,
-        timeout_ms=GEOCODING_TIMEOUT_MS,
-    )
+    location = normalize_location_core(payload if isinstance(payload, dict) else {})
     return jsonify({"location": location})
 
 
 @application.route('/api/location/reverse', methods=['GET'])
 def location_reverse():
-    lat = request.args.get('lat')
-    lng = request.args.get('lng')
-    location = reverse_geocode_location(
-        lat=lat,
-        lng=lng,
-        photon_base_url=PHOTON_BASE_URL,
-        nominatim_base_url=NOMINATIM_BASE_URL,
-        user_agent=GEOCODING_USER_AGENT,
-        language=LOCATION_ACCEPT_LANGUAGE,
-        country_codes=LOCATION_COUNTRY_CODES,
-        timeout_ms=GEOCODING_TIMEOUT_MS,
-    )
-    if not location:
-        return jsonify({"location": normalize_location_core({})})
-    return jsonify({"location": location})
+    return jsonify({"location": normalize_location_core({})})
 
 
 @application.route('/api/ritual_services', methods=['GET'])

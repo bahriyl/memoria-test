@@ -743,24 +743,81 @@ def people():
     if death_year and death_year.isdigit():
         conditions.append({'deathYear': int(death_year)})
 
-    area_or_conditions = []
-    if area_id:
-        area_or_conditions.extend([
-            {'areaId': area_id},
-            {'burial.location.area.id': area_id},
-        ])
-
     city_part = area.split(',')[0].strip() if area else ''
-    if city_part:
-        pattern = re.escape(city_part)
-        area_or_conditions.extend([
-            {'area': {'$regex': pattern, '$options': 'i'}},
-            {'burial.location.area.display': {'$regex': pattern, '$options': 'i'}},
-            {'burial.location.area.city': {'$regex': pattern, '$options': 'i'}},
-        ])
+    region_part = ''
+    if area:
+        area_parts = [part.strip() for part in area.split(',') if part.strip()]
+        if len(area_parts) >= 2:
+            region_part = area_parts[-1]
 
-    if area_or_conditions:
-        conditions.append({'$or': area_or_conditions})
+    if area_id:
+        strict_area_match = {
+            '$or': [
+                {'areaId': area_id},
+                {'burial.location.area.id': area_id},
+            ]
+        }
+
+        # Legacy fallback for records without canonical area ids.
+        fallback_and_conditions = [
+            {
+                '$and': [
+                    {'$or': [{'areaId': {'$exists': False}}, {'areaId': ''}, {'areaId': None}]},
+                    {'$or': [{'burial.location.area.id': {'$exists': False}}, {'burial.location.area.id': ''}, {'burial.location.area.id': None}]},
+                ]
+            }
+        ]
+
+        if city_part:
+            city_pattern = re.escape(city_part)
+            fallback_and_conditions.append({
+                '$or': [
+                    {'area': {'$regex': city_pattern, '$options': 'i'}},
+                    {'burial.location.area.display': {'$regex': city_pattern, '$options': 'i'}},
+                    {'burial.location.area.city': {'$regex': city_pattern, '$options': 'i'}},
+                ]
+            })
+
+        # If selected area includes region, enforce region match in fallback branch.
+        if region_part:
+            region_pattern = re.escape(region_part)
+            fallback_and_conditions.append({
+                '$or': [
+                    {'area': {'$regex': region_pattern, '$options': 'i'}},
+                    {'burial.location.area.display': {'$regex': region_pattern, '$options': 'i'}},
+                    {'burial.location.area.region': {'$regex': region_pattern, '$options': 'i'}},
+                ]
+            })
+
+        conditions.append({
+            '$or': [
+                strict_area_match,
+                {'$and': fallback_and_conditions},
+            ]
+        })
+    elif city_part:
+        city_pattern = re.escape(city_part)
+        area_or_conditions = [
+            {'area': {'$regex': city_pattern, '$options': 'i'}},
+            {'burial.location.area.display': {'$regex': city_pattern, '$options': 'i'}},
+            {'burial.location.area.city': {'$regex': city_pattern, '$options': 'i'}},
+        ]
+        if region_part:
+            region_pattern = re.escape(region_part)
+            conditions.append({
+                '$and': [
+                    {'$or': area_or_conditions},
+                    {
+                        '$or': [
+                            {'area': {'$regex': region_pattern, '$options': 'i'}},
+                            {'burial.location.area.display': {'$regex': region_pattern, '$options': 'i'}},
+                            {'burial.location.area.region': {'$regex': region_pattern, '$options': 'i'}},
+                        ]
+                    },
+                ]
+            })
+        else:
+            conditions.append({'$or': area_or_conditions})
 
     cemetery_or_conditions = []
     if cemetery_id:
@@ -8286,15 +8343,23 @@ def _query_cemetery_options(area_id='', area='', search='', limit=10):
         options.append(item)
 
     # Temporary compatibility fallback during KATOTTG area-id migration:
-    # if strict areaId has no results and area label is present, fall back to city text matching.
+    # if strict areaId has no results and area label is present, fall back to
+    # city/region text matching for legacy records without area ids only.
     if strict_area_id_used and not options and area:
-        city_part = area.split(',')[0].strip()
+        area_parts = [part.strip() for part in area.split(',') if part.strip()]
+        city_part = area_parts[0] if area_parts else ''
+        region_part = area_parts[-1] if len(area_parts) >= 2 else ''
         if city_part:
-            pattern = re.compile(r'\b' + re.escape(city_part) + r'\b', re.IGNORECASE)
+            city_pattern = re.compile(r'\b' + re.escape(city_part) + r'\b', re.IGNORECASE)
+            region_pattern = re.compile(r'\b' + re.escape(region_part) + r'\b', re.IGNORECASE) if region_part else None
             for doc in docs:
                 item = cemetery_option_from_doc(doc)
+                if item.get("areaId"):
+                    continue
                 area_text = item.get("area") or ""
-                if not pattern.search(area_text):
+                if not city_pattern.search(area_text):
+                    continue
+                if region_pattern and not region_pattern.search(area_text):
                     continue
                 options.append(item)
             if options:
@@ -8390,7 +8455,7 @@ def location_areas():
     search = request.args.get('search', '').strip()
     limit_raw = request.args.get('limit', '').strip()
     try:
-        limit = max(int(limit_raw or "10"), 1)
+        limit = min(max(int(limit_raw or "10"), 1), 10)
     except Exception:
         limit = 10
     if not search:
@@ -8405,7 +8470,7 @@ def location_addresses():
     search = request.args.get('search', '').strip()
     limit_raw = request.args.get('limit', '').strip()
     try:
-        limit = max(int(limit_raw or "10"), 1)
+        limit = min(max(int(limit_raw or "10"), 1), 10)
     except Exception:
         limit = 10
     if not search:

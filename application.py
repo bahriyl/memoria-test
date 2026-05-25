@@ -4082,6 +4082,8 @@ def _ads_build_qr_image_url(scan_url):
     if not cleaned or segno is None:
         return ''
     out = io.BytesIO()
+    # NOTE: Ads QRs are a separate visual flow; keep legacy density intentionally.
+    # NOTE: Ads QRs are a separate visual flow; keep legacy density intentionally.
     qr = segno.make(cleaned, error='m')
     qr.save(out, kind='svg', scale=6, border=2, dark='#111111', light='#ffffff')
     encoded = base64.b64encode(out.getvalue()).decode('ascii')
@@ -9478,6 +9480,13 @@ QR_PATH_LABELS = {
     'plaques': 'Таблички',
 }
 QR_ALLOWED_PATH_KEYS = set(QR_PATH_LABELS.keys())
+QR_STYLE_VERSION = 41
+QR_SVG_CANVAS_SIZE = 332
+QR_BG_OUTER_COLOR = '#D9D9D9'
+QR_BG_INNER_COLOR = '#D9D9D9'
+QR_BG_INNER_INSET = 13
+QR_BG_INNER_RADIUS = 21
+QR_MATRIX_FILL_INSET = 20
 QR_EXPORT_TOKEN_TTL_SECONDS = 15 * 60
 _qr_export_files = {}
 _qr_export_files_lock = threading.Lock()
@@ -9558,29 +9567,131 @@ def _qr_build_scan_url(token):
     return f'{base}{path}' if base else path
 
 
-def _qr_build_image_url(scan_url):
+def _qr_build_matrix_png_bytes(scan_url):
     cleaned = _qr_str(scan_url)
     if not cleaned:
-        return ''
+        return b''
     if segno is None:
-        return ''
+        return b''
 
     out = io.BytesIO()
-    qr = segno.make(cleaned, error='m')
-    qr.save(out, kind='svg', scale=6, border=2, dark='#111111', light='#ffffff')
-    svg_bytes = out.getvalue()
+    qr = segno.make(cleaned, error='h', version=12, micro=False)
+    qr.save(out, kind='png', scale=10, border=2, dark='#000000', light='#D9D9D9')
+    png_bytes = out.getvalue()
+    if not png_bytes:
+        return b''
+
+    if Image is not None:
+        try:
+            image = Image.open(io.BytesIO(png_bytes))
+            image = image.convert('RGB')
+            image = image.resize((1024, 1024), Image.NEAREST)
+            resized = io.BytesIO()
+            image.save(resized, format='PNG', optimize=True)
+            png_bytes = resized.getvalue()
+        except Exception:
+            pass
+    return png_bytes
+
+
+def _qr_png_dimensions(png_bytes):
+    if not isinstance(png_bytes, (bytes, bytearray)) or len(png_bytes) < 24:
+        return 0, 0
+    signature = b'\x89PNG\r\n\x1a\n'
+    if bytes(png_bytes[:8]) != signature:
+        return 0, 0
+    width = int.from_bytes(png_bytes[16:20], 'big')
+    height = int.from_bytes(png_bytes[20:24], 'big')
+    return width, height
+
+
+def _qr_style_for_path(path_key):
+    cleaned = _qr_str(path_key).lower()
+    if cleaned == 'plaques':
+        return 'plaques_m_badge'
+    if cleaned in {'premium_qr', 'premium_qr_firma'}:
+        return 'premium_wordmark'
+    return 'premium_wordmark'
+
+
+def _qr_center_logo_markup(style_key):
+    if style_key == 'plaques_m_badge':
+        return (
+            '<rect x="130" y="129" width="73" height="73" rx="8" fill="#D9D9D9"/>'
+            '<path d="M145.836 186V145.77H153.396L168.462 165.966H164.898L179.586 145.77H187.146V186H179.262V154.572L182.394 155.328L166.95 175.47H165.978L151.074 155.328L153.666 154.572V186H145.836Z" fill="black"/>'
+        )
+    return (
+        '<rect x="97" y="147" width="138" height="37" rx="8" fill="#D9D9D9"/>'
+        '<path d="M111.166 173V158.83H114.598V162.184L114.208 161.638C114.434 160.581 114.945 159.801 115.742 159.298C116.54 158.778 117.476 158.518 118.55 158.518C119.712 158.518 120.734 158.821 121.618 159.428C122.52 160.017 123.092 160.815 123.334 161.82L122.294 161.924C122.745 160.763 123.404 159.905 124.27 159.35C125.137 158.795 126.142 158.518 127.286 158.518C128.292 158.518 129.184 158.743 129.964 159.194C130.762 159.645 131.386 160.277 131.836 161.092C132.304 161.889 132.538 162.817 132.538 163.874V173H128.872V164.706C128.872 164.117 128.768 163.614 128.56 163.198C128.352 162.765 128.049 162.435 127.65 162.21C127.269 161.967 126.81 161.846 126.272 161.846C125.752 161.846 125.293 161.967 124.894 162.21C124.513 162.435 124.21 162.765 123.984 163.198C123.776 163.614 123.672 164.117 123.672 164.706V173H120.006V164.706C120.006 164.117 119.902 163.614 119.694 163.198C119.486 162.765 119.192 162.435 118.81 162.21C118.429 161.967 117.97 161.846 117.432 161.846C116.895 161.846 116.427 161.967 116.028 162.21C115.647 162.435 115.344 162.765 115.118 163.198C114.91 163.614 114.806 164.117 114.806 164.706V173H111.166ZM141.997 173.312C140.523 173.312 139.232 172.983 138.123 172.324C137.031 171.648 136.181 170.755 135.575 169.646C134.968 168.519 134.665 167.263 134.665 165.876C134.665 164.472 134.977 163.215 135.601 162.106C136.225 160.997 137.065 160.121 138.123 159.48C139.197 158.839 140.411 158.518 141.763 158.518C142.872 158.518 143.851 158.7 144.701 159.064C145.567 159.411 146.295 159.905 146.885 160.546C147.474 161.187 147.925 161.933 148.237 162.782C148.549 163.614 148.705 164.507 148.705 165.46C148.705 165.737 148.687 166.006 148.653 166.266C148.635 166.526 148.592 166.751 148.523 166.942H137.759V164.212H146.443L144.727 165.486C144.9 164.723 144.874 164.039 144.649 163.432C144.441 162.825 144.085 162.349 143.583 162.002C143.08 161.655 142.473 161.482 141.763 161.482C141.052 161.482 140.437 161.655 139.917 162.002C139.414 162.349 139.024 162.851 138.747 163.51C138.487 164.169 138.383 164.966 138.435 165.902C138.365 166.751 138.469 167.497 138.747 168.138C139.041 168.762 139.466 169.247 140.021 169.594C140.593 169.941 141.269 170.114 142.049 170.114C142.794 170.114 143.418 169.967 143.921 169.672C144.441 169.36 144.857 168.953 145.169 168.45L148.107 169.854C147.829 170.53 147.387 171.128 146.781 171.648C146.191 172.168 145.489 172.575 144.675 172.87C143.86 173.165 142.967 173.312 141.997 173.312ZM151.156 173V158.83H154.588V162.184L154.198 161.638C154.424 160.581 154.935 159.801 155.732 159.298C156.53 158.778 157.466 158.518 158.54 158.518C159.702 158.518 160.724 158.821 161.608 159.428C162.51 160.017 163.082 160.815 163.324 161.82L162.284 161.924C162.735 160.763 163.394 159.905 164.26 159.35C165.127 158.795 166.132 158.518 167.276 158.518C168.282 158.518 169.174 158.743 169.954 159.194C170.752 159.645 171.376 160.277 171.826 161.092C172.294 161.889 172.528 162.817 172.528 163.874V173H168.862V164.706C168.862 164.117 168.758 163.614 168.55 163.198C168.342 162.765 168.039 162.435 167.64 162.21C167.259 161.967 166.8 161.846 166.262 161.846C165.742 161.846 165.283 161.967 164.884 162.21C164.503 162.435 164.2 162.765 163.974 163.198C163.766 163.614 163.662 164.117 163.662 164.706V173H159.996V164.706C159.996 164.117 159.892 163.614 159.684 163.198C159.476 162.765 159.182 162.435 158.8 162.21C158.419 161.967 157.96 161.846 157.422 161.846C156.885 161.846 156.417 161.967 156.018 162.21C155.637 162.435 155.334 162.765 155.108 163.198C154.9 163.614 154.796 164.117 154.796 164.706V173H151.156ZM182.195 173.312C180.808 173.312 179.543 172.991 178.399 172.35C177.255 171.709 176.345 170.833 175.669 169.724C174.993 168.597 174.655 167.323 174.655 165.902C174.655 164.481 174.993 163.215 175.669 162.106C176.345 160.997 177.255 160.121 178.399 159.48C179.543 158.839 180.808 158.518 182.195 158.518C183.599 158.518 184.864 158.839 185.991 159.48C187.135 160.121 188.045 160.997 188.721 162.106C189.397 163.215 189.735 164.481 189.735 165.902C189.735 167.323 189.388 168.597 188.695 169.724C188.019 170.833 187.117 171.709 185.991 172.35C184.864 172.991 183.599 173.312 182.195 173.312ZM182.195 169.984C182.94 169.984 183.59 169.811 184.145 169.464C184.699 169.117 185.133 168.641 185.445 168.034C185.774 167.41 185.939 166.699 185.939 165.902C185.939 165.122 185.774 164.429 185.445 163.822C185.133 163.215 184.699 162.739 184.145 162.392C183.59 162.028 182.94 161.846 182.195 161.846C181.467 161.846 180.817 162.028 180.245 162.392C179.69 162.739 179.248 163.215 178.919 163.822C178.589 164.429 178.425 165.122 178.425 165.902C178.425 166.699 178.589 167.41 178.919 168.034C179.248 168.641 179.69 169.117 180.245 169.464C180.817 169.811 181.467 169.984 182.195 169.984ZM192.188 173V158.83H195.62V162.106L195.36 161.638C195.672 160.494 196.183 159.714 196.894 159.298C197.604 158.882 198.454 158.674 199.442 158.674H200.274V161.872H199.052C198.098 161.872 197.318 162.167 196.712 162.756C196.122 163.345 195.828 164.169 195.828 165.226V173H192.188ZM202.065 173V158.83H205.705V173H202.065ZM202.065 157.4V153.63H205.705V157.4H202.065ZM213.059 173.312C212.054 173.312 211.178 173.147 210.433 172.818C209.705 172.489 209.142 172.021 208.743 171.414C208.344 170.79 208.145 170.062 208.145 169.23C208.145 168.433 208.318 167.731 208.665 167.124C209.029 166.517 209.584 166.006 210.329 165.59C211.074 165.174 212.002 164.879 213.111 164.706L217.583 163.978V166.682L213.787 167.358C213.18 167.479 212.712 167.679 212.383 167.956C212.071 168.233 211.915 168.615 211.915 169.1C211.915 169.551 212.088 169.915 212.435 170.192C212.799 170.452 213.241 170.582 213.761 170.582C214.437 170.582 215.026 170.435 215.529 170.14C216.049 169.845 216.448 169.447 216.725 168.944C217.02 168.441 217.167 167.887 217.167 167.28V163.614C217.167 163.042 216.942 162.565 216.491 162.184C216.058 161.803 215.46 161.612 214.697 161.612C213.986 161.612 213.354 161.803 212.799 162.184C212.262 162.565 211.872 163.077 211.629 163.718L208.665 162.288C208.942 161.525 209.376 160.867 209.965 160.312C210.572 159.74 211.291 159.298 212.123 158.986C212.972 158.674 213.882 158.518 214.853 158.518C216.032 158.518 217.072 158.735 217.973 159.168C218.874 159.601 219.576 160.199 220.079 160.962C220.582 161.725 220.833 162.609 220.833 163.614V173H217.401V170.66L218.207 170.556C217.808 171.163 217.358 171.674 216.855 172.09C216.352 172.489 215.78 172.792 215.139 173C214.515 173.208 213.822 173.312 213.059 173.312Z" fill="black"/>'
+    )
+
+
+def _qr_build_styled_svg_bytes(scan_url, path_key):
+    cleaned = _qr_str(scan_url)
+    if not cleaned:
+        return b''
+
+    qr_png = _qr_build_matrix_png_bytes(cleaned)
+    if not qr_png:
+        return b''
+
+    width, height = _qr_png_dimensions(qr_png)
+    if width <= 0 or height <= 0:
+        width = 1024
+        height = 1024
+
+    image_b64 = base64.b64encode(qr_png).decode('ascii')
+    scale = 1.0 / float(width)
+    style_key = _qr_style_for_path(path_key)
+    logo_markup = _qr_center_logo_markup(style_key)
+
+    canvas = int(QR_SVG_CANVAS_SIZE)
+    inner_x = int(QR_BG_INNER_INSET)
+    inner_y = int(QR_BG_INNER_INSET)
+    inner_w = canvas - (inner_x * 2)
+    inner_h = canvas - (inner_y * 2)
+    inner_rx = int(QR_BG_INNER_RADIUS)
+
+    matrix_inset = int(QR_MATRIX_FILL_INSET)
+    matrix_x = inner_x + matrix_inset
+    matrix_y = inner_y + matrix_inset
+    matrix_w = inner_w - (matrix_inset * 2)
+    matrix_h = inner_h - (matrix_inset * 2)
+    if matrix_w <= 0 or matrix_h <= 0:
+        matrix_x = inner_x
+        matrix_y = inner_y
+        matrix_w = inner_w
+        matrix_h = inner_h
+
+    svg = (
+        f'<svg width="{canvas}" height="{canvas}" viewBox="0 0 {canvas} {canvas}" fill="none" '
+        f'xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">'
+        f'<rect width="{canvas}" height="{canvas}" fill="{QR_BG_OUTER_COLOR}"/>'
+        f'<rect x="{inner_x}" y="{inner_y}" width="{inner_w}" height="{inner_h}" rx="{inner_rx}" fill="{QR_BG_INNER_COLOR}"/>'
+        f'<rect x="{matrix_x}" y="{matrix_y}" width="{matrix_w}" height="{matrix_h}" fill="url(#pattern0)"/>'
+        f'{logo_markup}'
+        f'<defs>'
+        f'<pattern id="pattern0" patternContentUnits="objectBoundingBox" width="1" height="1">'
+        f'<use xlink:href="#image0" transform="scale({scale:.9f})"/>'
+        f'</pattern>'
+        f'<image id="image0" width="{width}" height="{height}" preserveAspectRatio="none" '
+        f'xlink:href="data:image/png;base64,{image_b64}"/>'
+        f'</defs>'
+        f'</svg>'
+    )
+    return svg.encode('utf-8')
+
+
+def _qr_build_image_url(scan_url, path_key):
+    svg_bytes = _qr_build_styled_svg_bytes(scan_url, path_key)
+    if not svg_bytes:
+        return ''
     encoded = base64.b64encode(svg_bytes).decode('ascii')
     return f'data:image/svg+xml;base64,{encoded}'
 
 
-def _qr_build_svg_bytes(scan_url):
-    cleaned = _qr_str(scan_url)
-    if not cleaned or segno is None:
-        return b''
-    out = io.BytesIO()
-    qr = segno.make(cleaned, error='m')
-    qr.save(out, kind='svg', scale=6, border=2, dark='#111111', light='#ffffff')
-    return out.getvalue()
+def _qr_build_svg_bytes(scan_url, path_key):
+    return _qr_build_styled_svg_bytes(scan_url, path_key)
 
 
 def _qr_export_cleanup_expired_tokens(now_ts=None):
@@ -9629,16 +9740,25 @@ def _qr_ensure_doc_runtime_fields(doc, *, persist=False):
         scan_url = _qr_build_scan_url(token)
         update_fields['scanUrl'] = scan_url
 
+    path_key = _qr_str(doc.get('pathKey'))
+
     qr_image_url = _qr_str(doc.get('qrImageUrl'))
-    if not qr_image_url:
-        qr_image_url = _qr_build_image_url(scan_url)
+    try:
+        qr_style_version = int(doc.get('qrStyleVersion') or 0)
+    except Exception:
+        qr_style_version = 0
+    if not qr_image_url or qr_style_version < QR_STYLE_VERSION:
+        qr_image_url = _qr_build_image_url(scan_url, path_key)
         update_fields['qrImageUrl'] = qr_image_url
+        update_fields['qrStyleVersion'] = QR_STYLE_VERSION
 
     wired_qr_code_id = _qr_str(doc.get('wiredQrCodeId'))
     if not wired_qr_code_id and doc.get('qrNumber') is not None:
         wired_qr_code_id = _qr_str(doc.get('qrNumber'))
         if wired_qr_code_id:
             update_fields['wiredQrCodeId'] = wired_qr_code_id
+    elif qr_style_version < QR_STYLE_VERSION:
+        update_fields['qrStyleVersion'] = QR_STYLE_VERSION
 
     if update_fields:
         update_fields['updatedAt'] = datetime.utcnow()
@@ -9907,7 +10027,8 @@ def admin_qr_create():
             'qrNumber': qr_number,
             'qrToken': qr_token,
             'scanUrl': scan_url,
-            'qrImageUrl': _qr_build_image_url(scan_url),
+            'qrImageUrl': _qr_build_image_url(scan_url, path_key),
+            'qrStyleVersion': QR_STYLE_VERSION,
             'status': 'disconnected',
             'isConnected': False,
             'wiredPersonId': '',
@@ -9979,7 +10100,7 @@ def admin_qr_export():
                 scan_url = _qr_str(prepared.get('scanUrl'))
                 if not scan_url:
                     scan_url = _qr_build_scan_url(prepared.get('qrToken'))
-                svg_payload = _qr_build_svg_bytes(scan_url)
+                svg_payload = _qr_build_svg_bytes(scan_url, path_key)
                 if not svg_payload:
                     continue
                 archive.writestr(f'qr-{qr_number}.svg', svg_payload)

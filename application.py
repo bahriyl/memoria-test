@@ -7798,6 +7798,75 @@ def _derive_ritual_hq_location_from_payload(payload, current_doc=None):
     return location
 
 
+def _is_valid_lat_lon(lat_value, lon_value):
+    lat = loc_parse_float(lat_value)
+    lon = loc_parse_float(lon_value)
+    if lat is None or lon is None:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+def _coords_from_location_geo(location):
+    if not isinstance(location, dict):
+        return None
+    geo = loc_parse_geo_point(location.get('geo'))
+    if not geo:
+        return None
+    coords = geo.get('coordinates') if isinstance(geo, dict) else None
+    if not isinstance(coords, list) or len(coords) != 2:
+        return None
+    lon = loc_parse_float(coords[0])
+    lat = loc_parse_float(coords[1])
+    return _is_valid_lat_lon(lat, lon)
+
+
+def _coords_from_settlement_refs(service_area_ids=None, settlement_names=None):
+    service_area_ids = service_area_ids if isinstance(service_area_ids, list) else []
+    settlement_names = settlement_names if isinstance(settlement_names, list) else []
+
+    for katottg_code in service_area_ids:
+        code = loc_clean_str(katottg_code)
+        if not code:
+            continue
+        settlement = settlements_collection.find_one({'katottg_code': code}, {'lat': 1, 'lon': 1})
+        if settlement:
+            parsed = _is_valid_lat_lon(settlement.get('lat'), settlement.get('lon'))
+            if parsed:
+                return parsed
+
+    for settlement_name in settlement_names:
+        name = _clean_str(settlement_name)
+        if not name:
+            continue
+        settlement = settlements_collection.find_one({'name': name}, {'lat': 1, 'lon': 1})
+        if settlement:
+            parsed = _is_valid_lat_lon(settlement.get('lat'), settlement.get('lon'))
+            if parsed:
+                return parsed
+
+    return None
+
+
+def _resolve_ritual_coordinates(payload, current_doc=None):
+    current_doc = current_doc if isinstance(current_doc, dict) else {}
+    candidate_sources = [
+        _is_valid_lat_lon(payload.get('latitude'), payload.get('longitude')),
+        _coords_from_location_geo(payload.get('hqLocation')),
+        _is_valid_lat_lon(current_doc.get('latitude'), current_doc.get('longitude')),
+        _coords_from_location_geo(current_doc.get('hqLocation')),
+        _coords_from_settlement_refs(
+            payload.get('serviceAreaIds') if isinstance(payload.get('serviceAreaIds'), list) else current_doc.get('serviceAreaIds'),
+            payload.get('settlements') if isinstance(payload.get('settlements'), list) else current_doc.get('settlements'),
+        ),
+    ]
+    for item in candidate_sources:
+        if item:
+            return item
+    return None
+
+
 def _build_admin_ritual_service_payload(data, partial=False, current_doc=None):
     if not isinstance(data, dict):
         abort(400, description='Body must be a JSON object')
@@ -7897,6 +7966,33 @@ def _build_admin_ritual_service_payload(data, partial=False, current_doc=None):
                     payload['latitude'] = legacy.get('latitude')
                 if payload.get('longitude') is None:
                     payload['longitude'] = legacy.get('longitude')
+
+    has_location_intent = (
+        bool(payload.get('serviceAreaIds'))
+        or bool(payload.get('settlements'))
+        or bool(payload.get('hqLocation'))
+        or ('latitude' in payload and payload.get('latitude') not in (None, ''))
+        or ('longitude' in payload and payload.get('longitude') not in (None, ''))
+        or not partial
+    )
+    if has_location_intent:
+        resolved_coords = _resolve_ritual_coordinates(payload, current_doc=current_doc)
+        if not resolved_coords:
+            abort(422, description='Unable to resolve ritual service coordinates. Select a settlement with coordinates or provide valid latitude/longitude.')
+        lat, lon = resolved_coords
+        payload['latitude'] = lat
+        payload['longitude'] = lon
+        hq_location = payload.get('hqLocation')
+        if not isinstance(hq_location, dict):
+            hq_location = _derive_ritual_hq_location_from_payload(payload, current_doc=current_doc) or {}
+        hq_location = merge_dict(hq_location, {
+            'geo': {
+                'type': 'Point',
+                'coordinates': [lon, lat],
+                'precision': 'exact',
+            }
+        })
+        payload['hqLocation'] = normalize_location_core(hq_location)
 
     if not partial:
         payload.setdefault('category', DEFAULT_RITUAL_SERVICE_CATEGORIES[1])

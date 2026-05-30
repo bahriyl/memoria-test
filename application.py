@@ -62,7 +62,7 @@ from location_service import (
     cemetery_option_from_doc,
     filter_docs_by_radius,
 )
-from katottg_settlements import search_settlements as search_katottg_settlements
+from settlements_service import serialize_settlement
 
 load_dotenv()
 
@@ -220,6 +220,7 @@ location_moderation_collection = db['location_moderation']
 liturgies_collection = db['liturgies']
 chat_templates_collection = db['chat_templates']
 admin_note_payments_collection = db['admin_note_payments']
+settlements_collection = db['settlements']
 
 ALLOWED_CHAT_CATEGORIES = {'Реклама', 'Ритуальні послуги', 'Електронна записка'}
 CHAT_TEMPLATE_TITLE_MAX_LEN = 120
@@ -424,6 +425,36 @@ except Exception:
 
 try:
     ritual_services_collection.create_index([("hqLocation.geo", "2dsphere")])
+except Exception:
+    pass
+
+try:
+    settlements_collection.create_index([("katottg_code", ASCENDING)], unique=True)
+except Exception:
+    pass
+
+try:
+    settlements_collection.create_index([("name", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    settlements_collection.create_index([("normalized_name", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    settlements_collection.create_index([("region", ASCENDING), ("district", ASCENDING), ("hromada", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    settlements_collection.create_index([("type", ASCENDING)])
+except Exception:
+    pass
+
+try:
+    settlements_collection.create_index([("location", "2dsphere")])
 except Exception:
     pass
 
@@ -8307,13 +8338,21 @@ def get_church_page(church_id):
     })
 
 
-@application.route('/api/locations', methods=['GET'])
-def locations():
-    search = request.args.get('search', '').strip()
-    if not search:
-        return jsonify([])
-    rows = search_katottg_settlements(search, limit=10, min_query_len=1)
-    return jsonify([_katottg_item_to_location_suggestion(item) for item in rows])
+def _settlement_filters_from_request():
+    return {
+        "region": request.args.get("region", "").strip(),
+        "district": request.args.get("district", "").strip(),
+        "hromada": request.args.get("hromada", "").strip(),
+        "type": request.args.get("type", "").strip(),
+    }
+
+
+def _apply_settlement_filters(filters):
+    query = {}
+    for key, value in filters.items():
+        if value:
+            query[key] = value
+    return query
 
 
 def _query_cemetery_options(area_id='', area='', search='', limit=10):
@@ -8407,79 +8446,92 @@ def cemeteries():
     return jsonify(items)
 
 
-def _katottg_item_to_location_suggestion(item):
-    area_display = loc_clean_str(item.get("label"))
-    city = loc_clean_str(item.get("name"))
-    region = loc_clean_str(item.get("region"))
-    district = loc_clean_str(item.get("district"))
-    community = loc_clean_str(item.get("community"))
-    settlement_type = loc_clean_str(item.get("type"))
-    katottg = loc_clean_str(item.get("katottg"))
+@application.route('/api/settlements/search', methods=['GET'])
+def settlements_search():
+    q = request.args.get("q", "").strip()
+    filters = _settlement_filters_from_request()
+    limit_raw = request.args.get("limit", "").strip()
+    try:
+        limit = min(max(int(limit_raw or "10"), 1), 50)
+    except Exception:
+        limit = 10
 
-    return {
-        "id": katottg,
-        "display": area_display,
-        "name": city,
-        "label": area_display,
-        "lat": None,
-        "lng": None,
-        "source": "katottg",
-        "provider": "katottg",
-        "settlement": {
-            "cityName": city,
-            "settlementType": settlement_type,
-            "katottg": katottg,
-            "region": region,
-            "district": district,
-            "community": community,
-            "label": area_display,
-        },
-        "area": {
-            "id": katottg,
-            "source": "katottg",
-            "city": city,
-            "region": region,
-            "countryCode": "UA",
-            "display": area_display,
-        },
-        "address": {
-            "raw": area_display,
-            "display": area_display,
-            "provider": "katottg",
-            "city": city,
-            "region": region,
-        },
+    query = _apply_settlement_filters(filters)
+    if q:
+        query["$or"] = [
+            {"name": {"$regex": re.escape(q), "$options": "i"}},
+            {"normalized_name": {"$regex": re.escape(loc_clean_str(q).lower()), "$options": "i"}},
+            {"search_text": {"$regex": re.escape(q), "$options": "i"}},
+        ]
+    docs = list(settlements_collection.find(query).sort([("name", ASCENDING)]).limit(limit))
+    items = [serialize_settlement(doc) for doc in docs]
+    return jsonify({"total": len(items), "items": items})
+
+
+@application.route('/api/settlements/<string:katottg_code>', methods=['GET'])
+def settlements_get_by_code(katottg_code):
+    code = katottg_code.strip()
+    if not code:
+        abort(400, description="Missing katottg_code")
+    doc = settlements_collection.find_one({"katottg_code": code})
+    if not doc:
+        abort(404, description="Settlement not found")
+    return jsonify(serialize_settlement(doc))
+
+
+@application.route('/api/settlements/near', methods=['GET'])
+def settlements_near():
+    lat = loc_parse_float(request.args.get("lat"))
+    lon = loc_parse_float(request.args.get("lon"))
+    radius = loc_parse_float(request.args.get("radius"))
+    if lat is None or lon is None or radius is None:
+        abort(400, description="lat, lon, radius are required")
+    radius_meters = max(float(radius), 0.0) * 1000.0
+    query = {
+        "location": {
+            "$near": {
+                "$geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "$maxDistance": radius_meters,
+            }
+        }
     }
-
-
-@application.route('/api/location/areas', methods=['GET'])
-def location_areas():
-    search = request.args.get('search', '').strip()
-    limit_raw = request.args.get('limit', '').strip()
+    limit_raw = request.args.get("limit", "").strip()
     try:
-        limit = min(max(int(limit_raw or "10"), 1), 10)
+        limit = min(max(int(limit_raw or "50"), 1), 200)
     except Exception:
-        limit = 10
-    if not search:
-        return jsonify({"total": 0, "items": []})
-    rows = search_katottg_settlements(search, limit=limit, min_query_len=1)
-    items = [_katottg_item_to_location_suggestion(item) for item in rows]
-    return jsonify({"total": len(items), "items": items})
+        limit = 50
+    docs = list(settlements_collection.find(query).limit(limit))
+    return jsonify({"total": len(docs), "items": [serialize_settlement(doc) for doc in docs]})
 
 
-@application.route('/api/location/addresses', methods=['GET'])
-def location_addresses():
-    search = request.args.get('search', '').strip()
-    limit_raw = request.args.get('limit', '').strip()
-    try:
-        limit = min(max(int(limit_raw or "10"), 1), 10)
-    except Exception:
-        limit = 10
-    if not search:
-        return jsonify({"total": 0, "items": []})
-    rows = search_katottg_settlements(search, limit=limit, min_query_len=1)
-    items = [_katottg_item_to_location_suggestion(item) for item in rows]
-    return jsonify({"total": len(items), "items": items})
+@application.route('/api/regions', methods=['GET'])
+def settlements_regions():
+    values = [item for item in settlements_collection.distinct("region") if loc_clean_str(item)]
+    values.sort()
+    return jsonify({"items": values})
+
+
+@application.route('/api/districts', methods=['GET'])
+def settlements_districts():
+    region = request.args.get("region", "").strip()
+    query = {"region": region} if region else {}
+    values = [item for item in settlements_collection.distinct("district", query) if loc_clean_str(item)]
+    values.sort()
+    return jsonify({"items": values})
+
+
+@application.route('/api/hromadas', methods=['GET'])
+def settlements_hromadas():
+    region = request.args.get("region", "").strip()
+    district = request.args.get("district", "").strip()
+    query = {}
+    if region:
+        query["region"] = region
+    if district:
+        query["district"] = district
+    values = [item for item in settlements_collection.distinct("hromada", query) if loc_clean_str(item)]
+    values.sort()
+    return jsonify({"items": values})
 
 
 @application.route('/api/location/cemeteries', methods=['GET'])
@@ -8491,16 +8543,6 @@ def location_cemeteries():
     return jsonify({"total": len(items), "items": items, "meta": meta})
 
 
-@application.route('/api/location/normalize', methods=['POST'])
-def location_normalize():
-    payload = request.get_json(silent=True) or {}
-    location = normalize_location_core(payload if isinstance(payload, dict) else {})
-    return jsonify({"location": location})
-
-
-@application.route('/api/location/reverse', methods=['GET'])
-def location_reverse():
-    return jsonify({"location": normalize_location_core({})})
 
 
 @application.route('/api/ritual_services', methods=['GET'])
@@ -9340,8 +9382,8 @@ def public_qr_activation_plaques():
     return jsonify({'success': True, 'orderId': str(order_insert.inserted_id)})
 
 
-@application.route('/api/settlements', methods=['GET'])
-def search_settlements():
+@application.route('/api/np/settlements', methods=['GET'])
+def np_search_settlements():
     q = request.args.get('q', '').strip()
     if not q:
         return jsonify({'success': False, 'data': [], 'errors': ['Missing q parameter']}), 400
@@ -9359,8 +9401,8 @@ def search_settlements():
     return jsonify(resp.json())
 
 
-@application.route('/api/warehouses', methods=['GET'])
-def get_warehouses():
+@application.route('/api/np/warehouses', methods=['GET'])
+def np_get_warehouses():
     city_ref = request.args.get('cityRef', '').strip()
     q = request.args.get('q', '').strip()
     if not city_ref:

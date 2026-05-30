@@ -63,6 +63,7 @@ from location_service import (
     filter_docs_by_radius,
 )
 from settlements_service import serialize_settlement
+from settlements_service import norm_text as settlements_norm_text
 
 load_dotenv()
 
@@ -455,6 +456,11 @@ except Exception:
 
 try:
     settlements_collection.create_index([("location", "2dsphere")])
+except Exception:
+    pass
+
+try:
+    settlements_collection.create_index([("normalized_name", ASCENDING), ("population", -1), ("name", ASCENDING)])
 except Exception:
     pass
 
@@ -8458,12 +8464,13 @@ def settlements_search():
 
     query = _apply_settlement_filters(filters)
     if q:
-        query["$or"] = [
-            {"name": {"$regex": re.escape(q), "$options": "i"}},
-            {"normalized_name": {"$regex": re.escape(loc_clean_str(q).lower()), "$options": "i"}},
-            {"search_text": {"$regex": re.escape(q), "$options": "i"}},
-        ]
-    docs = list(settlements_collection.find(query).sort([("name", ASCENDING)]).limit(limit))
+        normalized_q = settlements_norm_text(q)
+        if not normalized_q:
+            return jsonify({"total": 0, "items": []})
+        query["normalized_name"] = {"$regex": f"^{re.escape(normalized_q)}", "$options": "i"}
+    docs = list(
+        settlements_collection.find(query).sort([("population", -1), ("name", ASCENDING)]).limit(limit)
+    )
     items = [serialize_settlement(doc) for doc in docs]
     return jsonify({"total": len(items), "items": items})
 

@@ -7762,11 +7762,38 @@ def _derive_ritual_hq_location_from_payload(payload, current_doc=None):
     seed = {}
     area_id = service_area_ids[0] if service_area_ids else ''
     area_display = settlements[0] if settlements else ''
+    area_city = _clean_str(area_display.split(',')[0]) if area_display else ''
+    area_district = ''
+    area_region = ''
+    if area_id:
+        settlement_doc = settlements_collection.find_one(
+            {'katottg_code': area_id},
+            {'name': 1, 'district': 1, 'region': 1, 'hromada': 1},
+        )
+        if settlement_doc:
+            canonical_city = _clean_str(settlement_doc.get('name'))
+            canonical_district = _clean_str(settlement_doc.get('district'))
+            canonical_region = _clean_str(settlement_doc.get('region'))
+            canonical_hromada = _clean_str(settlement_doc.get('hromada'))
+            if canonical_city:
+                area_city = canonical_city
+            if canonical_district:
+                area_district = canonical_district
+            if canonical_region:
+                area_region = canonical_region
+            if canonical_city and not area_display:
+                area_display_parts = [canonical_city, canonical_district, canonical_region]
+                area_display = ', '.join([part for part in area_display_parts if part])
+            if canonical_hromada and area_display and canonical_hromada not in area_display:
+                # Keep display compact and stable (city, district, region) unless settlement seed already had custom display.
+                pass
     if area_id or area_display:
         seed['area'] = {
             'id': area_id,
             'display': area_display,
-            'city': area_display,
+            'city': area_city,
+            'district': area_district,
+            'region': area_region,
             'source': 'manual',
         }
     if address_seed:

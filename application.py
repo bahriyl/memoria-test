@@ -28,7 +28,7 @@ except Exception:
 
 from flask import Flask, request, jsonify, abort, make_response, send_file, after_this_request, redirect
 from flask_cors import CORS
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, ASCENDING, UpdateOne
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 from flask_socketio import SocketIO, join_room
@@ -1065,7 +1065,63 @@ def _admin_pages_build_burial_from_fields(area_id, area, cemetery, burial_site_c
     return burial, legacy
 
 
-def _admin_pages_projection(person, index, extra_ctx=None):
+def _read_nested_value(doc, field_path):
+    current = doc
+    for segment in str(field_path or '').split('.'):
+        if not segment:
+            return None
+        if not isinstance(current, dict):
+            return None
+        current = current.get(segment)
+    return current
+
+
+def _normalize_persisted_index(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _next_collection_index(collection, field_path):
+    cursor = collection.find(
+        {field_path: {'$exists': True}},
+        {field_path: 1},
+    )
+    max_index = 0
+    for doc in cursor:
+        max_index = max(max_index, _normalize_persisted_index(_read_nested_value(doc, field_path)))
+    return max_index + 1
+
+
+def _backfill_collection_indices(collection, field_path, legacy_sort, query_filter=None):
+    missing_filter = {field_path: {'$exists': False}}
+    if query_filter:
+        missing_filter = {'$and': [query_filter, missing_filter]}
+
+    docs = list(collection.find(missing_filter).sort(legacy_sort))
+    if not docs:
+        return
+
+    next_index = _next_collection_index(collection, field_path)
+    operations = []
+    for offset, doc in enumerate(docs):
+        doc_id = doc.get('_id')
+        if not doc_id:
+            continue
+        operations.append(
+            UpdateOne(
+                {'_id': doc_id, field_path: {'$exists': False}},
+                {'$set': {field_path: next_index + offset}},
+            )
+        )
+
+    if operations:
+        collection.bulk_write(operations, ordered=True)
+
+
+def _admin_pages_projection(person, index=None, extra_ctx=None):
     item = _person_with_location_projection(person)
     admin_page = item.get('adminPage') if isinstance(item.get('adminPage'), dict) else {}
     burial = normalize_person_burial(item)
@@ -1146,9 +1202,13 @@ def _admin_pages_projection(person, index, extra_ctx=None):
             except Exception:
                 coords_from_location_geo = ''
 
+    persisted_index = _normalize_persisted_index(admin_page.get('index'))
+    if not persisted_index:
+        persisted_index = _normalize_persisted_index(index)
+
     return {
         'id': str(item.get('_id')),
-        'index': int(index),
+        'index': persisted_index,
         'name': _admin_pages_str(item.get('name')),
         'birthYear': birth_year,
         'deathYear': death_year,
@@ -1188,6 +1248,12 @@ def _admin_pages_projection(person, index, extra_ctx=None):
 
 @application.route('/api/admin/pages', methods=['GET'])
 def admin_list_pages():
+    _backfill_collection_indices(
+        people_collection,
+        'adminPage.index',
+        [('createdAt', -1), ('_id', -1)],
+    )
+
     search_query = _admin_pages_str(request.args.get('search'))
     query_filter = {}
     if search_query:
@@ -1212,7 +1278,7 @@ def admin_list_pages():
             ]
         }
 
-    docs = list(people_collection.find(query_filter).sort([('createdAt', -1), ('_id', -1)]))
+    docs = list(people_collection.find(query_filter).sort([('adminPage.index', 1), ('_id', 1)]))
 
     person_ids = [str(doc.get('_id') or '') for doc in docs if doc.get('_id')]
     plaques_person_ids = set()
@@ -1264,7 +1330,7 @@ def admin_list_pages():
         'plaquesPersonIds': plaques_person_ids,
         'wiredQrByPersonAndPath': wired_qr_by_person_and_path,
     }
-    pages = [_admin_pages_projection(person, index + 1, extra_ctx=extra_ctx) for index, person in enumerate(docs)]
+    pages = [_admin_pages_projection(person, extra_ctx=extra_ctx) for person in docs]
     return jsonify({
         'total': len(pages),
         'pages': pages,
@@ -1327,7 +1393,9 @@ def admin_create_page():
 
     notable = bool(data.get('notable')) or bool(internet_links) or bool(achievements) or bool(bio)
 
-    admin_page_payload = {}
+    admin_page_payload = {
+        'index': _next_collection_index(people_collection, 'adminPage.index'),
+    }
     if phone:
         admin_page_payload['phone'] = phone
     if customer_name:
@@ -1388,7 +1456,7 @@ def admin_create_page():
 
     inserted = people_collection.insert_one(doc)
     created = people_collection.find_one({'_id': inserted.inserted_id})
-    return jsonify(_admin_pages_projection(created, 1)), 201
+    return jsonify(_admin_pages_projection(created)), 201
 
 
 @application.route('/api/admin/pages/<string:person_id>', methods=['PATCH'])
@@ -1532,23 +1600,38 @@ def admin_update_page(person_id):
         merged_admin_page['updatedAt'] = datetime.utcnow()
         update_fields['adminPage'] = merged_admin_page
 
-    location_change_keys = {'area', 'areaId', 'cemetery', 'burialSiteCoords', 'burialSitePhotoUrl', 'burialSitePhotoUrls'}
+    location_change_keys = {'area', 'areaId', 'cemetery', 'burialSiteCoords', 'burialSitePhotoUrl', 'burialSitePhotoUrls', 'location'}
     has_location_changes = any(key in data for key in location_change_keys)
     if has_location_changes:
+        raw_location = data.get('location') if isinstance(data.get('location'), list) else None
+        location_coords = ''
+        location_landmarks = ''
+        location_photos = None
+        if raw_location is not None:
+            location_coords = _admin_pages_str(raw_location[0]) if len(raw_location) > 0 else ''
+            location_landmarks = _admin_pages_str(raw_location[1]) if len(raw_location) > 1 else ''
+            raw_location_photos = raw_location[2] if len(raw_location) > 2 and isinstance(raw_location[2], list) else []
+            location_photos = [_admin_pages_str(url) for url in raw_location_photos if _admin_pages_str(url)]
         next_area_id = _admin_pages_str(data.get('areaId')) if 'areaId' in data else _admin_pages_str(existing.get('areaId'))
         next_area = _admin_pages_str(data.get('area')) if 'area' in data else _admin_pages_str(existing.get('area'))
         next_cemetery = _admin_pages_str(data.get('cemetery')) if 'cemetery' in data else _admin_pages_str(existing.get('cemetery'))
         next_burial_site_coords = (
-            _admin_pages_str(data.get('burialSiteCoords'))
-            if 'burialSiteCoords' in data
-            else _admin_pages_str(existing.get('burialSiteCoords'))
+            location_coords
+            if raw_location is not None
+            else (
+                _admin_pages_str(data.get('burialSiteCoords'))
+                if 'burialSiteCoords' in data
+                else _admin_pages_str(existing.get('burialSiteCoords'))
+            )
         )
         next_burial_site_photo_url = (
             _admin_pages_str(data.get('burialSitePhotoUrl'))
             if 'burialSitePhotoUrl' in data
             else _admin_pages_str(existing.get('burialSitePhotoUrl'))
         )
-        if 'burialSitePhotoUrls' in data and isinstance(data.get('burialSitePhotoUrls'), list):
+        if location_photos is not None:
+            next_burial_site_photo_urls = location_photos
+        elif 'burialSitePhotoUrls' in data and isinstance(data.get('burialSitePhotoUrls'), list):
             next_burial_site_photo_urls = [
                 _admin_pages_str(url)
                 for url in data.get('burialSitePhotoUrls')
@@ -1579,12 +1662,20 @@ def admin_update_page(person_id):
             burial_site_photo_urls=next_burial_site_photo_urls,
         )
 
+        if raw_location is not None and isinstance(burial.get('location'), dict):
+            burial['location']['geo'] = None if not location_coords else burial['location'].get('geo')
+            burial['landmarks'] = location_landmarks
+            burial['photos'] = next_burial_site_photo_urls
+            legacy['location'] = [location_coords, location_landmarks, next_burial_site_photo_urls]
+
         if _location_write_is_canonical() or _location_write_is_dual():
             update_fields['burial'] = burial
         if _location_write_is_legacy() or _location_write_is_dual():
             update_fields['areaId'] = legacy['areaId']
             update_fields['area'] = legacy['area']
             update_fields['cemetery'] = legacy['cemetery']
+            update_fields['location'] = legacy['location']
+        elif raw_location is not None:
             update_fields['location'] = legacy['location']
 
     if not update_fields:
@@ -1593,7 +1684,7 @@ def admin_update_page(person_id):
     update_fields['updatedAt'] = datetime.utcnow()
     people_collection.update_one({'_id': oid}, {'$set': update_fields})
     updated = people_collection.find_one({'_id': oid})
-    return jsonify(_admin_pages_projection(updated, 1))
+    return jsonify(_admin_pages_projection(updated))
 
 
 @application.route('/api/admin/pages/<string:person_id>/password', methods=['GET'])
@@ -3532,6 +3623,7 @@ def _normalize_admin_cemetery(cemetery):
 
     return {
         'id': str(cemetery.get('_id')),
+        'index': _normalize_persisted_index(cemetery.get('index')),
         'name': _clean_str(cemetery.get('name')),
         'locality': locality,
         'addressLine': address_line,
@@ -3705,6 +3797,12 @@ def _build_admin_cemetery_payload(data, partial=False):
 
 @application.route('/api/admin/cemeteries', methods=['GET'])
 def admin_list_cemeteries():
+    _backfill_collection_indices(
+        cemeteries_collection,
+        'index',
+        [('createdAt', -1), ('_id', -1)],
+    )
+
     search = _clean_str(request.args.get('search', ''))
     query_filter = {}
 
@@ -3722,7 +3820,7 @@ def admin_list_cemeteries():
             ]
         }
 
-    cursor = cemeteries_collection.find(query_filter).sort([('createdAt', -1), ('_id', -1)])
+    cursor = cemeteries_collection.find(query_filter).sort([('index', 1), ('_id', 1)])
     cemeteries_list = [_normalize_admin_cemetery(cemetery) for cemetery in cursor]
 
     return jsonify({
@@ -3735,6 +3833,7 @@ def admin_list_cemeteries():
 def admin_create_cemetery():
     data = request.get_json(silent=True) or {}
     payload = _build_admin_cemetery_payload(data, partial=False)
+    payload['index'] = _next_collection_index(cemeteries_collection, 'index')
     payload['fillPercent'] = _calculate_admin_cemetery_fill_percent(payload)
     now = datetime.utcnow()
     payload['createdAt'] = now
@@ -5298,6 +5397,7 @@ def _normalize_admin_church(church):
 
     return {
         'id': str(church.get('_id')),
+        'index': _normalize_persisted_index(church.get('index')),
         'name': _clean_str(church.get('name')),
         'address': _clean_str(church.get('address') or legacy_loc.get('address')),
         'locality': _clean_str(church.get('locality') or legacy_loc.get('locality')),
@@ -5515,6 +5615,12 @@ def _build_admin_church_payload(data, partial=False):
 
 @application.route('/api/admin/churches', methods=['GET'])
 def admin_list_churches():
+    _backfill_collection_indices(
+        churches_collection,
+        'index',
+        [('name', 1), ('_id', 1)],
+    )
+
     search = _clean_str(request.args.get('search', ''))
     query_filter = {}
     if search:
@@ -5530,7 +5636,7 @@ def admin_list_churches():
             ]
         }
 
-    churches_cursor = churches_collection.find(query_filter).sort([('name', 1), ('_id', 1)]).limit(50)
+    churches_cursor = churches_collection.find(query_filter).sort([('index', 1), ('_id', 1)]).limit(50)
     churches_list = [_normalize_admin_church(church) for church in churches_cursor]
 
     return jsonify({
@@ -5543,6 +5649,7 @@ def admin_list_churches():
 def admin_create_church():
     data = request.get_json(silent=True) or {}
     payload = _build_admin_church_payload(data, partial=False)
+    payload['index'] = _next_collection_index(churches_collection, 'index')
     now = datetime.utcnow()
     payload['createdAt'] = now
     payload['updatedAt'] = now

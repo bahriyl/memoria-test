@@ -2,3 +2,10 @@
 
 __pycache__/
 *.pyc
+.pytest_cache/
+.DS_Store
+
+# Generated audit/backfill outputs
+backups/
+migration-reports/
+data/ukraine_settlements_with_population_latlon_*.json

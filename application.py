@@ -772,6 +772,12 @@ def people():
     lng = request.args.get('lng')
     radius_km = request.args.get('radiusKm')
 
+    def prefix_regex(value):
+        cleaned = re.sub(r'\s+', ' ', (value or '').strip())
+        if not cleaned:
+            return None
+        return {'$regex': f'^{re.escape(cleaned)}', '$options': 'i'}
+
     conditions = []
     if search_query:
         conditions.append({'name': {'$regex': re.escape(search_query), '$options': 'i'}})
@@ -806,23 +812,23 @@ def people():
         ]
 
         if city_part:
-            city_pattern = re.escape(city_part)
+            city_pattern = prefix_regex(city_part)
             fallback_and_conditions.append({
                 '$or': [
-                    {'area': {'$regex': city_pattern, '$options': 'i'}},
-                    {'burial.location.area.display': {'$regex': city_pattern, '$options': 'i'}},
-                    {'burial.location.area.city': {'$regex': city_pattern, '$options': 'i'}},
+                    {'area': city_pattern},
+                    {'burial.location.area.display': city_pattern},
+                    {'burial.location.area.city': city_pattern},
                 ]
             })
 
         # If selected area includes region, enforce region match in fallback branch.
         if region_part:
-            region_pattern = re.escape(region_part)
+            region_pattern = prefix_regex(region_part)
             fallback_and_conditions.append({
                 '$or': [
-                    {'area': {'$regex': region_pattern, '$options': 'i'}},
-                    {'burial.location.area.display': {'$regex': region_pattern, '$options': 'i'}},
-                    {'burial.location.area.region': {'$regex': region_pattern, '$options': 'i'}},
+                    {'area': region_pattern},
+                    {'burial.location.area.display': region_pattern},
+                    {'burial.location.area.region': region_pattern},
                 ]
             })
 
@@ -833,22 +839,22 @@ def people():
             ]
         })
     elif city_part:
-        city_pattern = re.escape(city_part)
+        city_pattern = prefix_regex(city_part)
         area_or_conditions = [
-            {'area': {'$regex': city_pattern, '$options': 'i'}},
-            {'burial.location.area.display': {'$regex': city_pattern, '$options': 'i'}},
-            {'burial.location.area.city': {'$regex': city_pattern, '$options': 'i'}},
+            {'area': city_pattern},
+            {'burial.location.area.display': city_pattern},
+            {'burial.location.area.city': city_pattern},
         ]
         if region_part:
-            region_pattern = re.escape(region_part)
+            region_pattern = prefix_regex(region_part)
             conditions.append({
                 '$and': [
                     {'$or': area_or_conditions},
                     {
                         '$or': [
-                            {'area': {'$regex': region_pattern, '$options': 'i'}},
-                            {'burial.location.area.display': {'$regex': region_pattern, '$options': 'i'}},
-                            {'burial.location.area.region': {'$regex': region_pattern, '$options': 'i'}},
+                            {'area': region_pattern},
+                            {'burial.location.area.display': region_pattern},
+                            {'burial.location.area.region': region_pattern},
                         ]
                     },
                 ]
@@ -864,7 +870,7 @@ def people():
         ])
 
     if cemetery:
-        cem_regex = {'$regex': re.escape(cemetery), '$options': 'i'}
+        cem_regex = prefix_regex(cemetery)
         cemetery_or_conditions.extend([
             {'cemetery': cem_regex},
             {'burial.cemeteryRef.name': cem_regex},
@@ -9898,6 +9904,8 @@ def _qr_center_logo_markup(style_key):
         return (
             '<rect x="130" y="129" width="73" height="73" rx="8" fill="#D9D9D9"/>'
             '<path d="M145.836 186V145.77H153.396L168.462 165.966H164.898L179.586 145.77H187.146V186H179.262V154.572L182.394 155.328L166.95 175.47H165.978L151.074 155.328L153.666 154.572V186H145.836Z" fill="black"/>'
+            '<rect x="157" y="56" width="18" height="18" fill="black"/>'
+            '<rect x="157" y="257" width="18" height="18" fill="black"/>'
         )
     return (
         '<rect x="97" y="147" width="138" height="37" rx="8" fill="#D9D9D9"/>'
